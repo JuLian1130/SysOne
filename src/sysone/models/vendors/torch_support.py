@@ -1,0 +1,214 @@
+"""torch 侧装载：先在 meta 上建出厂商模型，再按 row-int8 的 codes/scale 就地填满。
+
+这样 4B 的 bf16 常驻（约 9.3 GB）从不出现在内存里：权重以 int8 码表 + 每行
+fp32 scale 的形式常驻，反量化发生在每次前向的线性层里。
+
+只被 vendor 桥 import，核心面（`tests/unit/test_import_light.py`）不碰 torch。
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
+
+from ...errors import ConfigError, MissingTensorError
+from ...weights.packing.row_int8 import RowInt8Store
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型检查用
+    from pathlib import Path
+
+_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp32": torch.float32,
+}
+
+# 前向里按位置自己算的派生张量，检查点里通常不存
+_DERIVED_SUFFIXES = ("rotary_emb.inv_freq", "rotary_emb.cos_cached", "rotary_emb.sin_cached")
+
+
+def torch_dtype(name: str) -> torch.dtype:
+    """把配置里的 bf16/fp16/fp32 转成 torch dtype。"""
+    try:
+        return _DTYPES[name]
+    except KeyError as exc:
+        raise ConfigError("未知的权重精度", dtype=name, allowed=sorted(_DTYPES)) from exc
+
+
+class Int8Linear(torch.nn.Module):
+    """int8 常驻、前向时逐行反量化的线性层。"""
+
+    def __init__(
+        self,
+        codes: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("codes", codes.detach().to(torch.int8), persistent=False)
+        self.register_buffer("scale", scale.detach().to(torch.float32), persistent=False)
+        self.in_features = int(codes.shape[1])
+        self.out_features = int(codes.shape[0])
+        if bias is None:
+            self.register_buffer("bias", None)
+        else:
+            self.register_buffer("bias", bias.detach(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.codes.to(x.dtype) * self.scale.to(x.dtype)[:, None]
+        bias = None if self.bias is None else self.bias.to(x.dtype)
+        return torch.nn.functional.linear(x, weight, bias)
+
+    def extra_repr(self) -> str:
+        return f"in={self.in_features}, out={self.out_features}, int8"
+
+
+def build_model(model_dir: Path, *, dtype: torch.dtype) -> tuple[torch.nn.Module, object]:
+    """在 meta 设备上构造厂商架构；返回 (model, config)。"""
+    import transformers
+
+    config = transformers.AutoConfig.from_pretrained(str(model_dir))
+    architectures = getattr(config, "architectures", None) or []
+    if not architectures:
+        raise ConfigError("config.json 缺少 architectures", model_dir=str(model_dir))
+    name = architectures[0]
+    cls = getattr(transformers, name, None)
+    if cls is None:
+        raise ConfigError("当前 transformers 版本没有这个架构类", architecture=name)
+    with torch.device("meta"):
+        model = cls(config)
+    return model, config
+
+
+def _assign(module: torch.nn.Module, name: str, tensor: torch.Tensor, *, param: bool) -> None:
+    if param:
+        module._parameters[name] = torch.nn.Parameter(tensor, requires_grad=False)
+    else:
+        module._buffers[name] = tensor
+
+
+def _to(tensor: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    array = np.ascontiguousarray(tensor)
+    if not array.flags.writeable:  # mmap 读出来的视图，torch 需要可写缓冲
+        array = array.copy()
+    return torch.from_numpy(array).to(device=device, dtype=dtype)
+
+
+def fill_model(
+    model: torch.nn.Module,
+    config: object,
+    store: RowInt8Store,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    skip_prefixes: tuple[str, ...] = ("model.visual", "multi_modal_projector", "mtp."),
+) -> torch.nn.Module:
+    """用 int8 码表与 keep 张量就地填满 meta 模型。
+
+    线性层的权重换成 `Int8Linear`；其余参数与 buffer 逐个赋值。缺失的张量如果
+    落在 `skip_prefixes`（视觉塔、MTP 草稿模块）下就跳过——纯文本、单次 prefill
+    前向不会碰它们——否则按缺失张量报错。
+    """
+    modules = dict(model.named_modules())
+    handled: set[str] = set()
+    stored = set(store.names())
+
+    for entry_name in store.manifest.quantized():
+        if not entry_name.endswith(".weight"):
+            continue
+        module_path = entry_name[: -len(".weight")]
+        parent_path, _, leaf = module_path.rpartition(".")
+        parent = modules.get(parent_path)
+        module = modules.get(module_path)
+        if parent is None or module is None:
+            if entry_name.startswith(skip_prefixes):
+                continue
+            raise ConfigError("权重名对不上模型模块", tensor=entry_name)
+        codes, scale = store.read_parts(entry_name)
+        bias = None
+        bias_name = f"{module_path}.bias"
+        if bias_name in stored:
+            bias = _to(store.read_raw(bias_name), device, dtype)
+        parent._modules[leaf] = Int8Linear(
+            _to(codes, device, torch.int8),
+            _to(scale, device, torch.float32),
+            bias,
+        )
+        handled.add(entry_name)
+        if bias is not None:
+            handled.add(bias_name)
+
+    names = stored
+    tied = bool(getattr(config, "tie_word_embeddings", True))
+    for module_path, module in modules.items():
+        for name, param in list(module._parameters.items()):
+            full = f"{module_path}.{name}" if module_path else name
+            if param is None or full in handled:
+                continue
+            if tied and full.startswith("lm_head."):
+                continue  # 稍后与 embedding 共用同一个 Parameter
+            if full not in names:
+                if full.startswith(skip_prefixes):
+                    continue
+                raise MissingTensorError("权重文件里缺这张量", tensor=full)
+            _assign(module, name, _to(store.read_raw(full), device, dtype), param=True)
+            handled.add(full)
+        for name, buf in list(module._buffers.items()):
+            full = f"{module_path}.{name}" if module_path else name
+            if buf is None or full in handled:
+                continue
+            if name in getattr(module, "_non_persistent_buffers_set", frozenset()):
+                continue  # 派生 buffer（rotary 的 cos/sin 等），前向里会自己算
+            if full.endswith(_DERIVED_SUFFIXES):
+                continue
+            if full not in names:
+                if full.startswith(skip_prefixes):
+                    continue
+                raise MissingTensorError("权重文件里缺这张量", tensor=full)
+            _assign(module, name, _to(store.read_raw(full), device, buf.dtype), param=False)
+            handled.add(full)
+
+    _tie_embeddings(model, config, dtype)
+    return model
+
+
+def _tie_embeddings(model: torch.nn.Module, config: object, dtype: torch.dtype) -> None:
+    """tied 模型里 lm_head 与 embed_tokens 必须共用同一个 Parameter 对象。"""
+    if not getattr(config, "tie_word_embeddings", True):
+        return
+    embedding = getattr(model, "language_model", model)
+    embed = getattr(embedding, "embed_tokens", None)
+    if embed is None:
+        embed = model.get_input_embeddings()
+    head = getattr(model, "lm_head", None)
+    if head is None:
+        head = model.get_output_embeddings()
+    if embed is None or head is None or embed is head:
+        return
+    weight = embed._parameters.get("weight")
+    if weight is None:
+        return
+    head._parameters["weight"] = weight
+
+
+def text_backbone(model: torch.nn.Module) -> torch.nn.Module:
+    """找到吃 input_ids 的文本主干（旧实现靠扫 `named_modules()` 找）。"""
+    for _, module in model.named_modules():
+        layers = getattr(module, "layers", None)
+        layer_types = getattr(getattr(module, "config", None), "layer_types", None)
+        if isinstance(layers, torch.nn.ModuleList) and layer_types:
+            return module
+    return model
+
+
+def output_weight(model: torch.nn.Module) -> torch.Tensor:
+    """读出用的词表矩阵（tied 时就是 embedding）。"""
+    embeddings = model.get_output_embeddings()
+    if embeddings is not None and getattr(embeddings, "weight", None) is not None:
+        return embeddings.weight
+    head = getattr(model, "lm_head", None)
+    if head is not None and getattr(head, "weight", None) is not None:
+        return head.weight
+    raise ConfigError("模型没有输出词表矩阵")

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from ..config import EngineConfig
 from ..domain.attention import MaskMode
+from ..domain.buffers import MemoryPlan
 from ..domain.decision import (
     Answer,
     DecisionRequest,
@@ -18,6 +19,7 @@ from ..domain.decision import (
 from ..domain.work import CompilationTimes
 from ..errors import ConfigError, UnsupportedMediaError, UnsupportedModeError
 from ..models.descriptor import ModelDescriptor
+from .memory import plan_memory
 from .planner import Planner
 from .runner import ModelRunner
 from .scheduler import Scheduler, SerialScheduler
@@ -51,6 +53,7 @@ class Engine:
         self._scheduler: Scheduler = scheduler or SerialScheduler()
         self._pool = pool or SessionPool()
         self._startup = CompilationTimes(0.0, 0.0, 0.0)
+        self._memory: MemoryPlan | None = None
         self._requests = 0
         self._questions = 0
         self._tokens = 0
@@ -66,9 +69,14 @@ class Engine:
         return self._config
 
     def start(self) -> CompilationTimes:
-        """装载权重并编译预热；返回可展示的启动耗时。"""
+        """装载权重、做内存预算、编译预热；返回可展示的启动耗时。"""
         self._runner.init_device()
         self._runner.load_weights()
+        artifacts = 0
+        artifact_bytes = getattr(self._runner, "artifact_bytes", None)
+        if callable(artifact_bytes):
+            artifacts = int(artifact_bytes())
+        self._memory = plan_memory(self._descriptor, self._config, artifacts_bytes=artifacts)
         times = self._runner.compile_or_warm_up()
         if not self._runner.check_health():
             raise ConfigError("模型自检未通过", model=self._descriptor.model_id)
@@ -86,32 +94,42 @@ class Engine:
                 mode=mode.value,
                 supported=sorted(item.value for item in self._descriptor.supported_modes),
             )
-        plans = self._planner.plans(request, mode)
+        vendor = getattr(self._runner, "answers_for", None)
         prepared = time.perf_counter()
+        vendor_name: str | None = None
+        if callable(vendor):
+            # vendor 策略：模板、前向与读出都在厂商代码里，不走 MaskPlan。
+            prefill_started = time.perf_counter()
+            answers, tokens, readout_s = vendor(request, mode)
+            prefill_s = time.perf_counter() - prefill_started
+            usage = Usage(input_tokens=tokens, prefill_calls=len(answers))
+            vendor_name = getattr(self._runner, "bridge_name", None)
+        else:
+            plans = self._planner.plans(request, mode)
+            for plan in plans:
+                self._scheduler.add(plan)
+            readout_before = self._readout_s
+            prefill_started = time.perf_counter()
+            while self._scheduler.has_unfinished():
+                self.step()
+            prefill_s = time.perf_counter() - prefill_started
+            readout_s = self._readout_s - readout_before
 
-        for plan in plans:
-            self._scheduler.add(plan)
-        readout_before = self._readout_s
-        prefill_started = time.perf_counter()
-        while self._scheduler.has_unfinished():
-            self.step()
-        prefill_s = time.perf_counter() - prefill_started
-        readout_s = self._readout_s - readout_before
+            done = self._scheduler.drain()
+            if len(done) != len(plans):
+                raise ConfigError("调度结果数量与计划数量不一致", plans=len(plans), done=len(done))
+            answers = tuple(answer for _, answer in sorted(done, key=lambda item: item[1].question_index))
+            prefix_len = plans[0].prefix_len
+            tails = sum(plan.seq_len() - plan.prefix_len for plan in plans)
+            usage = Usage(input_tokens=prefix_len + tails, prefill_calls=len(plans))
 
-        done = self._scheduler.drain()
-        if len(done) != len(plans):
-            raise ConfigError("调度结果数量与计划数量不一致", plans=len(plans), done=len(done))
-        answers = tuple(answer for _, answer in sorted(done, key=lambda item: item[1].question_index))
-
-        prefix_len = plans[0].prefix_len
-        tails = sum(plan.seq_len() - plan.prefix_len for plan in plans)
-        usage = Usage(input_tokens=prefix_len + tails, prefill_calls=len(plans))
         provenance = Provenance(
             family=self._descriptor.family,
             artifact_id=self._config.cache_key(),
             quant=self._descriptor.quant,
             attention_mode=mode,
             attention_trained=mode in self._descriptor.trained_modes,
+            vendor_bridge=vendor_name,
         )
         timings = None
         if self._config.service.debug_timings:
@@ -124,7 +142,7 @@ class Engine:
             )
 
         self._requests += 1
-        self._questions += len(plans)
+        self._questions += len(answers)
         self._tokens += usage.input_tokens
         self._prefill_s += prefill_s
         return DecisionResult(

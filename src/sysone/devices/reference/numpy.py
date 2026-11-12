@@ -106,6 +106,10 @@ class ReferenceRunner:
             name: self._store.read(name).astype(np.float32, copy=False) for name in expected
         }
 
+    def artifact_bytes(self) -> int:
+        """参考后端没有编译产物。"""
+        return 0
+
     def compile_or_warm_up(self) -> CompilationTimes:
         return CompilationTimes(load_s=0.0, compile_s=0.0, warmup_s=0.0)
 
