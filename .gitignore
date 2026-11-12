@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local-only directories, each versioned by its own local git repo
+/docs/
+/.scratch/
+
+# macOS
+.DS_Store

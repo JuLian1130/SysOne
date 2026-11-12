@@ -1,0 +1,138 @@
+"""Qwen3.5 家族共用部分：config 解析与描述符构造（不注册自己）。"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Mapping
+
+from ...config import EngineConfig
+from ...domain.attention import AttentionRole, MaskMode
+from ...errors import ConfigError
+from ..descriptor import ModelDescriptor, ReadoutPlan, VisionSpec
+from ..layer_plan import LayerPlan, plan_layers
+
+
+def load_json(path: Path) -> dict[str, object]:
+    """读一个 JSON 文件；缺失或语法错都归为 `ConfigError`。"""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        raise ConfigError("模型目录缺少配置文件", path=str(path)) from None
+    except json.JSONDecodeError:
+        raise ConfigError("配置文件不是合法 JSON", path=str(path)) from None
+
+
+def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
+    """多模态 config 的 text_config；纯文本 config 则返回自身。"""
+    nested = config.get("text_config")
+    return nested if isinstance(nested, Mapping) else config  # type: ignore[return-value]
+
+
+def layer_types(text: Mapping[str, object]) -> tuple[AttentionRole, ...]:
+    """优先读显式 `layer_types`，退回 `full_attention_interval`。"""
+    count = int(text["num_hidden_layers"])  # type: ignore[arg-type]
+    raw = text.get("layer_types")
+    if raw is not None:
+        if len(raw) != count:  # type: ignore[arg-type]
+            raise ConfigError(
+                "layer_types 长度与 num_hidden_layers 不一致",
+                layers=len(raw),  # type: ignore[arg-type]
+                num_layers=count,
+            )
+        roles: list[AttentionRole] = []
+        for item in raw:  # type: ignore[union-attr]
+            if item == "full_attention":
+                roles.append(AttentionRole.FULL)
+            elif item == "linear_attention":
+                roles.append(AttentionRole.LINEAR)
+            else:
+                raise ConfigError("未知的 layer_types 取值", value=str(item))
+        return tuple(roles)
+    interval = text.get("full_attention_interval")
+    if interval:
+        step = int(interval)  # type: ignore[arg-type]
+        return tuple(
+            AttentionRole.FULL if (index + 1) % step == 0 else AttentionRole.LINEAR
+            for index in range(count)
+        )
+    raise ConfigError("config 缺少 layer_types 与 full_attention_interval")
+
+
+def geometry(text: Mapping[str, object]) -> dict[str, int]:
+    """取出与设备无关的结构数字。"""
+    heads = int(text["num_attention_heads"])  # type: ignore[arg-type]
+    hidden = int(text["hidden_size"])  # type: ignore[arg-type]
+    return {
+        "hidden": hidden,
+        "ffn": int(text["intermediate_size"]),  # type: ignore[arg-type]
+        "heads": heads,
+        "kv_heads": int(text.get("num_key_value_heads", heads)),  # type: ignore[arg-type]
+        "head_dim": int(text.get("head_dim") or hidden // heads),  # type: ignore[arg-type]
+        "vocab": int(text["vocab_size"]),  # type: ignore[arg-type]
+        "max_position": int(text.get("max_position_embeddings", 0)),  # type: ignore[arg-type]
+        "num_layers": int(text["num_hidden_layers"]),  # type: ignore[arg-type]
+    }
+
+
+def vision_spec(config: Mapping[str, object]) -> VisionSpec | None:
+    """视觉塔几何；M0 只记录，不加载。"""
+    nested = config.get("vision_config")
+    if not isinstance(nested, Mapping):
+        return None
+    return VisionSpec(
+        model_type=str(nested.get("model_type", "")),
+        depth=int(nested.get("depth", 0)),  # type: ignore[arg-type]
+        hidden=int(nested.get("hidden_size", 0)),  # type: ignore[arg-type]
+        patch_size=int(nested.get("patch_size", 0)),  # type: ignore[arg-type]
+        spatial_merge=int(nested.get("spatial_merge_size", 2)),  # type: ignore[arg-type]
+    )
+
+
+def descriptor_from(
+    config: Mapping[str, object],
+    *,
+    family: str,
+    model_id: str,
+    readout: ReadoutPlan,
+    supported_modes: frozenset[MaskMode],
+    trained_modes: frozenset[MaskMode],
+    default_mode: MaskMode,
+    tied_embeddings: bool | None = None,
+) -> ModelDescriptor:
+    """把一份 Qwen3.5 风格 config 拼成 `ModelDescriptor`（不做 weight 相关的事）。"""
+    text = text_config(config)
+    numbers = geometry(text)
+    descriptor = ModelDescriptor(
+        family=family,
+        model_id=model_id,
+        hidden=numbers["hidden"],
+        num_layers=numbers["num_layers"],
+        layer_types=layer_types(text),
+        heads=numbers["heads"],
+        kv_heads=numbers["kv_heads"],
+        head_dim=numbers["head_dim"],
+        ffn=numbers["ffn"],
+        vocab=numbers["vocab"],
+        max_position=numbers["max_position"],
+        readout=readout,
+        supported_modes=supported_modes,
+        trained_modes=trained_modes,
+        default_mode=default_mode,
+        tied_embeddings=(
+            bool(text.get("tie_word_embeddings", True))
+            if tied_embeddings is None
+            else tied_embeddings
+        ),
+        mtp_layers=int(text.get("mtp_num_hidden_layers", 0)),  # type: ignore[arg-type]
+        rms_eps=float(text.get("rms_norm_eps", 1e-6)),  # type: ignore[arg-type]
+        vision=vision_spec(config),
+    )
+    descriptor.validate()
+    return descriptor
+
+
+def layer_plan(descriptor: ModelDescriptor, config: EngineConfig) -> LayerPlan:
+    """按 ring 切块（三个家族一样：Qwen3.5 的层布局相同）。"""
+    return plan_layers(descriptor.layer_types, config.scheduler.ring)

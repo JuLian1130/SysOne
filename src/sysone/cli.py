@@ -1,0 +1,142 @@
+"""命令行入口：`sysone inspect` / `sysone run`。"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import sys
+from pathlib import Path
+
+from .config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig
+from .devices.reference import CharEncoder, ReferenceRunner
+from .domain.attention import MaskMode
+from .domain.decision import DecisionRequest, Question
+from .engine.engine import Engine
+from .errors import ConfigError, SysOneError
+from .models import families as _family_modules  # noqa: F401  导入即注册
+from .models.descriptor import ModelDescriptor
+from .models.registry import families, family
+from .weights.store import TensorStore
+
+_INPUT_KEYS = {"state", "questions", "attention_mode", "request_id"}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sysone", description="SysOne 决策推理引擎")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    inspect = sub.add_parser("inspect", help="解析模型配置并打印描述")
+    inspect.add_argument("--model", required=True, choices=families())
+    inspect.add_argument("--weights", type=Path, required=True, help="模型目录")
+
+    run = sub.add_parser("run", help="用参考后端跑一次请求")
+    run.add_argument("--descriptor", type=Path, required=True, help="descriptor JSON")
+    run.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
+    run.add_argument("--input", type=Path, required=True, help="请求 JSON")
+    run.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
+    run.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
+    return parser
+
+
+def _load_json(path: Path) -> object:
+    if not path.is_file():
+        raise ConfigError("文件不存在", path=str(path))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError("JSON 解析失败", path=str(path), error=str(exc)) from exc
+
+
+def _parse_mode(value: str | None) -> MaskMode | None:
+    if value is None:
+        return None
+    try:
+        return MaskMode(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in MaskMode)
+        raise ConfigError("未知注意力模式", mode=value, allowed=allowed) from exc
+
+
+def _load_request(path: Path) -> DecisionRequest:
+    payload = _load_json(path)
+    if not isinstance(payload, dict):
+        raise ConfigError("请求 JSON 必须是对象", path=str(path))
+    unknown = set(payload) - _INPUT_KEYS
+    if unknown:
+        raise ConfigError("请求 JSON 有未知字段", fields=sorted(unknown))
+    state = payload.get("state")
+    if not isinstance(state, str) or not state:
+        raise ConfigError("缺少 state 文本")
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        raise ConfigError("questions 必须是非空数组")
+    questions = []
+    for index, item in enumerate(raw_questions):
+        if not isinstance(item, dict):
+            raise ConfigError("问题必须是对象", question=index)
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            raise ConfigError("问题缺少 text", question=index)
+        options = item.get("options") or ()
+        kind = item.get("kind") or "choice"
+        if not isinstance(options, (list, tuple)) or not all(isinstance(o, str) for o in options):
+            raise ConfigError("options 必须是字符串数组", question=index)
+        questions.append(Question(text=text, options=tuple(options), kind=kind))
+    return DecisionRequest(
+        state=state,
+        questions=tuple(questions),
+        attention_mode=_parse_mode(payload.get("attention_mode")),
+        request_id=payload.get("request_id") or "",
+    )
+
+
+def _tensor_files(weights: Path) -> list[Path]:
+    if weights.is_dir():
+        files = sorted(weights.glob("*.safetensors"))
+        if not files:
+            raise ConfigError("目录里没有 safetensors", dir=str(weights))
+        return files
+    if weights.is_file():
+        return [weights]
+    raise ConfigError("权重路径不存在", path=str(weights))
+
+
+def _print(payload: object) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        if args.command == "inspect":
+            descriptor = family(args.model).parse_config(args.weights)
+            _print(descriptor.summary())
+            return 0
+        descriptor = ModelDescriptor.from_mapping(_load_json(args.descriptor))
+        store = TensorStore(_tensor_files(args.weights))
+        mode = _parse_mode(args.attention_mode)
+        config = EngineConfig(
+            model=ModelSelection(name=args.weights.name, dir=args.weights),
+            scheduler=SchedulerConfig(attention_mode=mode),
+            service=ServiceConfig(debug_timings=bool(args.debug_timings)),
+        )
+        config.validate()
+        engine = Engine(
+            descriptor=descriptor,
+            runner=ReferenceRunner(descriptor, store),
+            encoder=CharEncoder(vocab=descriptor.vocab),
+            config=config,
+        )
+        engine.start()
+        result = engine.run(_load_request(args.input))
+        _print(dataclasses.asdict(result))
+        return 0
+    except SysOneError as exc:
+        payload = {"error": exc.message, "code": exc.code, "status": exc.status, "context": exc.context}
+        print(json.dumps(payload, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

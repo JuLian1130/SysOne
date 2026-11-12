@@ -1,0 +1,30 @@
+{
+  "family": "reference",
+  "model_id": "tiny",
+  "hidden": 16,
+  "num_layers": 2,
+  "layer_types": ["full", "full"],
+  "heads": 2,
+  "kv_heads": 1,
+  "head_dim": 8,
+  "ffn": 32,
+  "vocab": 16,
+  "max_position": 128,
+  "supported_modes": ["causal", "noncausal_full", "prefix_noncausal"],
+  "trained_modes": ["prefix_noncausal"],
+  "default_mode": "prefix_noncausal",
+  "quant": {"scheme": "none", "scales": "none", "storage": "tensor"},
+  "tied_embeddings": true,
+  "mtp_layers": 0,
+  "rms_eps": 1e-06,
+  "readout": {
+    "kind": "code_rows",
+    "weight": "readout",
+    "file": null,
+    "rows": 4,
+    "labels": ["A", "B", "C", "D"],
+    "temperature": 1.0,
+    "dtype": "fp32"
+  },
+  "vision": null
+}
