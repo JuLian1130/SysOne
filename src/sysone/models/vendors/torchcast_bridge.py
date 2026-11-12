@@ -25,6 +25,7 @@ from .base import VendorAnswer, wire_answer
 from .torch_support import build_model, fill_model, torch_dtype
 
 _WARMUP_STATE = "warmup"
+_WARMUP_STATES = (_WARMUP_STATE, _WARMUP_STATE * 40, _WARMUP_STATE * 120)
 _WARMUP_QUESTION = {
     "type": "choice",
     "instructions": "Which option is correct?",
@@ -98,8 +99,17 @@ class TorchcastBridge:
     def compile_or_warm_up(self) -> CompilationTimes:
         """烧掉冷启动前向并校验概率有限、归一。"""
         started = time.perf_counter()
+        for state in _WARMUP_STATES:
+            self._warm_once(state)
+        return CompilationTimes(
+            load_s=self._load_s,
+            compile_s=0.0,
+            warmup_s=time.perf_counter() - started,
+        )
+
+    def _warm_once(self, state: str) -> None:
         try:
-            answer = self.decide(_WARMUP_STATE, _WARMUP_QUESTION, mode=MaskMode.NONCAUSAL_FULL)
+            answer = self.decide(state, _WARMUP_QUESTION, mode=MaskMode.NONCAUSAL_FULL)
         except Exception as exc:  # noqa: BLE001 — 预热失败就是要按未就绪报出去
             raise NotReadyError("厂商桥预热前向失败", bridge=self.name, reason=str(exc)) from exc
         probs = tuple(float(value) for value in answer.probs)

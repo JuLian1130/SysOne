@@ -36,6 +36,8 @@ _WARMUP_QUESTION = {
     "instructions": "Which option is correct?",
     "criteria": {"A": "A", "B": "B"},
 }
+# 三种长度：进程内头几次 prefill 才是坏的，长短各来一遍才能都烧掉
+_WARMUP_STATES = (_WARMUP_STATE, _WARMUP_STATE * 40, _WARMUP_STATE * 120)
 
 
 def _load_shim(model_dir: Path):
@@ -117,8 +119,17 @@ class H2OBridge:
         暴露，而不是变成第一道题的答案。
         """
         started = time.perf_counter()
+        for state in _WARMUP_STATES:
+            self._warm_once(state)
+        return CompilationTimes(
+            load_s=self._load_s,
+            compile_s=0.0,
+            warmup_s=time.perf_counter() - started,
+        )
+
+    def _warm_once(self, state: str) -> None:
         try:
-            answer = self.decide(_WARMUP_STATE, _WARMUP_QUESTION, mode=MaskMode.CAUSAL)
+            answer = self.decide(state, _WARMUP_QUESTION, mode=MaskMode.CAUSAL)
         except Exception as exc:  # noqa: BLE001 — 预热失败就是要按未就绪报出去
             raise NotReadyError("厂商桥预热前向失败", bridge=self.name, reason=str(exc)) from exc
         probs = tuple(float(value) for value in answer.probs)
@@ -126,11 +137,6 @@ class H2OBridge:
             raise NotReadyError("厂商桥预热前向产生了非法概率", bridge=self.name, probs=list(probs))
         if abs(sum(probs) - 1.0) > 1e-3:
             raise NotReadyError("厂商桥预热前向概率未归一", bridge=self.name, total=sum(probs))
-        return CompilationTimes(
-            load_s=self._load_s,
-            compile_s=0.0,
-            warmup_s=time.perf_counter() - started,
-        )
 
     # ---------------------------------------------------------------- decide
     def decide(self, state: str, question: dict, *, mode: MaskMode) -> VendorAnswer:
