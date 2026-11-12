@@ -12,6 +12,7 @@ from typing import Protocol
 
 from ...domain.attention import MaskMode
 from ...domain.decision import Question
+from ...domain.work import CompilationTimes
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,9 @@ class VendorBridge(Protocol):
 
     def decide(self, state: str, question: dict, *, mode: MaskMode) -> VendorAnswer:
         """按厂商自己的模板与前向跑一道题。"""
+
+    def compile_or_warm_up(self) -> CompilationTimes:
+        """跑一次预热前向并校验它的概率；不合法要抛 `NotReadyError`。"""
 
     def artifact_bytes(self) -> int:
         """占用磁盘的编译产物字节数；没有产物就返回 0。"""

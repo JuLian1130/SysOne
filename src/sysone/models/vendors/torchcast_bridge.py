@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import sys
 import time
 from pathlib import Path
@@ -17,14 +18,26 @@ from pathlib import Path
 import torch
 
 from ...domain.attention import MaskMode
-from ...errors import ConfigError, ReadoutError, UnsupportedModeError
+from ...domain.work import CompilationTimes
+from ...errors import ConfigError, NotReadyError, ReadoutError, UnsupportedModeError
 from ...weights.packing.row_int8 import RowInt8Store
 from .base import VendorAnswer, wire_answer
 from .torch_support import build_model, fill_model, torch_dtype
 
+_WARMUP_STATE = "warmup"
+_WARMUP_QUESTION = {
+    "type": "choice",
+    "instructions": "Which option is correct?",
+    "criteria": {"A": "A", "B": "B"},
+}
+
 
 class TorchcastBridge:
-    """Torchcast Decision 4B 的 vendor 桥。"""
+    """Torchcast Decision 4B 的 vendor 桥：模型、模板与读出全归厂商包。
+
+    默认 fp32，理由同 H2OBridge：CPU 上 bf16 会出 NaN 与漂移，权重常驻 int8 时
+    切 fp32 只加计算量、不加权重内存。
+    """
 
     name = "torchcast"
 
@@ -33,7 +46,7 @@ class TorchcastBridge:
         model_dir: Path | str,
         *,
         device: str = "cpu",
-        precision: str = "bf16",
+        precision: str = "fp32",
         max_length: int = 16384,
     ) -> None:
         self.dir = Path(model_dir)
@@ -43,9 +56,11 @@ class TorchcastBridge:
         self._model = None
         self._engine = None
         self._store = None
+        self._load_s = 0.0
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:
+        started = time.perf_counter()
         package_dir = self.dir / "torchcast_decision"
         if not package_dir.exists():
             raise ConfigError("厂商目录缺少 torchcast_decision 包", path=str(package_dir))
@@ -77,6 +92,26 @@ class TorchcastBridge:
         finally:
             cls.from_pretrained = original
             sys.path.remove(str(self.dir))
+        self._load_s = time.perf_counter() - started
+
+    # ---------------------------------------------------------------- warmup
+    def compile_or_warm_up(self) -> CompilationTimes:
+        """烧掉冷启动前向并校验概率有限、归一。"""
+        started = time.perf_counter()
+        try:
+            answer = self.decide(_WARMUP_STATE, _WARMUP_QUESTION, mode=MaskMode.NONCAUSAL_FULL)
+        except Exception as exc:  # noqa: BLE001 — 预热失败就是要按未就绪报出去
+            raise NotReadyError("厂商桥预热前向失败", bridge=self.name, reason=str(exc)) from exc
+        probs = tuple(float(value) for value in answer.probs)
+        if not probs or not all(math.isfinite(value) for value in probs):
+            raise NotReadyError("厂商桥预热前向产生了非法概率", bridge=self.name, probs=list(probs))
+        if abs(sum(probs) - 1.0) > 1e-3:
+            raise NotReadyError("厂商桥预热前向概率未归一", bridge=self.name, total=sum(probs))
+        return CompilationTimes(
+            load_s=self._load_s,
+            compile_s=0.0,
+            warmup_s=time.perf_counter() - started,
+        )
 
     # ---------------------------------------------------------------- decide
     def decide(self, state: str, question: dict, *, mode: MaskMode) -> VendorAnswer:

@@ -37,7 +37,7 @@ class VendorRunner:
         return int(self._bridge.artifact_bytes())
 
     def compile_or_warm_up(self) -> CompilationTimes:
-        return CompilationTimes(load_s=0.0, compile_s=0.0, warmup_s=0.0)
+        return self._bridge.compile_or_warm_up()
 
     def check_health(self) -> bool:
         return self._loaded

@@ -133,3 +133,12 @@ def test_torch_dtype_mapping() -> None:
     with pytest.raises(Exception) as info:
         torch_dtype("nf4")
     assert "未知的权重精度" in str(info.value)
+
+
+def test_vendor_bridges_default_to_fp32() -> None:
+    """CPU 上 bf16 实测会出 NaN 与漂移，默认必须是 fp32。"""
+    from sysone.models.vendors.h2o_bridge import H2OBridge
+    from sysone.models.vendors.torchcast_bridge import TorchcastBridge
+
+    assert H2OBridge("unused").dtype is torch.float32
+    assert TorchcastBridge("unused").dtype is torch.float32

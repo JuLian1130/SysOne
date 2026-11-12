@@ -15,9 +15,10 @@ from helpers import load_tiny_descriptor, make_request
 from sysone.config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig
 from sysone.domain.attention import MaskMode
 from sysone.domain.decision import Question
+from sysone.domain.work import CompilationTimes
 from sysone.engine.engine import Engine
 from sysone.engine.strategies.vendor import VendorRunner
-from sysone.errors import UnsupportedModeError
+from sysone.errors import NotReadyError, UnsupportedModeError
 from sysone.models.vendors.base import VendorAnswer
 
 
@@ -33,6 +34,9 @@ class FakeBridge:
 
     def load(self) -> None:
         self.loaded = True
+
+    def compile_or_warm_up(self) -> CompilationTimes:
+        return CompilationTimes(load_s=0.0, compile_s=0.0, warmup_s=0.0)
 
     def decide(self, state: str, question: dict, *, mode: MaskMode) -> VendorAnswer:
         if mode is self.fail_mode:
@@ -147,6 +151,25 @@ def test_vendor_runner_artifacts_and_close() -> None:
     assert runner.check_health() is True
     runner.shutdown()
     assert bridge.loaded is False
+
+
+def test_vendor_runner_delegates_warmup() -> None:
+    runner = VendorRunner(FakeBridge(trained=(MaskMode.CAUSAL,)))
+    times = runner.compile_or_warm_up()
+    assert times.total_s == 0.0
+    assert times.load_s == 0.0
+
+
+def test_engine_start_surfaces_bridge_warmup_failure() -> None:
+    """预热抛 NotReadyError 时启动就该失败，而不是让第一道题拿到坏概率。"""
+
+    class BrokenWarmup(FakeBridge):
+        def compile_or_warm_up(self) -> CompilationTimes:
+            raise NotReadyError("预热概率非法", bridge="fake")
+
+    engine = _engine(BrokenWarmup(trained=(MaskMode.CAUSAL,)))
+    with pytest.raises(NotReadyError):
+        engine.start()
 
 
 def test_question_spec_carries_options_as_criteria() -> None:

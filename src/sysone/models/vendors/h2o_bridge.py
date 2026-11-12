@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import time
 from pathlib import Path
 
@@ -20,13 +21,21 @@ import numpy as np
 import torch
 
 from ...domain.attention import MaskMode
-from ...errors import ConfigError, ReadoutError, UnsupportedModeError
+from ...domain.work import CompilationTimes
+from ...errors import ConfigError, NotReadyError, ReadoutError, UnsupportedModeError
 from ...weights.packing.row_int8 import RowInt8Store
 from .base import VendorAnswer, wire_answer
 from .torch_support import build_model, fill_model, output_weight, text_backbone, torch_dtype
 
 _SHIM_FILE = "h2o_lightning_shim.py"
 _SERVE_FILE = "serve_config.json"
+# 预热题：只用两个选项，尽量便宜，目的只是把冷启动那次前向烧掉
+_WARMUP_STATE = "warmup"
+_WARMUP_QUESTION = {
+    "type": "choice",
+    "instructions": "Which option is correct?",
+    "criteria": {"A": "A", "B": "B"},
+}
 
 
 def _load_shim(model_dir: Path):
@@ -42,7 +51,12 @@ def _load_shim(model_dir: Path):
 
 
 class H2OBridge:
-    """H2O-Lightning-4B 的 vendor 桥。"""
+    """H2O-Lightning-4B 的 vendor 桥。
+
+    默认 fp32：实测这个 hybrid 检查点在 CPU 上用 bf16 算会出 NaN 与大幅漂移
+    （首个全注意力层读出 NaN，同一输入的概率在 0.75 与 0.97 之间跳），fp32
+    首访即稳定。权重常驻的是 int8，切 fp32 只加计算量、不加权重内存。
+    """
 
     name = "h2o"
 
@@ -51,7 +65,7 @@ class H2OBridge:
         model_dir: Path | str,
         *,
         device: str = "cpu",
-        precision: str = "bf16",
+        precision: str = "fp32",
     ) -> None:
         self.dir = Path(model_dir)
         self.device = torch.device(device)
@@ -64,9 +78,11 @@ class H2OBridge:
         self._lm = None
         self._store = None
         self._bidir = False
+        self._load_s = 0.0
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:
+        started = time.perf_counter()
         serve = self.dir / _SERVE_FILE
         if not serve.exists():
             raise ConfigError("厂商目录缺少 serve_config.json", path=str(serve))
@@ -90,6 +106,31 @@ class H2OBridge:
         )
         self._backbone = text_backbone(self._model)
         self._lm = output_weight(self._model)
+        self._load_s = time.perf_counter() - started
+
+    # ---------------------------------------------------------------- warmup
+    def compile_or_warm_up(self) -> CompilationTimes:
+        """烧掉冷启动前向。
+
+        实测该检查点第一次 prefill 会在第一个全注意力层读出 NaN（第二次起正常），
+        所以装载完必须先跑一次并把结果校验掉：非法概率在这里以 `NotReadyError`
+        暴露，而不是变成第一道题的答案。
+        """
+        started = time.perf_counter()
+        try:
+            answer = self.decide(_WARMUP_STATE, _WARMUP_QUESTION, mode=MaskMode.CAUSAL)
+        except Exception as exc:  # noqa: BLE001 — 预热失败就是要按未就绪报出去
+            raise NotReadyError("厂商桥预热前向失败", bridge=self.name, reason=str(exc)) from exc
+        probs = tuple(float(value) for value in answer.probs)
+        if not probs or not all(math.isfinite(value) for value in probs):
+            raise NotReadyError("厂商桥预热前向产生了非法概率", bridge=self.name, probs=list(probs))
+        if abs(sum(probs) - 1.0) > 1e-3:
+            raise NotReadyError("厂商桥预热前向概率未归一", bridge=self.name, total=sum(probs))
+        return CompilationTimes(
+            load_s=self._load_s,
+            compile_s=0.0,
+            warmup_s=time.perf_counter() - started,
+        )
 
     # ---------------------------------------------------------------- decide
     def decide(self, state: str, question: dict, *, mode: MaskMode) -> VendorAnswer:
