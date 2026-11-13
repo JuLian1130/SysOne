@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,7 @@ _REQUIRED = (
     "e8_load",
     "e8_load_warm",
     "e8_eval",
+    "e8_eval_slot",
     "e8_unload",
     "e8_unload_all",
     "e8_count",
@@ -35,6 +37,7 @@ _REQUIRED = (
     "e8_surface_bytes",
     "e8_surface_free",
     "e8_attach",
+    "e8_attach_slot",
     "e8_avail_gb",
     "e8_wired_gb",
     "e8_footprint_gb",
@@ -102,6 +105,11 @@ class AneRuntime:
         rc = self.lib.e8_init()
         if rc:
             raise NotReadyError("e8_init 失败", rc=int(rc), reason=self.error())
+        # 异步 eval 的工作线程：`e8_eval` 是阻塞 ctypes 调用，但 ctypes 在调用期间释放 GIL，
+        # 所以一个普通工作线程就够。**只有一个 eval 在飞**：两个并发发射者在这台机器上慢
+        # 1.68×（同一条固件队列），所以这里刻意用 `max_workers=1`（`docs/ANE/anebench/e8_a3.py:168-179`）。
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ane")
+        self._pending: "Future | None" = None
 
     def _bind(self) -> None:
         lib = self.lib
@@ -122,6 +130,16 @@ class AneRuntime:
         lib.e8_eval.restype = ctypes.c_double
         lib.e8_attach.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64]
         lib.e8_attach.restype = ctypes.c_int
+        lib.e8_attach_slot.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.e8_attach_slot.restype = ctypes.c_int
+        lib.e8_eval_slot.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.e8_eval_slot.restype = ctypes.c_double
         lib.e8_unload.argtypes = [ctypes.c_char_p]
         lib.e8_count.restype = ctypes.c_int
         lib.e8_avail_gb.restype = ctypes.c_double
@@ -187,6 +205,10 @@ class AneRuntime:
         """同步执行一次，返回 dylib 记录的毫秒数（M2.0 只用它做对拍，不做吞吐）。"""
         return float(self.lib.e8_eval(name.encode(), int(procedure)))
 
+    def eval_slot(self, name: str, procedure: int = 0, slot: int = 0) -> float:
+        """在指定槽位上同步执行一次；槽位 0 与 `eval()` 等价，其余槽位要先用 `attach_slot` 绑过。"""
+        return float(self.lib.e8_eval_slot(name.encode(), int(procedure), int(slot)))
+
     def attach(self, name: str, procedure: int, surf_in: Surface, surf_out: Surface) -> None:
         """把一对 surface 绑到一个 (program, procedure) 上；绑定后 `eval` 才能跑。"""
         self._check(
@@ -196,8 +218,53 @@ class AneRuntime:
             f"attach({name}, {procedure})",
         )
 
+    def attach_slot(
+        self, name: str, procedure: int, slot: int, surf_in: Surface, surf_out: Surface
+    ) -> None:
+        """把另一对 surface 绑到同一个 (program, procedure) 的第 `slot` 个槽位。
+
+        多槽是为了"一次 eval 在飞时准备下一段"：同一段代码在不同槽位上跑，输入输出各是
+        独立的 IOSurface，所以 GPU 可以往槽 1 写、ANE 从槽 0 读。槽 0 由 `attach()` 绑，
+        这里是槽 1 起的补充。
+        """
+        self._check(
+            self.lib.e8_attach_slot(
+                name.encode(), int(procedure), int(slot),
+                int(surf_in.handle), int(surf_out.handle),
+            ),
+            f"attach_slot({name}, {procedure}, slot={slot})",
+        )
+
+    # ------------------------------------------------------------ 异步执行
+
+    @property
+    def pending(self) -> bool:
+        """是否还有一次已发射、未回收的 eval 在飞。"""
+        return self._pending is not None
+
+    def issue(self, name: str, procedure: int = 0) -> None:
+        """异步发射一次 eval，立刻返回；用 `reap()` 回收。
+
+        这是旧引擎 `ISSUE_EVAL`（`docs/ANE/anebench/e8_a3.py:168-179`）的语义：
+        **不是并发 eval**（两个并发发射者慢 1.68×，同一条固件队列），而是"eval 在飞时
+        CPU 不阻塞"，于是这段时间里可以往 GPU 命令缓冲里继续编码互不依赖的 kernel。
+        """
+        if self._pending is not None:
+            raise NotReadyError("上一次 eval 还没回收", name=name, procedure=procedure)
+        self._pending = self._executor.submit(self.eval, name, int(procedure))
+
+    def reap(self) -> float:
+        """回收一次在飞的 eval，返回它的毫秒数；没有在飞的就返回 0。"""
+        pending = self._pending
+        self._pending = None
+        if pending is None:
+            return 0.0
+        return float(pending.result())
+
     def unload(self, name: str) -> None:
         self.lib.e8_unload(name.encode())
 
     def close(self) -> None:
+        self.reap()
+        self._executor.shutdown(wait=True)
         self.lib.e8_unload_all()

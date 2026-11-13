@@ -406,13 +406,45 @@ class AneLayer:
         out_key = f"{proc}_out"
         return self._read(out_key, cout), ms
 
-    def eval_proc(self, proc: str) -> float:
+    def eval_proc(self, proc: str, *, slot: int = 0) -> float:
         """只执行一个 procedure，不读回结果（流水线里结果留在面上给 GPU 核用）。"""
-        ms = self._runtime.eval(self.name, PROCS[proc])
+        if slot:
+            ms = self._runtime.eval_slot(self.name, PROCS[proc], slot)
+        else:
+            ms = self._runtime.eval(self.name, PROCS[proc])
         if ms < 0:
-            raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc,
+            raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc, slot=slot,
                                 reason=self._runtime.error())
         return ms
+
+    def issue_proc(self, proc: str) -> None:
+        """异步发射一个 procedure（不等待），随后用 `reap_proc()` 回收。
+
+        发射之后到回收之前，CPU 可以去 GPU 命令缓冲里编码与该 procedure 无关的 kernel ——
+        这是旧引擎 `ISSUE_EVAL` 的做法。违反"只有一个 eval 在飞"会抛 `NotReadyError`。
+        """
+        self._runtime.issue(self.name, PROCS[proc])
+
+    def reap_proc(self) -> float:
+        """回收上一次 `issue_proc()` 的 eval，返回毫秒数。"""
+        ms = self._runtime.reap()
+        if ms < 0:
+            raise NotReadyError("ANE 执行失败", program=self.name, reason=self._runtime.error())
+        return ms
+
+    def bind_slot(self, slot: int, *, keys: tuple[str, ...] = ("in", "out")) -> bool:
+        """给某个槽位再绑一对面。`keys=("proj_in", "proj_out")` 之类的写法由调用方决定。"""
+        if slot <= 0:
+            raise ConfigError("槽位 0 由 attach() 绑定，不能重复绑", slot=slot)
+        if keys not in {
+            ("proj_in", "proj_out"), ("out_in", "out_out"), ("ffn_in", "ffn_out"),
+        }:
+            raise ConfigError("未知的槽位绑定键", keys=keys)
+        proc = {"proj": "proj", "out": "out", "ffn": "ffn"}[keys[0].split("_")[0]]
+        self._runtime.attach_slot(
+            self.name, PROCS[proc], slot, self._surfaces[keys[0]], self._surfaces[keys[1]]
+        )
+        return True
 
     def project(self, x: np.ndarray) -> tuple[np.ndarray, float]:
         """`[hidden, s]` → `[cout, s]`。"""

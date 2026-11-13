@@ -37,6 +37,16 @@ MTL_DYLIB_NAME = "libe8mtl.dylib"
 # `at_stage()`，循环体逐字保留。
 SOURCES = ("e8_common.h", "e8_kernels.metal", "e8_attn.metal", "e8_gdn.metal")
 
+# 两条命令队列（`docs/ANE/anebench/e8_mtl.m:51-72` 的 `E8_NLANE`）：
+#   lane 0 —— 长任务：`k_attn` / `k_q_prep` / `k_kv_prep`，以及 ANE 藏在其后的那些 stage；
+#   lane 1 —— 1~3 ms 的小核：`k_norm_to` / `k_norm_resid` / `k_copy`（GDN 的 `core` 也在这里，
+#             因为 lane 0 上排着 ~140 ms 的 attention dispatch，把它排后面会让 ANE 停一整个
+#             attention 瓦片 —— `e8_a3.py:317-349` 的 docstring 记着这个 85 次 × 39 ms 的坑）。
+# 两条 lane 各自有命令缓冲与待回收队列，`wait(lane)` 只等自己那条。
+LANE_LONG = 0
+LANE_SMALL = 1
+LANES = (LANE_LONG, LANE_SMALL)
+
 # 复用到的符号。少一个就说明 dylib 是旧的或编译坏了，在 init 处一次报清楚。
 _REQUIRED = (
     "e8m_init_src",
@@ -52,6 +62,7 @@ _REQUIRED = (
     "e8m_wait_l",
     "e8m_sync_l",
     "e8m_gpu_ms",
+    "e8m_gpu_busy_l",
 )
 
 
@@ -248,6 +259,8 @@ class MetalRuntime:
         lib.e8m_sync_l.argtypes = [ctypes.c_int]
         lib.e8m_sync_l.restype = ctypes.c_double
         lib.e8m_gpu_ms.restype = ctypes.c_double
+        lib.e8m_gpu_busy_l.argtypes = [ctypes.c_int]
+        lib.e8m_gpu_busy_l.restype = ctypes.c_double
 
     def _compile(self, sources: Path, *, verbose: bool, geometry: "Geometry | None" = None) -> None:
         missing = [name for name in SOURCES if not (sources / name).is_file()]
@@ -333,6 +346,19 @@ class MetalRuntime:
 
     def sync(self, lane: int = 0) -> float:
         return float(self.lib.e8m_sync_l(int(lane)))
+
+    def sync_all(self) -> float:
+        """两条 lane 都提交并等到队尾；返回两条 lane 里更长的那个耗时（ms）。
+
+        只在真的"两边都要等"的地方用（比如整层跑完、要读回最终隐藏态）。逐段流水里
+        大多数等待只依赖一条 lane，用 `sync(lane)` 就够 —— 多等一条会把另一条上还在
+        跑的活也拖成串行，等于把两条 lane 又并成一条。
+        """
+        return max(self.sync(lane) for lane in LANES)
+
+    def busy_ms(self, lane: int = 0) -> float:
+        """该 lane 自上次读取以来的 GPU 执行时间（ms）；用来看 lane 0/lane 1 各自的忙时。"""
+        return float(self.lib.e8m_gpu_busy_l(int(lane)))
 
     def gpu_ms(self) -> float:
         return float(self.lib.e8m_gpu_ms())

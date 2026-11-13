@@ -267,3 +267,54 @@ def test_program_files_are_reused_on_second_write(tmp_path: Path) -> None:
     assert second.reused is True
     third = write_program(tmp_path / "p8", mil=mil, blob=b"y" * 4, s=16)
     assert third.reused is False, "blob 变了就必须重写，不能沿用旧 sidecar"
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
+def test_multi_slot_binding_and_async_eval(tmp_path: Path) -> None:
+    """同一 program 的第二套面能绑到槽 1 并独立执行；`issue_proc`/`reap_proc` 能异步跑。
+
+    这两个能力是第 2 步（双 lane + 多槽 + 异步 eval）的机制验收：槽 1 是为了"一次 eval 在飞
+    时用另一套面准备下一段"，异步 eval 是为了"eval 在飞时 CPU 不阻塞"。这里用小几何合成
+    权重，只钉机制不改数值。
+    """
+    # 几何要落在 ANE 肯跑的范围内：通道数太窄（如 hidden=8 / ffn=24）时 ANE 会在
+    # `evaluate` 阶段直接报 `Program Inference error`（status=0x1d）。这里取 64/192/64，
+    # `ffn_parts(64, 192) == 3` 刚好覆盖 down 的三段切片。
+    hidden, ffn, cout, s = 64, 192, 64, 64
+    rng = np.random.default_rng(3)
+    items = {
+        "proj": rng.standard_normal((cout, hidden)).astype(np.float16),
+        "o": rng.standard_normal((hidden, hidden)).astype(np.float16),
+        "gate": rng.standard_normal((ffn, hidden)).astype(np.float16),
+        "up": rng.standard_normal((ffn, hidden)).astype(np.float16),
+        **{f"down{i}": rng.standard_normal((hidden, hidden)).astype(np.float16)
+           for i in range(ffn_parts(hidden, ffn))},
+    }
+    blob, entries = ane_blob.build(items, quantize=False)
+    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=entries)
+    files = write_program(tmp_path / "slots", mil=mil, blob=blob, s=s)
+
+    runtime = AneRuntime()
+    layer = AneLayer(runtime, files, name="m22_slots", hidden=hidden, cout=cout, ffn=ffn, s=s)
+    try:
+        x = rng.standard_normal((hidden, s)).astype(np.float16)
+        layer._write("proj_in", hidden, x)
+        layer.eval_proc("proj")
+        slot0 = layer._read("proj_out", cout)
+
+        # 槽 1 绑同一对面（机制验收：多槽走的是 `e8_attach_slot` / `e8_eval_slot`）。
+        layer.bind_slot(1, keys=("proj_in", "proj_out"))
+        layer._write("proj_in", hidden, x)
+        layer.eval_proc("proj", slot=1)
+        slot1 = layer._read("proj_out", cout)
+        np.testing.assert_array_equal(slot0, slot1, "同一输入在槽 0/槽 1 必须逐位一致")
+
+        # 异步：发射后立刻返回，回收时给出毫秒数。
+        layer.issue_proc("proj")
+        assert runtime.pending is True
+        ms = layer.reap_proc()
+        assert runtime.pending is False
+        assert ms > 0, "回收得到的应该是这次 eval 的毫秒数"
+    finally:
+        layer.close()
+        runtime.close()

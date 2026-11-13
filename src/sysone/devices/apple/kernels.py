@@ -17,7 +17,19 @@ import struct
 
 from ...errors import NotReadyError
 from .geometry import Geometry, mude_geometry
-from .metal import MetalBuffer, MetalRuntime
+from .metal import LANE_LONG, LANE_SMALL, MetalBuffer, MetalRuntime
+
+__all__ = [
+    "LANE_LONG",
+    "LANE_SMALL",
+    "attention",
+    "copy_columns",
+    "gdn",
+    "kv_prep",
+    "norm_residual",
+    "norm_to",
+    "q_prep",
+]
 
 # ---- 几何（默认 = mude 2B，与 e8_common.h:52-67 的默认宏一致）------------------------------
 # 运行时路径（`pipeline.py`）一律显式传 `geometry=`；下面的模块常量只为测试与默认几何保留，
@@ -172,6 +184,7 @@ def copy_columns(
     src_stride: int,
     dst_stride: int,
     src_s0: int = 0,
+    lane: int = LANE_SMALL,
 ) -> None:
     grid, tg = _copy_grid(nchan, stile)
     runtime.dispatch(
@@ -189,6 +202,7 @@ def copy_columns(
         ),
         grid=grid,
         tg=tg,
+        lane=lane,
     )
 
 
@@ -206,6 +220,7 @@ def norm_to(
     segw: int = 0,
     dst_stride: int = 0,
     dst_s0: int = 0,
+    lane: int = LANE_SMALL,
 ) -> None:
     """`k_norm_to`：对 `src` 的每一列做 RMSNorm（`weight` 已在装配时补过 +1），写进 `dst`。
 
@@ -227,6 +242,7 @@ def norm_to(
         ),
         grid=grid,
         tg=tg,
+        lane=lane,
     )
 
 
@@ -242,6 +258,7 @@ def norm_residual(
     s0: int = 0,
     dst_stride: int = 0,
     dst_s0: int = 0,
+    lane: int = LANE_SMALL,
 ) -> None:
     """`k_norm_resid`：`dst = [rmsnorm(src) | src]`（两半各 HID 通道，正是 ANE 的 ffn 入口）。
 
@@ -261,6 +278,7 @@ def norm_residual(
         ),
         grid=grid,
         tg=tg,
+        lane=lane,
     )
 
 
@@ -278,6 +296,7 @@ def q_prep(
     nka: int = 0,
     segw: int = 0,
     geometry: Geometry | None = None,
+    lane: int = LANE_LONG,
 ) -> None:
     """`k_q_prep`（原地）：q 半区做 RMSNorm+部分 RoPE，gate 半区做 sigmoid。"""
     geom = GEOMETRY if geometry is None else geometry
@@ -297,6 +316,7 @@ def q_prep(
         ),
         grid=grid,
         tg=tg,
+        lane=lane,
     )
 
 
@@ -314,6 +334,7 @@ def kv_prep(
     nka: int = 0,
     segw: int = 0,
     geometry: Geometry | None = None,
+    lane: int = LANE_LONG,
 ) -> None:
     """`k_kv_prep`（原地）：只动 k 半区（v 不需要归一化或旋转）。"""
     geom = GEOMETRY if geometry is None else geometry
@@ -333,6 +354,7 @@ def kv_prep(
         ),
         grid=grid,
         tg=tg,
+        lane=lane,
     )
 
 
@@ -355,6 +377,7 @@ def attention(
     out_s0: int = 0,
     fast: bool = True,
     geometry: Geometry | None = None,
+    lane: int = LANE_LONG,
 ) -> None:
     """注意力：`qg`/`kv` 必须已经过 prep；结果写进 `out` 的第 `out_s0` 起的 HID 行（含 gate）。
 
@@ -391,6 +414,7 @@ def attention(
         ),
         grid=grid,
         tg=tg,
+        lane=lane,
     )
 
 
@@ -415,6 +439,7 @@ def gdn(
     out_s0: int = 0,
     fast: bool = True,
     geometry: Geometry | None = None,
+    lane: int = LANE_SMALL,
 ) -> None:
     """GDN：`proj` 是 ANE 的 8224 行投影（通道在前），结果写进 `out` 的前 HID 行。
 
@@ -430,7 +455,7 @@ def gdn(
     buffers_list = [proj, state, tail, wconv, a_log, dt_bias, norm, out, scratch]
     if not fast:
         grid, tg = _gdn_ref_grid(geom.l_v_heads, geom.l_k_dim)
-        runtime.dispatch("k_gdn_ref", buffers_list, args=args, grid=grid, tg=tg)
+        runtime.dispatch("k_gdn_ref", buffers_list, args=args, grid=grid, tg=tg, lane=lane)
         return
     for name, (grid, tg) in _gdn_fast_grids(stile, geom.l_v_heads, geom.l_v_dim):
-        runtime.dispatch(name, buffers_list, args=args, grid=grid, tg=tg)
+        runtime.dispatch(name, buffers_list, args=args, grid=grid, tg=tg, lane=lane)

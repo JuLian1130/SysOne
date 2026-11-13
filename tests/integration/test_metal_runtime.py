@@ -127,3 +127,42 @@ def test_runtime_is_shared_per_process():
     assert second.lib is not None
     second.close()
     assert MetalRuntime() is first, "close() 之后仍应复用同一份运行时"
+
+
+def test_lanes_are_independent_command_buffers():
+    """两条 lane 各有命令缓冲：提交并等待 lane 0 不会把 lane 1 上还没提交的活带出来。
+
+    `e8_mtl.m:51-72` 的约定是 lane 0 放长 stage（attention / prep）、lane 1 放小核
+    （norm / copy / gdn）。`sync_all()` 才是"两条都排空"。
+    """
+    runtime = _runtime()
+    src = runtime.alloc(2 * 8 * 2)
+    dst0 = runtime.alloc(2 * 8 * 2)
+    dst1 = runtime.alloc(2 * 8 * 2)
+    src.array(np.float16, (2, 8))[:] = np.float16(5.0)
+    dst0.array(np.float16, (2, 8))[:] = np.float16(-1.0)
+    dst1.array(np.float16, (2, 8))[:] = np.float16(-1.0)
+    args = _copy_args(
+        nchan=2, src_c0=0, dst_c0=0, stile=8, s0=0, src_stride=8, dst_stride=8, src_s0=0
+    )
+    grid, tg = (1, 1, 1), (64, 8, 1)
+
+    # lane 1：只编码、不提交。
+    runtime.dispatch("k_copy", [src, dst1], args=args, grid=grid, tg=tg, lane=1)
+    # lane 0：编码、提交、等待 —— 不该顺手把 lane 1 的活也执行掉。
+    runtime.dispatch("k_copy", [src, dst0], args=args, grid=grid, tg=tg, lane=0)
+    runtime.commit(0)
+    runtime.wait(0)
+    np.testing.assert_array_equal(dst0.array(np.float16, (2, 8)), np.float16(5.0))
+    np.testing.assert_array_equal(dst1.array(np.float16, (2, 8)), np.float16(-1.0))
+
+    # 提交 lane 1 之后它才跑，`sync_all()` 把两条一起排空。
+    runtime.commit(1)
+    runtime.wait(1)
+    np.testing.assert_array_equal(dst1.array(np.float16, (2, 8)), np.float16(5.0))
+    runtime.sync_all()
+    assert runtime.busy_ms(0) >= 0.0 and runtime.busy_ms(1) >= 0.0
+    src.free()
+    dst0.free()
+    dst1.free()
+    runtime.close()

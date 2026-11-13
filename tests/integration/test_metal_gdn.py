@@ -132,8 +132,9 @@ def _run(t: dict[str, np.ndarray], runtime: MetalRuntime, *, fast: bool) -> np.n
             runtime, proj_buf, state, tail, conv_buf, a_buf, dt_buf, norm_buf, out, scratch,
             stile=S, eps=EPS, first=True, T=S, fast=fast,
         )
-        runtime.commit()
-        runtime.wait()
+        # `k_gdn` 的四连 dispatch 全在 lane 1（小核队列）上，所以两条 lane 都要排空；
+        # 只 `commit()/wait()` 默认的 lane 0 会等到一个空的队列，`out` 还是全零。
+        runtime.sync_all()
         return out.array(np.float16, (2 * hid, S))[:hid].astype(np.float32)
     finally:
         for buf in (proj_buf, state, tail, conv_buf, a_buf, dt_buf, norm_buf, out, scratch):

@@ -23,7 +23,7 @@ from ...errors import ConfigError
 from . import kernels
 from .compile import AneLayer
 from .geometry import Geometry, mude_geometry
-from .metal import MetalBuffer, MetalRuntime
+from .metal import LANE_LONG, LANE_SMALL, MetalBuffer, MetalRuntime
 
 EPS = 1e-6
 
@@ -163,13 +163,24 @@ class MudePipeline:
             # 从第二层起，输入和输出都是 `x` 本身（就地）；第一层的输入仍是 `seed`。
             cur = nxt
             nxt = self.x
-            self._sync()
-        self._sync()
+        self._wait_all()
         self._last = cur
 
-    def _sync(self) -> None:
-        self._runtime.commit()
-        self._runtime.wait()
+    # ---- 两条命令队列 -------------------------------------------------------
+
+    def _wait(self, lane: int = LANE_SMALL) -> None:
+        """提交该 lane 的命令缓冲并等到队尾。
+
+        只有真的要用它刚写出的数据时才调：`kernels.py` 里 `k_norm_to`/`k_norm_resid`/
+        `k_copy`/`k_gdn` 都排在 lane 1，`k_q_prep`/`k_kv_prep`/`k_attn` 排在 lane 0。多等
+        另一条 lane 会把那边还在跑的活拖成串行，等于把两条队列并回一条。
+        """
+        self._runtime.commit(lane)
+        self._runtime.wait(lane)
+
+    def _wait_all(self) -> None:
+        """两条 lane 都等到队尾（整层/整链收尾、读回最终隐藏态时才用）。"""
+        self._runtime.sync_all()
 
     def _copy(
         self,
@@ -209,13 +220,19 @@ class MudePipeline:
                 stile=n, src_stride=self._width, eps=EPS, s0=start,
                 dst_stride=self._bucket, dst_s0=0,
             )
-            self._sync()          # GPU 只是排队，ANE 紧接着要读 proj_in
-            entry.ane.eval_proc("proj")
-            self._sync()
+            self._wait(LANE_SMALL)          # GPU 只是排队，ANE 紧接着要读 proj_in
+            # 发射即返回：投影在飞的时候 CPU 不阻塞，这段时间可以用来编码与本段无关的
+            # 搬运/计算（旧引擎 `ISSUE_EVAL` 的用法）。投影要把 `proj_out` 交给下一段，
+            # 所以紧接着回收 —— 真正的叠法要等两套 proj 槽位（见 docs 的 M2.2 第 5 片）。
+            entry.ane.issue_proc("proj")
+            entry.ane.reap_proc()
             self._copy(proj, self.qg, nchan=self._geometry.qg_rows, n=n, s0=start,
                        src_stride=self._bucket, dst_stride=self._width)
             self._copy(proj, self.kv, nchan=self._geometry.kv_rows, src_c0=self._geometry.qg_rows,
                        n=n, s0=start, src_stride=self._bucket, dst_stride=self._width)
+        # 分段投影的 `proj_out → qg/kv` 搬运在 lane 1 上，而下面两个 prep 在 lane 0 上；
+        # 两者碰的是同一批缓冲，所以必须等 lane 1 排空（否则 prep 之后的 qg 又被裸拷贝覆盖）。
+        self._wait(LANE_SMALL)
         kernels.q_prep(self._runtime, self.qg, entry.weights["q_norm"],
                        self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
                        geometry=self._geometry)
@@ -247,7 +264,7 @@ class MudePipeline:
                 T=self._width, stile=tail, nk=length, nq=tail, s0=prefix,
                 out_stride=self._width, out_s0=prefix, fast=True, geometry=self._geometry,
             )
-        self._sync()
+        self._wait(LANE_LONG)   # ANE 的 out 要吃 k_attn 写出的 attn 面
         self._out_and_ffn(entry, length, nxt, cur=cur)
 
     # ---- 线性（GDN）层 ------------------------------------------------------
@@ -268,13 +285,14 @@ class MudePipeline:
                 stile=n, src_stride=self._width, eps=EPS, s0=start,
                 dst_stride=self._bucket, dst_s0=0,
             )
-            self._sync()
-            entry.ane.eval_proc("proj")
-            self._sync()
-            # 残差直接写进 ANE 的 out_in 后半区，GDN 的输出去前半区
+            self._wait(LANE_SMALL)
+            entry.ane.issue_proc("proj")
+            # 残差搬运只读 `cur`、只写 `out_in` 的后半区，与在飞的投影（读写 `proj_in` /
+            # `proj_out`）不冲突，所以排在回收之前 —— 一次 eval 在飞时 CPU 继续编码。
             self._copy(cur, entry.surface("out_in"), nchan=self._hidden,
                        dst_c0=self._hidden, n=n, s0=0, src_s0=start,
                        src_stride=self._width, dst_stride=self._bucket)
+            entry.ane.reap_proc()
             kernels.gdn(
                 self._runtime, entry.surface("proj_out"), self.state, self.tail,
                 entry.weights["conv"], entry.weights["a_log"], entry.weights["dt_bias"],
@@ -285,9 +303,8 @@ class MudePipeline:
                 out_stride=self._bucket, fast=True, geometry=self._geometry,
             )
             first = False
-            self._sync()
+            self._wait(LANE_SMALL)   # ANE 的 out 要读 GDN 写出的 out_in 前半区
             self._out_and_ffn(entry, length, nxt, only=(start, n))
-            self._sync()
 
     def _out_and_ffn(
         self, entry: LayerBuffers, length: int, nxt: MetalBuffer,
@@ -297,8 +314,14 @@ class MudePipeline:
 
         `only` 是给线性层用的：它已经在同一个循环里逐段处理，这里只补该段；全注意力层一次
         处理所有段，`cur` 是它的残差来源（全宽单带，和注意力输出一起拼成 `out_in` 的两半）。
+
+        **段与段之间的软件流水**：某一段的 `ffn` 在 ANE 上跑着的时候，下一段的 `out_in`
+        就已经在 lane 1 的队列里等着了（`ffn` 只读写 `ffn_in`/`ffn_out`，与 `out_in` 无关），
+        所以 `ffn` 结束时下一段的输入也已就绪；上一段的 `ffn_out → nxt` 回填则排在下一段
+        `out` 发射之前。没有这一步流水，每段都要"等 ANE 完全空闲再开始搬输入"。
         """
         chunks = [only] if only is not None else list(self._chunks(length))
+        pending: tuple[int, int] | None = None   # 上一次已发射、尚未回填的 ffn 属于哪一段
         for start, n in chunks:
             if cur is not None:
                 # 注意力结果 → 前半区；残差 → 后半区。两趟都是单带宽，比原来"残差先写中间
@@ -309,20 +332,29 @@ class MudePipeline:
                 self._copy(cur, entry.surface("out_in"), nchan=self._hidden,
                            dst_c0=self._hidden, n=n, s0=0, src_s0=start,
                            src_stride=self._width, dst_stride=self._bucket)
-            self._sync()
-            entry.ane.eval_proc("out")
-            self._sync()
+            self._wait(LANE_SMALL)              # out_in 两半就绪
+            if pending is not None:
+                entry.ane.reap_proc()           # 上一段的 ffn 算完了，ffn_out 可读
+                self._copy(entry.surface("ffn_out"), nxt, nchan=self._hidden,
+                           n=pending[1], s0=pending[0],
+                           src_stride=self._bucket, dst_stride=self._width)
+            entry.ane.issue_proc("out")
+            entry.ane.reap_proc()               # norm_residual 要读 out_out
             kernels.norm_residual(
                 self._runtime, entry.surface("out_out"), entry.weights["post_norm"],
                 entry.surface("ffn_in"),
                 stile=n, src_stride=self._bucket, eps=EPS,
                 dst_stride=self._bucket, dst_s0=0,
             )
-            self._sync()
-            entry.ane.eval_proc("ffn")
-            self._sync()
-            self._copy(entry.surface("ffn_out"), nxt, nchan=self._hidden, n=n, s0=start,
+            self._wait(LANE_SMALL)              # ffn_in 就绪
+            entry.ane.issue_proc("ffn")         # 在飞：下一段的搬运可以叠上来
+            pending = (start, n)
+        if pending is not None:
+            entry.ane.reap_proc()
+            self._copy(entry.surface("ffn_out"), nxt, nchan=self._hidden,
+                       n=pending[1], s0=pending[0],
                        src_stride=self._bucket, dst_stride=self._width)
+            self._wait(LANE_SMALL)              # ffn_out 已落进 nxt，下一层可以读
 
     # ------------------------------------------------------------------ 收尾
 
