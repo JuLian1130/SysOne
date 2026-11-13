@@ -121,8 +121,8 @@ class MudePipeline:
         # 每层的隐藏态在两张等宽缓冲之间交替；第一层读 `seed`，之后读上一层的输出。
         self.h_a = rt.alloc(2 * hidden * width)
         self.h_b = rt.alloc(2 * hidden * width)
-        # 注意力的输出（[0:hidden) 是注意力结果，[hidden:2hidden) 是残差），GPU 侧全宽。
-        self.attn = rt.alloc(2 * 2 * hidden * width)
+        # 注意力的输出，全宽、单通道带（残差不经过这里，见 `_out_and_ffn`）。
+        self.attn = rt.alloc(2 * hidden * width)
         self.qg = rt.alloc(2 * kernels.QK_DIM * 2 * width)
         self.kv = rt.alloc(2 * kernels.KV_PROJ * 2 * width)
         self.state = rt.alloc(4 * kernels.L_HEADS * kernels.L_KD * kernels.L_VD)
@@ -212,8 +212,6 @@ class MudePipeline:
                        self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS)
         kernels.kv_prep(self._runtime, self.kv, entry.weights["k_norm"],
                         self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS)
-        # 残差先落到注意力输出的后半区（`cur` 是全宽的上一份隐藏态）
-        self._copy(cur, self.attn, nchan=self._hidden, dst_c0=self._hidden, n=self._width)
         out = self.attn
         # `T` 是 qg/kv 的列数（缓冲宽度），不是本批 token 数：两者在"桶宽 256、只有 8 条
         # query"时不同，S=96 的对拍里恰好相等（T == Stile == nq）才没暴露这一错位。
@@ -240,7 +238,7 @@ class MudePipeline:
                 out_stride=self._width, out_s0=prefix, fast=True,
             )
         self._sync()
-        self._out_and_ffn(entry, length, nxt)
+        self._out_and_ffn(entry, length, nxt, cur=cur)
 
     # ---- 线性（GDN）层 ------------------------------------------------------
 
@@ -281,18 +279,23 @@ class MudePipeline:
 
     def _out_and_ffn(
         self, entry: LayerBuffers, length: int, nxt: MetalBuffer,
-        *, only: tuple[int, int] | None = None,
+        *, cur: MetalBuffer | None = None, only: tuple[int, int] | None = None,
     ) -> None:
         """`out` 投影（含残差加）→ 门控前归一 → FFN，按桶分段写回 `nxt` 的对应列。
 
-        `only` 是给线性层用的：它已经在同一个循环里逐段处理，这里只补该段；
-        全注意力层一次处理所有段。
+        `only` 是给线性层用的：它已经在同一个循环里逐段处理，这里只补该段；全注意力层一次
+        处理所有段，`cur` 是它的残差来源（全宽单带，和注意力输出一起拼成 `out_in` 的两半）。
         """
         chunks = [only] if only is not None else list(self._chunks(length))
         for start, n in chunks:
-            if only is None:
-                self._copy(self.attn, entry.surface("out_in"), nchan=2 * self._hidden,
+            if cur is not None:
+                # 注意力结果 → 前半区；残差 → 后半区。两趟都是单带宽，比原来"残差先写中间
+                # 缓冲、再把 2H 带整条拷回来"少一趟 2H 宽的全宽搬运。
+                self._copy(self.attn, entry.surface("out_in"), nchan=self._hidden,
                            n=n, s0=0, src_s0=start,
+                           src_stride=self._width, dst_stride=self._bucket)
+                self._copy(cur, entry.surface("out_in"), nchan=self._hidden,
+                           dst_c0=self._hidden, n=n, s0=0, src_s0=start,
                            src_stride=self._width, dst_stride=self._bucket)
             self._sync()
             entry.ane.eval_proc("out")
