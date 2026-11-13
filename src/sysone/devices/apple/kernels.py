@@ -379,6 +379,7 @@ def gdn(
     dt_bias: MetalBuffer,
     norm: MetalBuffer,
     out: MetalBuffer,
+    scratch: MetalBuffer,
     *,
     stile: int,
     eps: float,
@@ -393,12 +394,13 @@ def gdn(
 
     快核是 4 个 dispatch（prep → tail → delta 递推 → gated RMSNorm），参考核是一个。
     两者都把 fp32 的 `state`（16×128×128）与 3 列的 `tail` 原地推进，所以同一序列的多次
-    tile 调用必须按 s0 递增顺序来，`first=True` 只给第一个 tile。
+    tile 调用必须按 s0 递增顺序来，`first=True` 只给第一个 tile。`scratch` 是第 9 个缓冲
+    （`8192*stile` 个 fp16，旧引擎 `d.alloc(8192 * tile * 2)`），参考核与快核都会绑它。
     """
     args = gdn_args(
         stile=stile, s0=s0, T=T, first=first, eps=eps, out_stride=out_stride, out_s0=out_s0
     )
-    buffers_list = [proj, state, tail, wconv, a_log, dt_bias, norm, out]
+    buffers_list = [proj, state, tail, wconv, a_log, dt_bias, norm, out, scratch]
     if not fast:
         grid, tg = _gdn_ref_grid()
         runtime.dispatch("k_gdn_ref", buffers_list, args=args, grid=grid, tg=tg)

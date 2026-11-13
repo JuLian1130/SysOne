@@ -310,10 +310,9 @@ class MudeChain:
         key = mixed[:, heads * dim:2 * heads * dim].reshape(length, heads, dim)
         value = mixed[:, 2 * heads * dim:].reshape(length, heads, dim)
         z = p[:length, conv_rows:conv_rows + self._hidden].reshape(length, heads, dim)
-        a = p[:length, conv_rows + self._hidden:conv_rows + self._hidden + heads]
-        # 注意本仓库 `mude.ane_layer_weights` 的行序是 a 在 b 前（旧引擎是 b 在前），
-        # 这里必须按本仓库的 blob 顺序读，否则 beta 与 g 的输入会互换。
-        b = p[:length, conv_rows + self._hidden + heads:conv_rows + self._hidden + 2 * heads]
+        # 投影行序与 Metal 核一致：`[qkv丨z丨b丨a]`（`b` 在 `a` 之前，见 `e8_common.h:29`）。
+        b = p[:length, conv_rows + self._hidden:conv_rows + self._hidden + heads]
+        a = p[:length, conv_rows + self._hidden + heads:conv_rows + self._hidden + 2 * heads]
         beta = sigmoid(b)
         g = -np.exp(params["a_log"]) * softplus(a + params["dt_bias"])
         core = delta_rule(query, key, value, g, beta)      # [L, heads, dim]

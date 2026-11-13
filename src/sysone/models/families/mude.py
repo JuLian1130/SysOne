@@ -70,7 +70,10 @@ def ane_layer_weights(
 
     投影是**整块行拼接**，这是旧引擎 `COUT` 的来历，也是 20 层链要复用的同一事实：
     - 全注意力层 5120 = `q_proj` 4096（前 2048 是 q、后 2048 是门控）+ `k_proj` 512 + `v_proj` 512；
-    - 线性注意力层 8224 = `in_proj_qkv` 6144（q丨k丨v 各 2048）+ `in_proj_z` 2048 + `in_proj_a` 16 + `in_proj_b` 16。
+    - 线性注意力层 8224 = `in_proj_qkv` 6144（q丨k丨v 各 2048）+ `in_proj_z` 2048 + `in_proj_b` 16 + `in_proj_a` 16。
+
+    线性层的 `b` 在 `a` 之前，是 Metal 核的约定（`k_gdn` 从 `COUT_GDN-32` 起读 `b`、从
+    `COUT_GDN-16` 起读 `a`，见 `docs/ANE/anebench/e8_common.h:29`）；numpy 链按同一顺序读。
 
     FFN 的 `down_proj` 是 `[hidden, ffn]`，按 `hidden` 切 `ffn_parts()` 段；`out` 是
     `out_proj` / `o_proj`（`[hidden, hidden]`，与 `layer_mil` 的 p1 一致 —— 残差在 program 里加）。
@@ -88,7 +91,7 @@ def ane_layer_weights(
         attn = f"{base}.linear_attn"
         proj = np.concatenate(
             [read(f"{attn}.in_proj_qkv.weight"), read(f"{attn}.in_proj_z.weight"),
-             read(f"{attn}.in_proj_a.weight"), read(f"{attn}.in_proj_b.weight")],
+             read(f"{attn}.in_proj_b.weight"), read(f"{attn}.in_proj_a.weight")],
             axis=0,
         )
         out = read(f"{attn}.out_proj.weight")
