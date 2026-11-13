@@ -97,6 +97,7 @@ def test_one_chain_covers_every_tile_in_order():
 
 
 def test_attention_sequence_is_gathers_then_prep_then_attention():
+    """`prep` 是本层唯一的序列级屏障，且整条链的注意力都排在它后面。"""
     steps = attention_steps(4, par=0)
     gathers = [i for i, step in enumerate(steps) if step.work == "gather"]
     preps = [i for i, step in enumerate(steps) if step.work == "prep"]
@@ -104,6 +105,20 @@ def test_attention_sequence_is_gathers_then_prep_then_attention():
     assert len(preps) == 1
     assert preps[0] > max(gathers)
     assert preps[0] < min(attns)
+
+
+def test_attention_and_body_stay_interleaved():
+    """第二相必须按瓦片交错：把整层注意力提前实测两头都更慢（见 `attention_steps` 的注释）。
+
+    这里的判据是"每个 `attn` 后面紧跟着它自己的 `out`"，也就是 lane 0 上永远只有一片注意力在飞。
+    """
+    for par in (0, 1):
+        steps = attention_steps(6, par=par)
+        attns = [i for i, step in enumerate(steps) if step.work == "attn"]
+        assert len(attns) == 3
+        for index in attns:
+            assert steps[index + 1].work == "out"
+            assert steps[index + 1].tile == steps[index].tile
 
 
 def test_only_the_first_chain_carries_the_prep():

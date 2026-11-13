@@ -135,6 +135,16 @@ def attention_steps(
 
     **第二相**（每个瓦片）：`attn → out → norm2 → ffn → tail`。
 
+    第二相**不能**把整条链的 `attn` 排到 body 之前（试过，2026-11-13 实测两头都更慢）：
+    16k / prefix 0 墙 5262 → 6075 ms，出货口径 4907 → 5678 ms。原因是 dylib 的两条 lane 在
+    提交序上几乎先进先出 —— lane 0 攒着十几片注意力时，后面才编码的 `out_in` 那一次小搬运
+    （把注意力输出与这一层的输入并进 `out_in`、喂给 ANE 的 `out`）就要排在下一片注意力后面，
+    每瓦片白等一片（阻塞量 211 → 2710 ms）；ANE 自己的 eval 时间一点没变（2801 → 2778 ms），
+    所以墙时涨的正是它的空转。交错的顺序让 lane 0 上永远只有一片在飞，反而没有这个
+    "小搬运排在长 kernel 后面"的钱。
+
+    所以保持交错：`attn` 一片接一片地排、body 紧跟其后，`out` 只等自己那一片。
+
     `dead`（S3）：前 `dead` 个瓦片整段落在请求的公共前缀里，而**模型最后一层**在这些瓦片上
     只欠 K/V —— 它的注意力输出与 MLP 输出没有读者（读出在 query 行上，K/V 出自 `proj1`，
     不依赖注意力输出）。所以这些瓦片保留第一相、丢掉第二相。`tail` 随之没写，那些列的 `h`
@@ -151,7 +161,7 @@ def attention_steps(
     if tiles and par == 0:
         out.append(_gpu("prep", -1, LANE_LONG))
     for s in tiles:
-        if s < dead:
+        if s < dead:                        # 整段落在前缀里，只欠 K/V（S3）
             continue
         out += [
             _gpu("attn", s, LANE_LONG),
