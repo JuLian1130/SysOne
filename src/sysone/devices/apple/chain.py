@@ -20,6 +20,7 @@ from ...models.families.mude import CODE_ROWS, ane_layer_weights, normalize_norm
 from ...weights.packing.ane_blob import build as build_blob
 from ...weights.store import SafeTensorFile
 from .compile import S_NATIVE, AneLayer, layer_mil, write_program
+from .geometry import Geometry
 from .metal import MetalRuntime
 from .pipeline import MudePipeline
 
@@ -176,6 +177,21 @@ class MudeChain:
             raise ValueError("GDN 的 v 头数与 k 头数不同，当前实现没做 repeat_interleave")
         if int(text.get("linear_value_head_dim", linear_dim)) != linear_dim:
             raise ValueError("GDN 的 v 头维与 k 头维不同，当前实现没做 repeat_interleave")
+        # 设备侧的形状只从这里取（architecture.md §13 R1）：MIL 生成、缓冲分配、kernel 网格。
+        geometry = Geometry(
+            hid=hidden,
+            ffn=ffn,
+            q_heads=heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            l_k_heads=linear_heads,
+            l_k_dim=linear_dim,
+            l_v_heads=linear_heads,
+            l_v_dim=linear_dim,
+            conv_k=int(text.get("linear_conv_kernel_dim", 4) or 4),
+        )
+        geometry.validate()
         roles = [
             AttentionRole.LINEAR if kind == "linear_attention" else AttentionRole.FULL
             for kind in text["layer_types"]
@@ -218,10 +234,10 @@ class MudeChain:
             temperature = float(decision.get("temperature", 1.0))
             cos, sin = _rope_table(theta, width, rotary_dim)
             if metal:
-                metal_runtime = MetalRuntime()
+                metal_runtime = MetalRuntime(geometry=geometry)
                 pipeline = MudePipeline(
                     runtime=metal_runtime, layers=layers, roles=roles, params=params,
-                    cos=cos, sin=sin, hidden=hidden, bucket=s, width=width,
+                    cos=cos, sin=sin, geometry=geometry, bucket=s, width=width,
                 )
         except BaseException:
             if pipeline is not None:

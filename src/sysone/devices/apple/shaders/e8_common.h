@@ -49,6 +49,9 @@ using namespace metal;
 
 #define E8_ARGS_INDEX 30
 
+// 几何宏（模型形状）。运行时会先生成一段 `#define E8_GEOMETRY_SET 1` 的头文件、拼在本文件之前，
+// 所以这里的默认值只在"没有注入几何"时生效（例如单独跑源码编译的测试）。见 architecture §13 R1。
+#ifndef E8_GEOMETRY_SET
 #define E8_HID        2048
 #define E8_FFN        6144
 #define E8_COUT_FULL  5120
@@ -65,6 +68,7 @@ using namespace metal;
 #define E8_CONV_K     4
 #define E8_CONV_DIM   6144        // 2*16*128 + 16*128
 #define E8_Z_DIM      2048
+#endif
 
 // ---------------------------------------------------------------------------------------
 // Argument blocks.  Field order is part of the ABI: e8_mtl.py packs these with struct.pack

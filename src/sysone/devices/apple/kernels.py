@@ -16,26 +16,30 @@ from __future__ import annotations
 import struct
 
 from ...errors import NotReadyError
+from .geometry import Geometry, mude_geometry
 from .metal import MetalBuffer, MetalRuntime
 
-# ---- 几何（e8_common.h:52-67；M2 只做 mude，4B 是 M4 的事）------------------------------
-HID = 2048
-FFN = 6144
-COUT_FULL = 5120
-COUT_GDN = 8224
-Q_HEADS = 8
-KV_HEADS = 2
-HEAD_DIM = 256
-ROTARY_DIM = 64  # head_dim * partial_rotary_factor(0.25)
-QK_DIM = Q_HEADS * HEAD_DIM  # 2048
-KV_PROJ = KV_HEADS * HEAD_DIM  # 512
-ZDIM = 2048
-L_HEADS = 16
-L_KD = 128
-L_VD = 128
-CONV_K = 4
-CONV_DIM = 6144  # 2*16*128 + 16*128
-HEAD_SCALE = HEAD_DIM**-0.5  # attention 的 1/sqrt(256)
+# ---- 几何（默认 = mude 2B，与 e8_common.h:52-67 的默认宏一致）------------------------------
+# 运行时路径（`pipeline.py`）一律显式传 `geometry=`；下面的模块常量只为测试与默认几何保留，
+# 它是"这份源码默认编译出来的那个几何"的别名，不是引擎的假设（规矩见 architecture.md §13 R1）。
+GEOMETRY = mude_geometry()
+HID = GEOMETRY.hid
+FFN = GEOMETRY.ffn
+COUT_FULL = GEOMETRY.cout_full
+COUT_GDN = GEOMETRY.cout_gdn
+Q_HEADS = GEOMETRY.q_heads
+KV_HEADS = GEOMETRY.kv_heads
+HEAD_DIM = GEOMETRY.head_dim
+ROTARY_DIM = GEOMETRY.rotary_dim
+QK_DIM = GEOMETRY.qk_dim
+KV_PROJ = GEOMETRY.kv_proj
+ZDIM = GEOMETRY.z_dim
+L_HEADS = GEOMETRY.l_v_heads
+L_KD = GEOMETRY.l_k_dim
+L_VD = GEOMETRY.l_v_dim
+CONV_K = GEOMETRY.conv_k
+CONV_DIM = GEOMETRY.conv_dim
+HEAD_SCALE = GEOMETRY.head_scale  # attention 的 1/sqrt(head_dim)
 
 # ---- 参数结构体（与 e8_common.h 一一对应，单位是字节数）-------------------------------
 _NRM = struct.Struct("<IIIfIIII")  # struct NormArgs，32 B
@@ -118,32 +122,39 @@ def _norm_grid(stile: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     return ((stile + 255) // 256, 1, 1), (256, 1, 1)
 
 
-def _prep_grid(tokens: int, heads: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+def _prep_grid(
+    tokens: int, heads: int, head_dim: int
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """`k_q_prep` / `k_kv_prep`：一格一个 (token, head)，线程 = 通道（`e8_kernels.metal:216`）。"""
-    return (tokens, heads, 1), (HEAD_DIM, 1, 1)
+    return (tokens, heads, 1), (head_dim, 1, 1)
 
 
-def _attn_grid(nq: int, *, fast: bool) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """fast 核：一格 (head, 128 个查询)，`8*ceil(n/128)` 格、512 线程（`e8_a1m.py:74`）。"""
+def _attn_grid(
+    nq: int, *, fast: bool, q_heads: int
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """fast 核：一格 (head, 128 个查询)，`q_heads*ceil(n/128)` 格、512 线程（`e8_a1m.py:74`）。"""
     if not fast:
-        return (nq, Q_HEADS, 1), (256, 1, 1)
+        return (nq, q_heads, 1), (256, 1, 1)
     bm = 128
-    return (Q_HEADS * ((nq + bm - 1) // bm), 1, 1), (bm // 8 * 32, 1, 1)
+    return (q_heads * ((nq + bm - 1) // bm), 1, 1), (bm // 8 * 32, 1, 1)
 
 
-def _gdn_ref_grid() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    return (L_HEADS, 1, 1), (L_KD, 1, 1)
+def _gdn_ref_grid(
+    l_heads: int, l_kd: int
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    return (l_heads, 1, 1), (l_kd, 1, 1)
 
 
 def _gdn_fast_grids(
-    stile: int,
+    stile: int, l_heads: int, l_v_dim: int,
 ) -> list[tuple[str, tuple[tuple[int, int, int], tuple[int, int, int]]]]:
     """快核是 4 个 dispatch（`e8_a1m.py:96`），顺序不能换：prep 的 halo 读要先于 tail 写。"""
+    tg = (l_v_dim, 1, 1)
     return [
-        ("k_gdn_prep", ((L_HEADS, (stile + 7) // 8, 1), (128, 1, 1))),
-        ("k_gdn_tail", ((L_HEADS, 1, 1), (128, 1, 1))),
-        ("k_gdn", ((L_HEADS, 4, 1), (128, 1, 1))),
-        ("k_gdn_norm", (((stile + 3) // 4, L_HEADS, 1), (128, 1, 1))),
+        ("k_gdn_prep", ((l_heads, (stile + 7) // 8, 1), tg)),
+        ("k_gdn_tail", ((l_heads, 1, 1), tg)),
+        ("k_gdn", ((l_heads, 4, 1), tg)),
+        ("k_gdn_norm", (((stile + 3) // 4, l_heads, 1), tg)),
     ]
 
 
@@ -266,9 +277,11 @@ def q_prep(
     s0: int = 0,
     nka: int = 0,
     segw: int = 0,
+    geometry: Geometry | None = None,
 ) -> None:
     """`k_q_prep`（原地）：q 半区做 RMSNorm+部分 RoPE，gate 半区做 sigmoid。"""
-    grid, tg = _prep_grid(stile, Q_HEADS)
+    geom = GEOMETRY if geometry is None else geometry
+    grid, tg = _prep_grid(stile, geom.q_heads, geom.head_dim)
     runtime.dispatch(
         "k_q_prep",
         [qg, q_norm, cos, sin],
@@ -300,9 +313,11 @@ def kv_prep(
     s0: int = 0,
     nka: int = 0,
     segw: int = 0,
+    geometry: Geometry | None = None,
 ) -> None:
     """`k_kv_prep`（原地）：只动 k 半区（v 不需要归一化或旋转）。"""
-    grid, tg = _prep_grid(stile, KV_HEADS)
+    geom = GEOMETRY if geometry is None else geometry
+    grid, tg = _prep_grid(stile, geom.kv_heads, geom.head_dim)
     runtime.dispatch(
         "k_kv_prep",
         [kv, k_norm, cos, sin],
@@ -339,12 +354,14 @@ def attention(
     out_stride: int = 0,
     out_s0: int = 0,
     fast: bool = True,
+    geometry: Geometry | None = None,
 ) -> None:
     """注意力：`qg`/`kv` 必须已经过 prep；结果写进 `out` 的第 `out_s0` 起的 HID 行（含 gate）。
 
     `fast=True` 走寄存器内 score 分块（不需要 scratch）；`fast=False` 走参考核，需要
     `8*Stile*T` 个 float 的 scratch（只为不含快核的机器或对拍留一条路）。
     """
+    geom = GEOMETRY if geometry is None else geometry
     if scratch is None:
         raise NotReadyError(
             "注意力核需要一个 scratch 缓冲（快核不读它，但 buffer 必须绑定）",
@@ -354,7 +371,7 @@ def attention(
     n_eff = stile if nq is None else nq
     if n_eff <= 0:
         return
-    grid, tg = _attn_grid(n_eff, fast=fast)
+    grid, tg = _attn_grid(n_eff, fast=fast, q_heads=geom.q_heads)
     runtime.dispatch(
         "k_attn" if fast else "k_attn_ref",
         [qg, kv, out, scratch],
@@ -362,7 +379,7 @@ def attention(
             T=T,
             stile=stile,
             s0=s0,
-            scale=HEAD_SCALE,
+            scale=geom.head_scale,
             nk=nk,
             nq=n_eff,
             nka=nka,
@@ -397,6 +414,7 @@ def gdn(
     out_stride: int = 0,
     out_s0: int = 0,
     fast: bool = True,
+    geometry: Geometry | None = None,
 ) -> None:
     """GDN：`proj` 是 ANE 的 8224 行投影（通道在前），结果写进 `out` 的前 HID 行。
 
@@ -405,13 +423,14 @@ def gdn(
     tile 调用必须按 s0 递增顺序来，`first=True` 只给第一个 tile。`scratch` 是第 9 个缓冲
     （`8192*stile` 个 fp16，旧引擎 `d.alloc(8192 * tile * 2)`），参考核与快核都会绑它。
     """
+    geom = GEOMETRY if geometry is None else geometry
     args = gdn_args(
         stile=stile, s0=s0, T=T, first=first, eps=eps, out_stride=out_stride, out_s0=out_s0
     )
     buffers_list = [proj, state, tail, wconv, a_log, dt_bias, norm, out, scratch]
     if not fast:
-        grid, tg = _gdn_ref_grid()
+        grid, tg = _gdn_ref_grid(geom.l_v_heads, geom.l_k_dim)
         runtime.dispatch("k_gdn_ref", buffers_list, args=args, grid=grid, tg=tg)
         return
-    for name, (grid, tg) in _gdn_fast_grids(stile):
+    for name, (grid, tg) in _gdn_fast_grids(stile, geom.l_v_heads, geom.l_v_dim):
         runtime.dispatch(name, buffers_list, args=args, grid=grid, tg=tg)

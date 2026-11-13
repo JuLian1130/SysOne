@@ -22,6 +22,7 @@ from ...domain.attention import AttentionRole
 from ...errors import ConfigError
 from . import kernels
 from .compile import AneLayer
+from .geometry import Geometry, mude_geometry
 from .metal import MetalBuffer, MetalRuntime
 
 EPS = 1e-6
@@ -74,12 +75,14 @@ class MudePipeline:
         params: list[dict[str, np.ndarray]],
         cos: np.ndarray,
         sin: np.ndarray,
-        hidden: int,
+        geometry: Geometry | None = None,
         bucket: int,
         width: int,
     ) -> None:
         self._runtime = runtime
-        self._hidden = int(hidden)
+        self._geometry = mude_geometry() if geometry is None else geometry
+        self._geometry.validate()
+        self._hidden = self._geometry.hid
         self._bucket = int(bucket)
         self._width = int(width)
         if self._width < self._bucket:
@@ -117,16 +120,18 @@ class MudePipeline:
 
     def _alloc_shared(self) -> None:
         rt, hidden, width, bucket = self._runtime, self._hidden, self._width, self._bucket
+        geom = self._geometry
         self.seed = rt.alloc(2 * hidden * width)
         # 每层的隐藏态在两张等宽缓冲之间交替；第一层读 `seed`，之后读上一层的输出。
         self.h_a = rt.alloc(2 * hidden * width)
         self.h_b = rt.alloc(2 * hidden * width)
         # 注意力的输出，全宽、单通道带（残差不经过这里，见 `_out_and_ffn`）。
         self.attn = rt.alloc(2 * hidden * width)
-        self.qg = rt.alloc(2 * kernels.QK_DIM * 2 * width)
-        self.kv = rt.alloc(2 * kernels.KV_PROJ * 2 * width)
-        self.state = rt.alloc(4 * kernels.L_HEADS * kernels.L_KD * kernels.L_VD)
-        self.tail = rt.alloc(2 * kernels.CONV_DIM * 3)
+        # [rows, width] 的 fp16 缓冲：行数来自几何（qg 是 2*q_heads*head_dim，kv 是 2*kv_proj）。
+        self.qg = rt.alloc(2 * geom.qg_rows * width)
+        self.kv = rt.alloc(2 * geom.kv_rows * width)
+        self.state = rt.alloc(4 * geom.state_floats)
+        self.tail = rt.alloc(2 * geom.conv_dim * 3)
         self.gscratch = rt.alloc(2 * 8192 * bucket)
         # 快核不读 scratch，但 kernel 声明了 buffer(3)，必须绑定。全宽的参考核才要 (T,T)。
         self.attn_scratch = rt.alloc(32)
@@ -204,14 +209,16 @@ class MudePipeline:
             self._sync()          # GPU 只是排队，ANE 紧接着要读 proj_in
             entry.ane.eval_proc("proj")
             self._sync()
-            self._copy(proj, self.qg, nchan=kernels.QK_DIM * 2, n=n, s0=start,
+            self._copy(proj, self.qg, nchan=self._geometry.qg_rows, n=n, s0=start,
                        src_stride=self._bucket, dst_stride=self._width)
-            self._copy(proj, self.kv, nchan=kernels.KV_PROJ * 2, src_c0=kernels.QK_DIM * 2,
+            self._copy(proj, self.kv, nchan=self._geometry.kv_rows, src_c0=self._geometry.qg_rows,
                        n=n, s0=start, src_stride=self._bucket, dst_stride=self._width)
         kernels.q_prep(self._runtime, self.qg, entry.weights["q_norm"],
-                       self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS)
+                       self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
+                       geometry=self._geometry)
         kernels.kv_prep(self._runtime, self.kv, entry.weights["k_norm"],
-                        self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS)
+                        self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
+                        geometry=self._geometry)
         out = self.attn
         # `T` 是 qg/kv 的列数（缓冲宽度），不是本批 token 数：两者在"桶宽 256、只有 8 条
         # query"时不同，S=96 的对拍里恰好相等（T == Stile == nq）才没暴露这一错位。
@@ -221,7 +228,7 @@ class MudePipeline:
             kernels.attention(
                 self._runtime, self.qg, self.kv, out, self.attn_scratch,
                 T=self._width, stile=length, nk=length, nq=length,
-                out_stride=self._width, fast=True,
+                out_stride=self._width, fast=True, geometry=self._geometry,
             )
         else:
             # `prefix_noncausal`：前缀行只看前缀、尾巴行看全部，而 `nk` 是**一个**全局上界，
@@ -230,12 +237,12 @@ class MudePipeline:
             kernels.attention(
                 self._runtime, self.qg, self.kv, out, self.attn_scratch,
                 T=self._width, stile=prefix, nk=prefix, nq=prefix, s0=0,
-                out_stride=self._width, out_s0=0, fast=True,
+                out_stride=self._width, out_s0=0, fast=True, geometry=self._geometry,
             )
             kernels.attention(
                 self._runtime, self.qg, self.kv, out, self.attn_scratch,
                 T=self._width, stile=tail, nk=length, nq=tail, s0=prefix,
-                out_stride=self._width, out_s0=prefix, fast=True,
+                out_stride=self._width, out_s0=prefix, fast=True, geometry=self._geometry,
             )
         self._sync()
         self._out_and_ffn(entry, length, nxt, cur=cur)
@@ -248,7 +255,9 @@ class MudePipeline:
         """按桶分段：投影 → GDN（递归状态与卷积尾巴跨段接力）→ out → FFN。"""
         # 每层的递归状态都从零开始（prefill、无 cache）：`k_gdn` 自己不清零，
         # 旧引擎也是在每层前把 w_state 填零（docs/ANE/anebench/e8_a1m.py:969-971）。
-        self.state.array(np.float32, (kernels.L_HEADS, kernels.L_KD, kernels.L_VD))[:] = 0
+        self.state.array(np.float32,
+                         (self._geometry.l_v_heads, self._geometry.l_k_dim,
+                          self._geometry.l_v_dim))[:] = 0
         first = True
         for start, n in self._chunks(length):
             kernels.norm_to(
@@ -270,7 +279,7 @@ class MudePipeline:
                 # GDN 核里的 `Stile` 既是列界也是**通道步长**（`proj[c*Stile + j]`），所以必须
                 # 传桶宽而不是本段的有效列数；`T` 是它不看的多余字段。
                 stile=self._bucket, eps=EPS, first=first, T=self._bucket,
-                out_stride=self._bucket, fast=True,
+                out_stride=self._bucket, fast=True, geometry=self._geometry,
             )
             first = False
             self._sync()

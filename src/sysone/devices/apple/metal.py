@@ -15,13 +15,16 @@ dylib 由 `tools/build_ane.sh` 重建，产物在 `SYS1_E8_DIR`（默认 `/tmp/e
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
-from ...errors import NotReadyError, SysOneError
+from ...errors import ConfigError, NotReadyError, SysOneError
+from .geometry import Geometry, mude_geometry
 
 MTL_DYLIB_NAME = "libe8mtl.dylib"
 
@@ -69,6 +72,23 @@ def _sources_dir(explicit: str | os.PathLike | None) -> Path:
     if env:
         return Path(env)
     return Path(__file__).resolve().parent / "shaders"
+
+
+def _write_geometry_header(geometry: Geometry) -> Path:
+    """把几何宏写成一个临时头文件，作为编译时插在最前面的那段源码（architecture §13 R1）。
+
+    内容只由几何决定，所以按宏的哈希命名：同几何复用同一份文件，不同几何各一份，互不覆盖。
+    """
+    digest = hashlib.sha256(
+        "|".join(f"{name}={value}" for name, value in sorted(geometry.defines().items())).encode()
+    ).hexdigest()[:16]
+    directory = Path(tempfile.gettempdir()) / "sysone-metal"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"e8_geometry_{digest}.h"
+    text = geometry.header()
+    if not path.is_file() or path.read_text(encoding="utf-8") != text:
+        path.write_text(text, encoding="utf-8")
+    return path
 
 
 class MetalBuffer:
@@ -141,6 +161,7 @@ class MetalRuntime:
         sources_dir: str | os.PathLike | None = None,
         *,
         verbose: bool = False,
+        geometry: "Geometry | None" = None,
     ) -> "MetalRuntime":
         if cls._shared is not None:
             return cls._shared
@@ -154,8 +175,15 @@ class MetalRuntime:
         sources_dir: str | os.PathLike | None = None,
         *,
         verbose: bool = False,
+        geometry: "Geometry | None" = None,
     ) -> None:
         if getattr(self, "_ready", False):
+            # 进程级单例：后来的构造只校验几何一致，不再重新编译（见类 docstring）。
+            # 首次构造没给几何时，编进去的是 `shaders/` 的默认值，也就等价于 mude 的几何。
+            compiled = mude_geometry() if self._geometry is None else self._geometry
+            if geometry is not None and geometry != compiled:
+                raise ConfigError("同进程的 Metal 运行时已经按另一套几何编译过",
+                                  compiled=compiled, requested=geometry)
             return
         if sys.platform != "darwin":
             raise NotReadyError("Metal 运行时只在 macOS 上可用", platform=sys.platform)
@@ -168,10 +196,11 @@ class MetalRuntime:
                 hint="运行 tools/build_ane.sh 重建（/tmp/e8 是易失目录）",
             )
         self.path = dylib
+        self._geometry = geometry
         self.lib = ctypes.CDLL(str(dylib))
         try:
             self._bind()
-            self._compile(_sources_dir(sources_dir), verbose=verbose)
+            self._compile(_sources_dir(sources_dir), verbose=verbose, geometry=geometry)
         except SysOneError:
             MetalRuntime._shared = None  # 初始化失败就别缓存，下次还能重试
             raise
@@ -220,7 +249,7 @@ class MetalRuntime:
         lib.e8m_sync_l.restype = ctypes.c_double
         lib.e8m_gpu_ms.restype = ctypes.c_double
 
-    def _compile(self, sources: Path, *, verbose: bool) -> None:
+    def _compile(self, sources: Path, *, verbose: bool, geometry: "Geometry | None" = None) -> None:
         missing = [name for name in SOURCES if not (sources / name).is_file()]
         if missing:
             raise NotReadyError(
@@ -229,11 +258,19 @@ class MetalRuntime:
                 missing=missing,
                 hint="设置 SYS1_MTL_SRC 指向含 e8_common.h 与 *.metal 的目录",
             )
-        encoded = [str(sources / name).encode() for name in SOURCES]
+        # 几何头必须是**第一段源码**：`e8m_init_src` 按顺序拼接，并把 `.metal` 里的
+        # `#include "e8_common.h"` 删掉，所以写在它前面的 `#define E8_GEOMETRY_SET` 会先于
+        # `e8_common.h` 的默认宏块生效（那个块被 `#ifndef` 包着）。
+        files = [sources / name for name in SOURCES]
+        if geometry is not None:
+            header = _write_geometry_header(geometry)
+            files.insert(0, header)
+        encoded = [str(path).encode() for path in files]
         paths = (ctypes.c_char_p * len(encoded))(*encoded)
         rc = self.lib.e8m_init_src(paths, len(encoded), 1 if verbose else 0)
         if rc != 0:
-            raise NotReadyError("Metal kernel 编译失败", reason=self.error(), rc=rc)
+            raise NotReadyError("Metal kernel 编译失败", reason=self.error(), rc=rc,
+                                geometry=None if geometry is None else dict(geometry.defines()))
 
     # -- 内存 ----------------------------------------------------------------
     def wrap(self, surface) -> MetalBuffer:
