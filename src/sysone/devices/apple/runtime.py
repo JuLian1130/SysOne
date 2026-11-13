@@ -34,8 +34,11 @@ _REQUIRED = (
     "e8_surface_base",
     "e8_surface_bytes",
     "e8_surface_free",
+    "e8_attach",
     "e8_avail_gb",
     "e8_wired_gb",
+    "e8_footprint_gb",
+    "e8_peak_footprint_gb",
 )
 
 
@@ -117,10 +120,14 @@ class AneRuntime:
         lib.e8_surface_free.argtypes = [ctypes.c_uint64]
         lib.e8_eval.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.e8_eval.restype = ctypes.c_double
+        lib.e8_attach.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64]
+        lib.e8_attach.restype = ctypes.c_int
         lib.e8_unload.argtypes = [ctypes.c_char_p]
         lib.e8_count.restype = ctypes.c_int
         lib.e8_avail_gb.restype = ctypes.c_double
         lib.e8_wired_gb.restype = ctypes.c_double
+        lib.e8_footprint_gb.restype = ctypes.c_double
+        lib.e8_peak_footprint_gb.restype = ctypes.c_double
 
     def error(self) -> str:
         raw = self.lib.e8_last_error()
@@ -141,8 +148,20 @@ class AneRuntime:
         return float(self.lib.e8_avail_gb())
 
     def wired_gb(self) -> float:
-        """进程的 ANE wired 内存（M2 的内存验收看这个，不看 RSS）。"""
+        """**整机**的非可分页内存（`vm_statistics64.wire_count`），不是本进程的 ANE 占用。
+
+        M2.0 的 doctor 曾把它当"我们的常驻"读成 2.4 GB，其实 0 个 program 时也是这个数。
+        内存验收看 `footprint_gb()`。
+        """
         return float(self.lib.e8_wired_gb())
+
+    def footprint_gb(self) -> float:
+        """本进程的 `phys_footprint`（活动监视器里的"内存"，含 IOSurface）——4 GB 预算看它。"""
+        return float(self.lib.e8_footprint_gb())
+
+    def peak_footprint_gb(self) -> float:
+        """`phys_footprint` 的历史峰值；M2 的长稳/峰值验收用这个。"""
+        return float(self.lib.e8_peak_footprint_gb())
 
     def surface(self, nbytes: int) -> Surface:
         handle = self.lib.e8_surface_new(int(nbytes))
@@ -167,6 +186,15 @@ class AneRuntime:
     def eval(self, name: str, procedure: int = 0) -> float:
         """同步执行一次，返回 dylib 记录的毫秒数（M2.0 只用它做对拍，不做吞吐）。"""
         return float(self.lib.e8_eval(name.encode(), int(procedure)))
+
+    def attach(self, name: str, procedure: int, surf_in: Surface, surf_out: Surface) -> None:
+        """把一对 surface 绑到一个 (program, procedure) 上；绑定后 `eval` 才能跑。"""
+        self._check(
+            self.lib.e8_attach(
+                name.encode(), int(procedure), int(surf_in.handle), int(surf_out.handle)
+            ),
+            f"attach({name}, {procedure})",
+        )
 
     def unload(self, name: str) -> None:
         self.lib.e8_unload(name.encode())

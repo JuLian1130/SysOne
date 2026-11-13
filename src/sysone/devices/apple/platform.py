@@ -129,7 +129,10 @@ class ApplePlatform:
         return None
 
     def compile(self, programs: object) -> None:
-        raise ConfigError("ANE program 编译在 M2.1 落地", op=getattr(programs, "op", None))
+        raise ConfigError(
+            "整层 program 的批量编译随 M2.2 的 pipeline 落地；M2.1 只用 devices/apple/compile.py 的单层 AneProjection",
+            op=getattr(programs, "op", None),
+        )
 
     def sync(self) -> None:
         """ANE 的 `eval` 本身就是同步等待；GPU 侧的同步在 M2.2 的 Metal 后端里做。"""
@@ -145,7 +148,9 @@ class ApplePlatform:
             "dylib": runtime.path,
             "programs": runtime.programs,
             "avail_gb": runtime.avail_gb(),
-            "wired_gb": runtime.wired_gb(),
+            # 常驻看本进程 footprint；`wired_gb` 是整机 wire_count，不能当我们的占用。
+            "footprint_gb": round(runtime.footprint_gb(), 3),
+            "peak_footprint_gb": round(runtime.peak_footprint_gb(), 3),
             "total_gb": round(info.total / 1024**3, 3) if info.total else 0.0,
             "dtypes": sorted(dtype.value for dtype in caps.dtypes),
             "quant": sorted(scheme.value for scheme in caps.quant),
