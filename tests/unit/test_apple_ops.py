@@ -32,6 +32,30 @@ def test_causal_conv_only_looks_left():
     np.testing.assert_allclose(out2[:-1], out[:-1])
 
 
+def test_apply_rotary_pairs_halves_and_keeps_the_norm():
+    """RoPE 是正交变换；90° 的极端角度能抓住"两个半区互为视图"的别名 bug。
+
+    曾经 `apply_rotary` 把 `x[..., :half]` 写回后再用同一个视图算第二半，于是第二半吃到的是
+    **已经旋转过**的第一半：模长仍守恒，只有把 cos/sin 取到 0/1 才暴露。
+    """
+    x = np.arange(0.0, 8.0, dtype=np.float32).reshape(1, 1, 8)
+    cos = np.ones((1, 4), np.float32)
+    sin = np.zeros((1, 4), np.float32)
+    np.testing.assert_allclose(ops.apply_rotary(x, cos, sin, rotary_dim=8), x)
+
+    out = ops.apply_rotary(x, np.zeros((1, 4), np.float32), np.ones((1, 4), np.float32), rotary_dim=8)
+    np.testing.assert_allclose(out[..., :4], -x[..., 4:])
+    np.testing.assert_allclose(out[..., 4:], x[..., :4])
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(5, 3, 8)).astype(np.float32)
+    angles = rng.uniform(0, 1, size=(5, 4)).astype(np.float32)
+    out = ops.apply_rotary(x, np.cos(angles), np.sin(angles), rotary_dim=8)
+    np.testing.assert_allclose(
+        np.linalg.norm(out, axis=-1), np.linalg.norm(x, axis=-1), rtol=1e-6
+    )
+
+
 def test_attention_respects_boolean_mask():
     s, h, d = 3, 1, 2
     q = np.ones((s, h, d), np.float32)

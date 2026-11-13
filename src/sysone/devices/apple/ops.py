@@ -68,11 +68,15 @@ def causal_depthwise_conv(x: np.ndarray, weight: np.ndarray, *, activation: bool
 
 
 def apply_rotary(x: np.ndarray, cos: np.ndarray, sin: np.ndarray, *, rotary_dim: int) -> np.ndarray:
-    """`x` 是 `[S, heads, head_dim]`；只旋转前 `rotary_dim` 维，按 RoPE 的"前半/后半"配对。"""
+    """`x` 是 `[S, heads, head_dim]`；只旋转前 `rotary_dim` 维，按 RoPE 的"前半/后半"配对。
+
+    两个半区必须先 `.copy()`：它们都是 `x` 的视图，先把新值写回半区、再用另一个半区算第二半，
+    会让第二半用上**已经旋转过的**第一半（M2.2 第 3 片接 Metal 时就是靠这条对拍抓到的）。
+    """
     x = np.asarray(x, dtype=np.float32).copy()
     half = rotary_dim // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:rotary_dim]
+    x1 = x[..., :half].copy()
+    x2 = x[..., half:rotary_dim].copy()
     c = cos[:, None, :]
     s = sin[:, None, :]
     x[..., :half] = x1 * c - x2 * s
