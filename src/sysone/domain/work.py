@@ -10,6 +10,26 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .attention import MaskPlan
+from ..errors import ConfigError
+
+
+def ffn_parts(hidden: int, ffn: int) -> int:
+    """FFN 的 down 投影把 K 维切成的段数 —— 旧引擎取 `ffn/hidden`（mude 是 3）。
+
+    ANE 的 conv 一次吃下 6144 个输入通道偏大，旧实现按 `hidden` 一段一段切。这里要求
+    `ffn` 能被 `hidden` 整除：mude 是 6144/2048 = 3；4B 是 9216/2560 = 3.6，需要变长切分，
+    留到 M4 的 4B 实验再说，现在显式报错而不是悄悄生成一个坏 program。
+    """
+    if hidden <= 0 or ffn <= 0:
+        raise ConfigError("FFN 切分需要正的 hidden/ffn", hidden=hidden, ffn=ffn)
+    if ffn % hidden:
+        raise ConfigError(
+            "FFN 的 down 投影要求 ffn 能被 hidden 整除",
+            hidden=hidden,
+            ffn=ffn,
+            hint="4B（9216/2560）需要变长切分，M2 只支持 mude 的 6144/2048",
+        )
+    return ffn // hidden
 
 
 class StageOp(StrEnum):

@@ -26,6 +26,7 @@ from typing import Mapping
 
 import numpy as np
 
+from ...domain.work import ffn_parts  # 规则只有一份，装配（models）与编译（devices）共用
 from ...errors import ConfigError, NotReadyError
 from ...weights.packing.ane_blob import BlobEntry
 from .runtime import AneRuntime, Surface
@@ -47,25 +48,6 @@ BLOB_NAME = "weights.bin"
 
 # 一层一个 program 时的 procedure 顺序（与旧引擎的 `PROCS` 一致）。
 PROCS = {"proj": 0, "out": 1, "ffn": 2}
-
-
-def ffn_parts(hidden: int, ffn: int) -> int:
-    """FFN 的 down 投影要把 K 维切成几段 —— 旧引擎取 3（6144 / 2048）。
-
-    ANE 的 conv 一次吃下 6144 个输入通道偏大，旧实现按 `hidden` 一段一段切。这里要求
-    `ffn` 能被 `hidden` 整除：mude 是 6144/2048 = 3；4B 是 9216/2560 = 3.6，需要变长切分，
-    留到 M4 的 4B 实验再说，现在显式报错而不是悄悄生成一个坏 program。
-    """
-    if hidden <= 0 or ffn <= 0:
-        raise ConfigError("FFN 切分需要正的 hidden/ffn", hidden=hidden, ffn=ffn)
-    if ffn % hidden:
-        raise ConfigError(
-            "FFN 的 down 投影要求 ffn 能被 hidden 整除",
-            hidden=hidden,
-            ffn=ffn,
-            hint="4B（9216/2560）需要变长切分，M2 只支持 mude 的 6144/2048",
-        )
-    return ffn // hidden
 
 
 def _conv(
