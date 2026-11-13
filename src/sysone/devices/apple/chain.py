@@ -234,16 +234,20 @@ class MudeChain:
                     for _ in range(pool_slots(roles))]
         try:
             params = [_layer_params(store, index, role) for index, role in enumerate(roles)]
+            # 产物目录按 (模型名, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
+            # 的测试就会把 `s=1024` 的缓存顶掉，下一次装载要多花 9 s 重算权重与量化。
+            program_root = scratch / root.name / f"s{s}"
             for index, role in enumerate(roles):
                 cout = geometry.cout_full if role is AttentionRole.FULL else geometry.cout_gdn
+                directory = program_root / f"layer{index:02d}"
                 source = _artifact_source(
                     store, layer=index, role=role, cout=cout,
                     hidden=hidden, ffn=ffn, s=s, quantize=quantize,
                 )
-                files = cached_program(scratch / f"layer{index:02d}", source=source, s=s)
+                files = cached_program(directory, source=source, s=s)
                 if files is None:
                     files = _build_layer_program(
-                        store, scratch=scratch, index=index, role=role, cout=cout,
+                        store, directory=directory, index=index, role=role, cout=cout,
                         hidden=hidden, ffn=ffn, s=s, quantize=quantize, source=source,
                     )
                 layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
@@ -477,7 +481,7 @@ def _artifact_source(
 def _build_layer_program(
     store: SafeTensorFile,
     *,
-    scratch: Path,
+    directory: Path,
     index: int,
     role: AttentionRole,
     cout: int,
@@ -499,7 +503,7 @@ def _build_layer_program(
     blob, blob_entries = build_blob(entries, quantize=quantize)
     mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=blob_entries)
     return write_program(
-        scratch / f"layer{index:02d}",
+        directory,
         mil=mil,
         blob=blob,
         s=s,
