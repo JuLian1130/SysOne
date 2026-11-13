@@ -47,6 +47,10 @@ SIDECAR_NAME = "sidecar.json"
 MIL_NAME = "program.mil"
 BLOB_NAME = "weights.bin"
 
+# 产物的"版本盐"。MIL 生成、blob 布局或量化规则只要有一处改了，就把这个数 +1：
+# sidecar 里记着它，与当前代码不一致的旧产物会被重算，而不是被悄悄当成最新的那份。
+ARTIFACT_VERSION = 1
+
 # 一层一个 program 时的 procedure 顺序（与旧引擎的 `PROCS` 一致）。
 PROCS = {"proj": 0, "out": 1, "ffn": 2}
 
@@ -254,10 +258,13 @@ def write_program(
     blob: bytes,
     s: int,
     meta: dict | None = None,
+    source: dict | None = None,
 ) -> ProgramFiles:
     """把 MIL 与 blob 落盘，sidecar 写内容哈希；目录里内容没变就复用。
 
-    `reused=True` 不代表 aned 一定命中，只代表"这份文件就是这份 MIL 的产物"。
+    `source` 是"这份产物是从哪份权重来的"的身份（`cached_program` 只比它，不比哈希），
+    `meta` 是给人看与给调用方回读字段用的（层号、cout 等）。`reused=True` 不代表 aned
+    一定命中，只代表"这份文件就是这份 MIL 的产物"。
     """
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
@@ -267,22 +274,34 @@ def write_program(
 
     mil_hash = _sha256(mil.encode())
     blob_hash = _sha256(blob)
-    payload = {"s": int(s), "mil_sha256": mil_hash, "blob_sha256": blob_hash, "meta": meta or {}}
+    payload = {
+        "version": ARTIFACT_VERSION,
+        "s": int(s),
+        "mil_sha256": mil_hash,
+        "blob_sha256": blob_hash,
+        "meta": meta or {},
+        "source": source,
+    }
 
-    reused = False
-    if mil_path.is_file() and blob_path.is_file() and sidecar_path.is_file():
-        try:
-            previous = json.loads(sidecar_path.read_text())
-        except (OSError, ValueError):
-            previous = {}
-        reused = (
-            previous.get("mil_sha256") == mil_hash
-            and previous.get("blob_sha256") == blob_hash
-            and previous.get("s") == int(s)
-        )
+    previous: dict = {}
+    try:
+        previous = json.loads(sidecar_path.read_text())
+    except (OSError, ValueError):
+        previous = {}
+    reused = bool(
+        mil_path.is_file()
+        and blob_path.is_file()
+        and previous.get("mil_sha256") == mil_hash
+        and previous.get("blob_sha256") == blob_hash
+        and previous.get("s") == int(s)
+    )
+    # sidecar 与这一份记录不等（比如多了一个 `source` 字段）时也要重写：缓存靠它认身份，
+    # 只在内容变化时写会让"内容没变、身份刚补上"的那一次永远错过。
+    stale = previous != payload
     if not reused:
         mil_path.write_text(mil)
         blob_path.write_bytes(blob)
+    if not reused or stale:
         sidecar_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return ProgramFiles(
         directory=root,
@@ -292,6 +311,39 @@ def write_program(
         mil=mil,
         s=int(s),
         reused=reused,
+    )
+
+
+def cached_program(directory: str | Path, *, source: dict, s: int) -> ProgramFiles | None:
+    """目录里的产物已经就是 `source` 的产物时，直接按它复用；否则 `None`。
+
+    这里**不比 blob / MIL 的哈希**：那两个哈希要先算出来才知道，而缓存的意义正是不再算
+    它们（`build_blob` 在本机要 6 s，读一遍 fp16 权重再加 2.4 s）。代价是 `source` 必须
+    覆盖一切会改变产物的输入：权重文件的身份（路径、大小、mtime）、层号、层类型、几何、
+    桶宽、量化开关，以及 `ARTIFACT_VERSION`。
+    """
+    root = Path(directory)
+    mil_path = root / MIL_NAME
+    blob_path = root / BLOB_NAME
+    sidecar_path = root / SIDECAR_NAME
+    if not (mil_path.is_file() and blob_path.is_file() and sidecar_path.is_file()):
+        return None
+    try:
+        payload = json.loads(sidecar_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if payload.get("version") != ARTIFACT_VERSION:
+        return None
+    if payload.get("s") != int(s) or payload.get("source") != source:
+        return None
+    return ProgramFiles(
+        directory=root,
+        mil_path=mil_path,
+        blob_path=blob_path,
+        sidecar_path=sidecar_path,
+        mil=mil_path.read_text(),
+        s=int(s),
+        reused=True,
     )
 
 

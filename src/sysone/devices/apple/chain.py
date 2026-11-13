@@ -19,7 +19,15 @@ from ...domain.attention import AttentionRole
 from ...models.families.mude import CODE_ROWS, ane_layer_weights, normalize_norm
 from ...weights.packing.ane_blob import build as build_blob
 from ...weights.store import SafeTensorFile
-from .compile import S_NATIVE, AneLayer, SurfaceSet, layer_mil, write_program
+from .compile import (
+    S_NATIVE,
+    AneLayer,
+    ProgramFiles,
+    SurfaceSet,
+    cached_program,
+    layer_mil,
+    write_program,
+)
 from .geometry import Geometry
 from .metal import MetalRuntime
 from .pipeline import MudePipeline, pool_slots
@@ -227,17 +235,17 @@ class MudeChain:
         try:
             params = [_layer_params(store, index, role) for index, role in enumerate(roles)]
             for index, role in enumerate(roles):
-                entries = ane_layer_weights(store.read, layer=index, layer_type=role)
-                cout = int(entries["proj"].shape[0])
-                blob, blob_entries = build_blob(entries, quantize=quantize)
-                mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=blob_entries)
-                files = write_program(
-                    scratch / f"layer{index:02d}",
-                    mil=mil,
-                    blob=blob,
-                    s=s,
-                    meta={"layer": index, "type": str(role), "cout": cout},
+                cout = geometry.cout_full if role is AttentionRole.FULL else geometry.cout_gdn
+                source = _artifact_source(
+                    store, layer=index, role=role, cout=cout,
+                    hidden=hidden, ffn=ffn, s=s, quantize=quantize,
                 )
+                files = cached_program(scratch / f"layer{index:02d}", source=source, s=s)
+                if files is None:
+                    files = _build_layer_program(
+                        store, scratch=scratch, index=index, role=role, cout=cout,
+                        hidden=hidden, ffn=ffn, s=s, quantize=quantize, source=source,
+                    )
                 layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
                                        hidden=hidden, cout=cout, ffn=ffn, s=s, pool=pool))
             final_norm = normalize_norm(store.read("language_model.norm.weight"))
@@ -429,6 +437,75 @@ class MudeChain:
         if self._own_runtime:
             self._runtime.close()
         self._store.close()
+
+
+# ---------------------------------------------------------------------- 产物
+
+# 一层的产物目录里已经有了"就是这份权重、这个几何、这个桶宽、这个量化"的证明时，
+# 就不再读 fp16 权重、也不再量化 —— 这两段在本机是 8.6 s，而装载本身只要 0.7 s。
+def _artifact_source(
+    store: SafeTensorFile,
+    *,
+    layer: int,
+    role: AttentionRole,
+    cout: int,
+    hidden: int,
+    ffn: int,
+    s: int,
+    quantize: bool,
+) -> dict:
+    """产物的身份：权重文件的 stat + 几何 + 量化开关 + `ARTIFACT_VERSION`。
+
+    刻意用 stat 而不是内容哈希：哈希要把 1.5 GB 读一遍，而读一遍正是要省掉的那一段。
+    认不出来的情形只有"权重被原地改写且 mtime、大小都没变"，发布与替换权重都会改 mtime。
+    """
+    stat = store.path.stat()
+    return {
+        "weights": str(store.path.resolve()),
+        "bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "layer": int(layer),
+        "type": str(role),
+        "cout": int(cout),
+        "hidden": int(hidden),
+        "ffn": int(ffn),
+        "s": int(s),
+        "quantize": bool(quantize),
+    }
+
+
+def _build_layer_program(
+    store: SafeTensorFile,
+    *,
+    scratch: Path,
+    index: int,
+    role: AttentionRole,
+    cout: int,
+    hidden: int,
+    ffn: int,
+    s: int,
+    quantize: bool,
+    source: dict,
+) -> ProgramFiles:
+    """读这一层的 fp16 权重、量化、生成 MIL 并落盘（缓存未命中的那一路）。"""
+    entries = ane_layer_weights(store.read, layer=index, layer_type=role)
+    actual = int(entries["proj"].shape[0])
+    if actual != cout:
+        # `cout` 来自写死在 MSL 里的几何；权重形状与它对不上说明这个 checkpoint 不是
+        # 这套几何编译的，继续下去会得到一个形状对、语义错的 program。
+        raise ValueError(
+            f"第 {index} 层的 proj 行数 {actual} 与几何给出的 cout={cout} 不一致"
+        )
+    blob, blob_entries = build_blob(entries, quantize=quantize)
+    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=blob_entries)
+    return write_program(
+        scratch / f"layer{index:02d}",
+        mil=mil,
+        blob=blob,
+        s=s,
+        meta={"layer": index, "type": str(role), "cout": cout},
+        source=source,
+    )
 
 
 # ---------------------------------------------------------------------- 权重
