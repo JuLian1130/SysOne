@@ -136,12 +136,6 @@ class MudePipeline:
         """跑完 20 层。`embed` 是 `[length, hidden]` 的 embedding 输出（fp32）。"""
         if not 0 <= prefix <= length <= self._s:
             raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, s=self._s)
-        if prefix not in (0, length):
-            raise ConfigError(
-                "流水线目前只支持全长可见（nk = length）",
-                prefix=prefix, length=length,
-                hint="prefix_noncausal 的前缀/tail 两遍 dispatch 在下一片落地",
-            )
         view = self.seed.array(np.float16, (self._hidden, self._s))
         view[:] = 0
         view[:, :length] = np.asarray(embed, np.float32).T.astype(np.float16)
@@ -156,7 +150,7 @@ class MudePipeline:
             self._sync()
             entry.ane.eval_proc("proj")
             if entry.role is AttentionRole.FULL:
-                self._full_attention(entry, length, prev)
+                self._full_attention(entry, length, prefix, prev)
             else:
                 self._gdn(entry, length, prev)
             self._sync()
@@ -183,7 +177,7 @@ class MudePipeline:
             stile=self._s, s0=0, src_stride=self._s, dst_stride=self._s,
         )
 
-    def _full_attention(self, entry: LayerBuffers, length: int,
+    def _full_attention(self, entry: LayerBuffers, length: int, prefix: int,
                         prev: MetalBuffer | None) -> None:
         self._copy(entry.surface("proj_out"), self.qg, nchan=kernels.QK_DIM * 2)
         self._copy(entry.surface("proj_out"), self.kv, nchan=kernels.KV_PROJ * 2,
@@ -193,11 +187,32 @@ class MudePipeline:
         kernels.kv_prep(self._runtime, self.kv, entry.weights["k_norm"],
                         self._cos, self._sin, stile=self._s, src_stride=self._s, eps=EPS)
         self._residual(entry, prev)
+        out = entry.surface("out_in")
+        # `T` 是 qg/kv 的列数（缓冲宽度），不是本批 token 数：两者在"桶宽 256、只有 8 条
+        # query"时不同，S=96 的对拍里恰好相等（T == Stile == nq）才没暴露这一错位。
+        if prefix <= 0 or prefix >= length:
+            # 全长可见：每个 query 只受一个上界 `nk` 约束。`prefix == length` 时前缀就是整条
+            # prompt，`prefix_noncausal` 也退化成这一种，所以两者共用一次 dispatch。
+            kernels.attention(
+                self._runtime, self.qg, self.kv, out, self.attn_scratch,
+                T=self._s, stile=self._s, nk=length, nq=length,
+                out_stride=self._s, fast=True,
+            )
+            return
+        # `prefix_noncausal`：前缀行只看前缀、尾巴行看全部，而 `nk` 是**一个**全局上界，
+        # 所以得拆两遍 dispatch（`s0` 是这一遍的首个 query 位置、`out_s0` 是写列偏移，
+        # 见 shaders/e8_attn.metal:280 的 `os0 + jc`）。GDN 层不用拆：它的递推本来就是
+        # 逐 token 因果的，前缀行只看前缀在前缀内部恰好成立。
+        tail = length - prefix
         kernels.attention(
-            self._runtime, self.qg, self.kv, entry.surface("out_in"), self.attn_scratch,
-            # `T` 是 qg/kv 的列数（缓冲宽度），不是本批 token 数：两者在"桶宽 256、只有 8 条
-            # query"时不同，S=96 的对拍里恰好相等（T == Stile == nq）才没暴露这一错位。
-            T=self._s, stile=self._s, nk=length, nq=length, fast=True,
+            self._runtime, self.qg, self.kv, out, self.attn_scratch,
+            T=self._s, stile=prefix, nk=prefix, nq=prefix, s0=0,
+            out_stride=self._s, out_s0=0, fast=True,
+        )
+        kernels.attention(
+            self._runtime, self.qg, self.kv, out, self.attn_scratch,
+            T=self._s, stile=tail, nk=length, nq=tail, s0=prefix,
+            out_stride=self._s, out_s0=prefix, fast=True,
         )
 
     def _gdn(self, entry: LayerBuffers, length: int, prev: MetalBuffer | None) -> None:

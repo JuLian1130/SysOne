@@ -179,6 +179,72 @@ def test_q_and_kv_prep_match_numpy(store: SafeTensorFile, runtime: MetalRuntime)
 
 
 @pytest.mark.parametrize("fast", [False, True])
+def test_attention_prefix_two_pass_matches_numpy(
+    store: SafeTensorFile, runtime: MetalRuntime, fast: bool
+) -> None:
+    """`prefix_noncausal`：前缀行只看前缀、尾巴行看全部，靠两遍 dispatch 表达。
+
+    一遍 dispatch 只有一个全局上界 `nk`（`shaders/e8_common.h:117`），所以第一遍只放前缀行
+    （`s0=0`、`Stile=prefix`、`nk=prefix`），第二遍只放尾巴行（`s0=prefix`、
+    `Stile=tail`、`nk=S`），两遍各自写到 `out` 的 `out_s0` 列上。
+    """
+    prefix = 32
+    _, ref_qg, ref_kv = _inputs(store, S)
+    qg16, kv16 = ref_qg.astype(np.float16), ref_kv.astype(np.float16)
+    p_q, p_kv = qg16.astype(np.float32), kv16.astype(np.float32)
+    query = np.stack([p_q[h * 2 * kernels.HEAD_DIM : h * 2 * kernels.HEAD_DIM + kernels.HEAD_DIM].T
+                      for h in range(kernels.Q_HEADS)], axis=1)
+    gate = np.stack([p_q[h * 2 * kernels.HEAD_DIM + kernels.HEAD_DIM : (h + 1) * 2 * kernels.HEAD_DIM].T
+                     for h in range(kernels.Q_HEADS)], axis=1)
+    key = np.stack([p_kv[h * kernels.HEAD_DIM : (h + 1) * kernels.HEAD_DIM].T
+                    for h in range(kernels.KV_HEADS)], axis=1)
+    value = np.stack([p_kv[kernels.KV_PROJ + h * kernels.HEAD_DIM : kernels.KV_PROJ + (h + 1) * kernels.HEAD_DIM].T
+                      for h in range(kernels.KV_HEADS)], axis=1)
+    repeat = kernels.Q_HEADS // kernels.KV_HEADS
+    idx = np.arange(S)
+    mask = (idx[:, None] >= prefix) | (idx[None, :] < prefix)  # prefix_noncausal
+    context = attention(
+        query, np.repeat(key, repeat, axis=1), np.repeat(value, repeat, axis=1), mask,
+    ).reshape(S, kernels.QK_DIM)
+    expected = (context * gate.reshape(S, kernels.QK_DIM)).T
+
+    qg_buf = runtime.alloc(Q_ROWS * S * 2)
+    kv_buf = runtime.alloc(KV_ROWS * S * 2)
+    out_buf = runtime.alloc(kernels.HID * 2 * S * 2)
+    scratch = runtime.alloc(16 if fast else 8 * S * S * 4)
+    qg_buf.array(np.float16, (Q_ROWS, S))[:] = qg16
+    kv_buf.array(np.float16, (KV_ROWS, S))[:] = kv16
+    out_buf.array(np.float16, (kernels.HID * 2, S))[:] = 0
+
+    kernels.attention(
+        runtime, qg_buf, kv_buf, out_buf, scratch,
+        T=S, stile=prefix, nk=prefix, nq=prefix, s0=0,
+        out_stride=S, out_s0=0, fast=fast,
+    )
+    kernels.attention(
+        runtime, qg_buf, kv_buf, out_buf, scratch,
+        T=S, stile=S - prefix, nk=S, nq=S - prefix, s0=prefix,
+        out_stride=S, out_s0=prefix, fast=fast,
+    )
+    runtime.commit()
+    runtime.wait()
+
+    got = out_buf.array(np.float16, (kernels.HID * 2, S))[: kernels.HID].astype(np.float32)
+    rel, cos_sim = _rel_l2(got, expected), _cos(got, expected)
+    # 分两段报告：前缀行被尾巴污染只会坏第一段，尾巴行漏看前缀只会坏第二段
+    head_rel = _rel_l2(got[:, :prefix], expected[:, :prefix])
+    tail_rel = _rel_l2(got[:, prefix:], expected[:, prefix:])
+    assert rel < TOL, (
+        f"两遍 prefix 注意力对不上：relL2={rel:.3e} cos={cos_sim:.6f}"
+        f"｜前缀段 {head_rel:.3e}、尾巴段 {tail_rel:.3e}"
+    )
+    assert cos_sim > 0.999, f"方向不对：cos={cos_sim:.6f}"
+    assert np.all(np.isfinite(got)), "输出里有 NaN/inf"
+    for buf in (qg_buf, kv_buf, out_buf, scratch):
+        buf.free()
+
+
+@pytest.mark.parametrize("fast", [False, True])
 def test_attention_matches_numpy(store: SafeTensorFile, runtime: MetalRuntime, fast: bool) -> None:
     """喂**已 prep 好的** q/k/v（fp16 取整后再落盘），只量注意力核本身。"""
     _, ref_qg, ref_kv = _inputs(store, S)
