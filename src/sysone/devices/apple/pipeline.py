@@ -13,15 +13,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Iterator
 
 import numpy as np
 
 from ...domain.attention import AttentionRole
 from ...errors import ConfigError
 from . import kernels
-from .compile import AneLayer
+from .compile import AneLayer, SurfaceSet
 from .geometry import Geometry, mude_geometry
 from .metal import LANE_LONG, LANE_SMALL, MetalBuffer, MetalRuntime
 
@@ -33,7 +33,9 @@ class LayerBuffers:
     """一层的 ANE 面与 GPU 侧的权重表。
 
     `surfaces` 里是 **wrap 过的** `MetalBuffer`（不是 ANE `Surface`），所以 GPU 核与 ANE
-    程序看的是同一块内存；释放必须走 `free()`，它会对每张面 `unwind`。
+    程序看的是同一块内存。这六张面属于表面池、由流水线统一 wrap 一次：同一张面 wrap 两次
+    在 dylib 里拿到同一个句柄（`e8_mtl.m:241` 按 IOSurface 指针缓存），`unwind` 一次就够，
+    所以 `free()` 只放权重，面留给 `MudePipeline.close()`。
     """
 
     ane: AneLayer
@@ -47,11 +49,6 @@ class LayerBuffers:
         return self.surfaces[key]
 
     def free(self) -> None:
-        # 先解绑（`e8m_wrap` 在 dylib 里按 IOSurface 指针缓存句柄，不 unwrap 会让下一轮
-        # 拿到指向已释放内存的句柄），再释放权重表。
-        for buffer in self.surfaces.values():
-            buffer.free()
-        self.surfaces.clear()
         for buffer in self.weights.values():
             buffer.free()
         self.weights.clear()
@@ -80,6 +77,7 @@ class MudePipeline:
         geometry: Geometry | None = None,
         bucket: int,
         width: int,
+        pool: Sequence[SurfaceSet],
     ) -> None:
         self._runtime = runtime
         self._geometry = mude_geometry() if geometry is None else geometry
@@ -89,12 +87,19 @@ class MudePipeline:
         self._width = int(width)
         if self._width < self._bucket:
             raise ConfigError("傍宽不能小于桶宽", width=width, bucket=bucket)
+        if not pool:
+            raise ConfigError("表面池至少要有一套面")
+        # 六张面在池里只 wrap 一次（见 `LayerBuffers`）。包出来的句柄归流水线。
+        self._wrapped: list[dict[str, MetalBuffer]] = []
         self.buffers: list[LayerBuffers] = []
         try:
+            self._wrapped = [
+                {key: runtime.wrap(surface) for key, surface in st.surfaces.items()}
+                for st in pool
+            ]
             for index, layer in enumerate(layers):
-                entry = LayerBuffers(ane=layer, role=roles[index], surfaces={}, weights={})
-                for key, surface in layer.surfaces.items():
-                    entry.surfaces[key] = runtime.wrap(surface)
+                entry = LayerBuffers(ane=layer, role=roles[index],
+                                     surfaces=self._wrapped[0], weights={})
                 self.buffers.append(entry)
                 self._load_weights(entry, params[index])
             self._cos = _float_buffer(runtime, cos, np.float32)
@@ -477,6 +482,13 @@ class MudePipeline:
         for entry in self.buffers:
             entry.free()
         self.buffers.clear()
+        # 解绑池里的六张面：必须在它们的所有者 `SurfaceSet.free()` 之前（`e8m_wrap` 的缓存
+        # 按 IOSurface 指针键，地址会被下一次分配复用）。
+        for wrapped in self._wrapped:
+            for buffer in wrapped.values():
+                buffer.free()
+            wrapped.clear()
+        self._wrapped.clear()
         for name in ("seed", "x", "attn", "gscratch", "attn_scratch", "_cos", "_sin"):
             buffer = getattr(self, name, None)
             if buffer is not None:

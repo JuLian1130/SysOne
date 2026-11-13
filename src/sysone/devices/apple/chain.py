@@ -19,7 +19,7 @@ from ...domain.attention import AttentionRole
 from ...models.families.mude import CODE_ROWS, ane_layer_weights, normalize_norm
 from ...weights.packing.ane_blob import build as build_blob
 from ...weights.store import SafeTensorFile
-from .compile import S_NATIVE, AneLayer, layer_mil, write_program
+from .compile import S_NATIVE, AneLayer, SurfaceSet, layer_mil, write_program
 from .geometry import Geometry
 from .metal import MetalRuntime
 from .pipeline import MudePipeline
@@ -95,12 +95,14 @@ class MudeChain:
         linear_dim: int,
         own_runtime: bool = True,
         pipeline: object | None = None,
+        pool: list[SurfaceSet] | None = None,
         own_metal: bool = False,
         metal_runtime: object | None = None,
     ) -> None:
         self._runtime = runtime
         self._own_runtime = own_runtime
         self._pipeline = pipeline
+        self._pool = pool
         self._own_metal = own_metal
         self._metal_runtime = metal_runtime
         self._layers = layers
@@ -213,6 +215,14 @@ class MudeChain:
         pipeline = None
         metal_runtime = None
         layers: list[AneLayer] = []
+        # 表面池归这条链所有（Metal 形态才有）：20 层共用一个池，因为一次只有一条 ANE 固件
+        # 队列、一次只有一个 eval 在飞 —— 每层自带一套在 4096 桶下是 3.57 GB 对 0.20 GB。
+        # 池里放几套取决于同时有几条链在跑，今天是一条；双链要 NCH × block 层数（第 3 步）。
+        # `close()` 里必须在卸载 program **之后**才 `free()`：每次 `attach` 都给面加了引用。
+        pool: list[SurfaceSet] | None = None
+        if metal:
+            pool = [SurfaceSet(runtime, hidden=hidden,
+                               cout=max(geometry.cout_full, geometry.cout_gdn), s=s)]
         try:
             params = [_layer_params(store, index, role) for index, role in enumerate(roles)]
             for index, role in enumerate(roles):
@@ -228,7 +238,7 @@ class MudeChain:
                     meta={"layer": index, "type": str(role), "cout": cout},
                 )
                 layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
-                                       hidden=hidden, cout=cout, ffn=ffn, s=s))
+                                       hidden=hidden, cout=cout, ffn=ffn, s=s, pool=pool))
             final_norm = normalize_norm(store.read("language_model.norm.weight"))
             readout = _readout(root)
             temperature = float(decision.get("temperature", 1.0))
@@ -237,7 +247,7 @@ class MudeChain:
                 metal_runtime = MetalRuntime(geometry=geometry)
                 pipeline = MudePipeline(
                     runtime=metal_runtime, layers=layers, roles=roles, params=params,
-                    cos=cos, sin=sin, geometry=geometry, bucket=s, width=width,
+                    cos=cos, sin=sin, geometry=geometry, bucket=s, width=width, pool=pool,
                 )
         except BaseException:
             if pipeline is not None:
@@ -246,6 +256,8 @@ class MudeChain:
                 metal_runtime.close()
             for layer in layers:
                 layer.close()
+            for surface_set in pool or ():
+                surface_set.free()
             if own_runtime:
                 runtime.close()
             store.close()
@@ -257,7 +269,7 @@ class MudeChain:
             readout=readout, temperature=temperature, cos=cos, sin=sin,
             hidden=hidden, s=s, width=width, heads=heads, kv_heads=kv_heads, head_dim=head_dim,
             rotary_dim=rotary_dim, linear_heads=linear_heads, linear_dim=linear_dim,
-            own_runtime=own_runtime, pipeline=pipeline,
+            own_runtime=own_runtime, pipeline=pipeline, pool=pool,
             own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
         )
 
@@ -401,7 +413,7 @@ class MudeChain:
             return
         self._closed = True
         if self._pipeline is not None:
-            # 先解绑 GPU 侧的包装句柄，再让 AneLayer 释放那六张面。
+            # 先解绑 GPU 侧的包装句柄，再卸载 program，最后才释放池里的面。
             self._pipeline.close()
             self._pipeline = None
         if self._own_metal and self._metal_runtime is not None:
@@ -410,6 +422,9 @@ class MudeChain:
         for layer in self._layers:
             layer.close()
         self._layers.clear()
+        for surface_set in self._pool or ():
+            surface_set.free()
+        self._pool = None
         if self._own_runtime:
             self._runtime.close()
         self._store.close()

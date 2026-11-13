@@ -242,7 +242,7 @@ class AneRuntime:
         """是否还有一次已发射、未回收的 eval 在飞。"""
         return self._pending is not None
 
-    def issue(self, name: str, procedure: int = 0) -> None:
+    def issue(self, name: str, procedure: int = 0, *, slot: int = 0) -> None:
         """异步发射一次 eval，立刻返回；用 `reap()` 回收。
 
         这是旧引擎 `ISSUE_EVAL`（`docs/ANE/anebench/e8_a3.py:168-179`）的语义：
@@ -250,8 +250,8 @@ class AneRuntime:
         CPU 不阻塞"，于是这段时间里可以往 GPU 命令缓冲里继续编码互不依赖的 kernel。
         """
         if self._pending is not None:
-            raise NotReadyError("上一次 eval 还没回收", name=name, procedure=procedure)
-        self._pending = self._executor.submit(self.eval, name, int(procedure))
+            raise NotReadyError("上一次 eval 还没回收", name=name, procedure=procedure, slot=slot)
+        self._pending = self._executor.submit(self.eval_slot, name, int(procedure), int(slot))
 
     def reap(self) -> float:
         """回收一次在飞的 eval，返回它的毫秒数；没有在飞的就返回 0。"""

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -48,6 +49,10 @@ BLOB_NAME = "weights.bin"
 
 # 一层一个 program 时的 procedure 顺序（与旧引擎的 `PROCS` 一致）。
 PROCS = {"proj": 0, "out": 1, "ffn": 2}
+
+# 一个 (program, procedure) 能绑几套面。dylib 把请求按 `proc * 8 + slot` 键起来
+# （`e8_ane.m:386`），所以槽位号只能落在 0..7 —— 写成 8 会撞到下一个 procedure。
+MAX_SLOTS = 8
 
 
 def _conv(
@@ -290,6 +295,49 @@ def write_program(
     )
 
 
+# 每个 procedure 用哪两张面：`(输入, 输出)`，键都进 `SurfaceSet.surfaces`。
+SET_KEYS = {
+    "proj": ("proj_in", "proj_out"),
+    "out": ("out_in", "out_out"),
+    "ffn": ("ffn_in", "ffn_out"),
+}
+
+
+class SurfaceSet:
+    """一层三段计算要的六张 IOSurface，绑成一套。
+
+    这套面**不归某个 program 所有**，因为所有权换来的东西没有用：ANE 只有一条固件队列、
+    一次只有一个 eval 在飞，所以 20 层可以轮流用同一套面。旧引擎正是这么做的
+    （`docs/ANE/anebench/e8_ane.py:564-591`：20 层共享一套，省掉 0.9 GB）。池里放多套的
+    唯一理由是**相邻两层不能同时用同一套**：第 i 层的 ANE 还在读 `proj_in` 时，第 i+1 层的
+    `norm` 要往另一套里写 —— 双链驱动按 (层, 瓦片奇偶) 各分一套，见第 3 步。
+
+    谁开谁关：`AneLayer` 借用的池由调用方 `free()`。`close()` 里先卸载 program 再释放面
+    （卸载会 CFRelease 掉每次 `attach` 时给面加的引用，面才真的回收）。
+    """
+
+    def __init__(self, runtime: AneRuntime, *, hidden: int, cout: int, s: int) -> None:
+        self.hidden = int(hidden)
+        self.cout = int(cout)
+        self.s = int(s)
+        self.surfaces: dict[str, Surface] = {}
+        for key, items in (
+            ("proj_in", self.hidden), ("proj_out", self.cout),
+            ("out_in", 2 * self.hidden), ("out_out", self.hidden),
+            ("ffn_in", 2 * self.hidden), ("ffn_out", self.hidden),
+        ):
+            try:
+                self.surfaces[key] = runtime.surface(items * self.s * 2)
+            except NotReadyError:
+                self.free()
+                raise
+
+    def free(self) -> None:
+        for surface in self.surfaces.values():
+            surface.free()
+        self.surfaces.clear()
+
+
 class AneProgram:
     """装载好的单 func program：输入/输出各一张 IOSurface，零拷贝进出。
 
@@ -343,6 +391,9 @@ class AneLayer:
     六张 IOSurface 各管一个 stream 边界：ANE 写投影结果 → GPU 读它、写注意力输出 →
     ANE 读 `[attn | residual]` 算 out → GPU 再读 → ANE 读 `[xn | residual]` 算 FFN。
     与 `AneProgram` 相比省掉两次 `load` 与两次 program 切换（旧引擎也是这个形态）。
+
+    `pool` 给定时这六张面是借来的：池里的第 k 套绑到 ANE 槽位 k，调用方按链选槽位
+    （`eval_proc(..., slot=k)`）。不给就自己开一套（M2.1 的逐段对拍与 numpy 链用这个形态）。
     """
 
     def __init__(
@@ -355,6 +406,7 @@ class AneLayer:
         cout: int,
         ffn: int,
         s: int,
+        pool: Sequence[SurfaceSet] | None = None,
     ) -> None:
         self._runtime = runtime
         self.name = name
@@ -362,22 +414,24 @@ class AneLayer:
         self.cout = int(cout)
         self.ffn = int(ffn)
         self.s = int(s)
-        files.load(runtime, name)
+        self._owned: SurfaceSet | None = None
+        self._sets: list[SurfaceSet] = []
         self._surfaces: dict[str, Surface] = {}
         try:
-            for key, items in (
-                ("proj_in", hidden), ("proj_out", cout),
-                ("out_in", 2 * hidden), ("out_out", hidden),
-                ("ffn_in", 2 * hidden), ("ffn_out", hidden),
-            ):
-                self._surfaces[key] = runtime.surface(items * self.s * 2)
-            runtime.attach(name, PROCS["proj"], self._surfaces["proj_in"],
-                           self._surfaces["proj_out"])
-            runtime.attach(name, PROCS["out"], self._surfaces["out_in"],
-                           self._surfaces["out_out"])
-            runtime.attach(name, PROCS["ffn"], self._surfaces["ffn_in"],
-                           self._surfaces["ffn_out"])
-        except NotReadyError:
+            files.load(runtime, name)
+            self._owned = None if pool else SurfaceSet(
+                runtime, hidden=self.hidden, cout=self.cout, s=self.s
+            )
+            self._sets = [self._owned] if self._owned is not None else list(pool or ())
+            if len(self._sets) > MAX_SLOTS:
+                raise ConfigError("表面池超过 ANE 的槽位数", sets=len(self._sets),
+                                  max_slots=MAX_SLOTS)
+            self._surfaces = self._sets[0].surfaces
+            for slot, st in enumerate(self._sets):
+                for proc, pair in SET_KEYS.items():
+                    runtime.attach_slot(name, PROCS[proc], slot,
+                                        st.surfaces[pair[0]], st.surfaces[pair[1]])
+        except BaseException:
             self.close()
             raise
 
@@ -386,7 +440,8 @@ class AneLayer:
         """六张 IOSurface（`proj_in` / `proj_out` / `out_in` / `out_out` / `ffn_in` / `ffn_out`）。
 
         Metal 侧要直接 wrap 这几张面做零拷贝：GPU 读 ANE 刚写过的面、写 ANE 下一步要读的
-        面，中间不该经过 numpy。给出去的是**同一批对象**，调用方不许释放。
+        面，中间不该经过 numpy。给出去的是**同一批对象**，调用方不许释放；借用池的时候它
+        就是池里第 0 套（所有共享它的层拿到的是同一个 dict）。
         """
         return self._surfaces
 
@@ -408,22 +463,19 @@ class AneLayer:
 
     def eval_proc(self, proc: str, *, slot: int = 0) -> float:
         """只执行一个 procedure，不读回结果（流水线里结果留在面上给 GPU 核用）。"""
-        if slot:
-            ms = self._runtime.eval_slot(self.name, PROCS[proc], slot)
-        else:
-            ms = self._runtime.eval(self.name, PROCS[proc])
+        ms = self._runtime.eval_slot(self.name, PROCS[proc], slot)
         if ms < 0:
             raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc, slot=slot,
                                 reason=self._runtime.error())
         return ms
 
-    def issue_proc(self, proc: str) -> None:
+    def issue_proc(self, proc: str, *, slot: int = 0) -> None:
         """异步发射一个 procedure（不等待），随后用 `reap_proc()` 回收。
 
         发射之后到回收之前，CPU 可以去 GPU 命令缓冲里编码与该 procedure 无关的 kernel ——
         这是旧引擎 `ISSUE_EVAL` 的做法。违反"只有一个 eval 在飞"会抛 `NotReadyError`。
         """
-        self._runtime.issue(self.name, PROCS[proc])
+        self._runtime.issue(self.name, PROCS[proc], slot=slot)
 
     def reap_proc(self) -> float:
         """回收上一次 `issue_proc()` 的 eval，返回毫秒数。"""
@@ -431,20 +483,6 @@ class AneLayer:
         if ms < 0:
             raise NotReadyError("ANE 执行失败", program=self.name, reason=self._runtime.error())
         return ms
-
-    def bind_slot(self, slot: int, *, keys: tuple[str, ...] = ("in", "out")) -> bool:
-        """给某个槽位再绑一对面。`keys=("proj_in", "proj_out")` 之类的写法由调用方决定。"""
-        if slot <= 0:
-            raise ConfigError("槽位 0 由 attach() 绑定，不能重复绑", slot=slot)
-        if keys not in {
-            ("proj_in", "proj_out"), ("out_in", "out_out"), ("ffn_in", "ffn_out"),
-        }:
-            raise ConfigError("未知的槽位绑定键", keys=keys)
-        proc = {"proj": "proj", "out": "out", "ffn": "ffn"}[keys[0].split("_")[0]]
-        self._runtime.attach_slot(
-            self.name, PROCS[proc], slot, self._surfaces[keys[0]], self._surfaces[keys[1]]
-        )
-        return True
 
     def project(self, x: np.ndarray) -> tuple[np.ndarray, float]:
         """`[hidden, s]` → `[cout, s]`。"""
@@ -465,6 +503,10 @@ class AneLayer:
 
     def close(self) -> None:
         self._runtime.unload(self.name)
-        for surface in self._surfaces.values():
-            surface.free()
-        self._surfaces.clear()
+        if self._owned is not None:
+            self._owned.free()
+            self._owned = None
+        # 用的是重新绑定而不是 `clear()`：借来的池第 0 套就是别的层的那张 dict，
+        # 就地清空会把它们的面一起搬走。
+        self._surfaces = {}
+        self._sets = []

@@ -17,6 +17,7 @@ from sysone.devices.apple import available
 from sysone.devices.apple.compile import (
     AneLayer,
     AneProgram,
+    SurfaceSet,
     ffn_mil,
     ffn_parts,
     layer_mil,
@@ -270,10 +271,10 @@ def test_program_files_are_reused_on_second_write(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
-def test_multi_slot_binding_and_async_eval(tmp_path: Path) -> None:
-    """同一 program 的第二套面能绑到槽 1 并独立执行；`issue_proc`/`reap_proc` 能异步跑。
+def test_pool_slots_and_async_eval(tmp_path: Path) -> None:
+    """同一 program 的两套面各绑一个槽并独立执行；`issue_proc`/`reap_proc` 能异步跑。
 
-    这两个能力是第 2 步（双 lane + 多槽 + 异步 eval）的机制验收：槽 1 是为了"一次 eval 在飞
+    这两个能力是第 3 步（双链：两条链同时用同一份权重、各用一套面）的机制验收：槽 1 是为了"一次 eval 在飞
     时用另一套面准备下一段"，异步 eval 是为了"eval 在飞时 CPU 不阻塞"。这里用小几何合成
     权重，只钉机制不改数值。
     """
@@ -295,7 +296,9 @@ def test_multi_slot_binding_and_async_eval(tmp_path: Path) -> None:
     files = write_program(tmp_path / "slots", mil=mil, blob=blob, s=s)
 
     runtime = AneRuntime()
-    layer = AneLayer(runtime, files, name="m22_slots", hidden=hidden, cout=cout, ffn=ffn, s=s)
+    pool = [SurfaceSet(runtime, hidden=hidden, cout=cout, s=s) for _ in range(2)]
+    layer = AneLayer(runtime, files, name="m22_slots", hidden=hidden, cout=cout, ffn=ffn, s=s,
+                     pool=pool)
     try:
         x = rng.standard_normal((hidden, s)).astype(np.float16)
         layer._write("proj_in", hidden, x)
@@ -303,11 +306,13 @@ def test_multi_slot_binding_and_async_eval(tmp_path: Path) -> None:
         slot0 = layer._read("proj_out", cout)
 
         # 槽 1 绑同一对面（机制验收：多槽走的是 `e8_attach_slot` / `e8_eval_slot`）。
-        layer.bind_slot(1, keys=("proj_in", "proj_out"))
-        layer._write("proj_in", hidden, x)
+        # 槽 1 = 池里第 1 套面：同一个逻辑位置写同一份输入，走 `e8_eval_slot` 执行。
+        pool[1].surfaces["proj_in"].array(np.float16, (1, hidden, 1, s))[...] = \
+            x.reshape(1, hidden, 1, s)
         layer.eval_proc("proj", slot=1)
-        slot1 = layer._read("proj_out", cout)
-        np.testing.assert_array_equal(slot0, slot1, "同一输入在槽 0/槽 1 必须逐位一致")
+        slot1 = pool[1].surfaces["proj_out"].array(np.float16, (1, cout, 1, s))
+        np.testing.assert_array_equal(slot0, slot1.reshape(cout, s),
+                                      "同一输入在两个槽位必须逐位一致")
 
         # 异步：发射后立刻返回，回收时给出毫秒数。
         layer.issue_proc("proj")
@@ -317,4 +322,6 @@ def test_multi_slot_binding_and_async_eval(tmp_path: Path) -> None:
         assert ms > 0, "回收得到的应该是这次 eval 的毫秒数"
     finally:
         layer.close()
+        for surface_set in pool:
+            surface_set.free()
         runtime.close()
