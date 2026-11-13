@@ -40,6 +40,8 @@ class LayerBuffers:
     role: AttentionRole
     surfaces: dict[str, MetalBuffer]
     weights: dict[str, MetalBuffer]
+    # 这一层用哪一套 qg/kv（相邻两个全注意力层的投影与注意力会同时在飞）。
+    canvas: int = 0
 
     def surface(self, key: str) -> MetalBuffer:
         return self.surfaces[key]
@@ -98,6 +100,15 @@ class MudePipeline:
             self._cos = _float_buffer(runtime, cos, np.float32)
             self._sin = _float_buffer(runtime, sin, np.float32)
             self._alloc_shared()
+            # 每一列往下游推进的层数预算（对应旧引擎的 `RING = 8 // NCH`）：它是"注意力窗口里
+            # 填多少 ANE 活"的旋钮 —— 取 4 时一列能推 3 个线性层 + 下一个全注意力层的投影，
+            # 恰好 ≈ 一个 16k 注意力瓦片的 135 ms。
+            self._lookahead = 4
+            self._chunks_list: list[tuple[int, int]] = []
+            self._length = 0
+            self._prefix = 0
+            self._proj_done: list[int] = []
+            self._linear_first: list[bool] = []
         except BaseException:
             self.close()
             raise
@@ -126,16 +137,19 @@ class MudePipeline:
         # 段内所有读（`norm_to`、残差搬运）都在写（`ffn_out` 回填）之前完成，段与段的列不重叠，
         # 所以就地是安全的；这也是旧引擎 `e8_a1m.py` 的 `w_h` 的做法（它连乒乓缓冲都没有）。
         self.x = rt.alloc(2 * hidden * width)
-        # 注意力的输出，全宽、单通道带（残差不经过这里，见 `_out_and_ffn`）。
+        # 注意力的输出，全宽、单通道带（残差不经过这里，见 `_body`）。
         self.attn = rt.alloc(2 * hidden * width)
-        # [rows, width] 的 fp16 缓冲：行数来自几何（qg 是 2*q_heads*head_dim，kv 是 2*kv_proj）。
-        self.qg = rt.alloc(2 * geom.qg_rows * width)
-        self.kv = rt.alloc(2 * geom.kv_rows * width)
-        self.state = rt.alloc(4 * geom.state_floats)
-        self.tail = rt.alloc(2 * geom.conv_dim * 3)
+        # [rows, width] 的 fp16 缓冲。**两套**：波前里相邻两个全注意力层的投影与注意力会同时在飞
+        # （层的列段工作在本层注意力窗口里推进），一套会被写坏。全注意力层共 5 层，按序数奇偶交替。
+        self.qg_sets = [rt.alloc(2 * geom.qg_rows * width) for _ in range(2)]
+        self.kv_sets = [rt.alloc(2 * geom.kv_rows * width) for _ in range(2)]
         self.gscratch = rt.alloc(2 * 8192 * bucket)
         # 快核不读 scratch，但 kernel 声明了 buffer(3)，必须绑定。全宽的参考核才要 (T,T)。
         self.attn_scratch = rt.alloc(32)
+        # GDN 的递归状态与卷积尾巴**逐层独立**：波前里两层线性层的列段会交错执行，
+        # 共用一张状态会让后一层的清零把前一层的递推冲掉（每层 1 MB + 尾巴几十 KB）。
+        self.states = [rt.alloc(4 * geom.state_floats) for _ in self.buffers]
+        self.tails = [rt.alloc(2 * geom.conv_dim * 3) for _ in self.buffers]
         self._last: MetalBuffer = self.seed
 
     # ------------------------------------------------------------------ 执行
@@ -147,24 +161,39 @@ class MudePipeline:
             yield start, min(step, length - start)
 
     def run(self, embed: np.ndarray, *, length: int, prefix: int = 0) -> None:
-        """跑完 20 层。`embed` 是 `[length, hidden]` 的 embedding 输出（fp32）。"""
+        """跑完 20 层。`embed` 是 `[length, hidden]` 的 embedding 输出（fp32）。
+
+        **列段波前**（第 3 步 B 段）：不再"一层做完再做下一层"，而是按列段推进 —— 每写完
+        一层某一列的 `x`，下一层**同一列**就能开工（就地 `x` 的列互不重叠）。于是全注意力层的
+        注意力窗口（540 ms/层）里填的不是它自己的 ANE（只有 ~40 ms），而是紧随其后的三个线性层
+        的列段工作（3 × 136 ms）与再下一个全注意力层的投影（66 ms）——把 ANE 的 3.6 s 摊进
+        GPU 的 2.8 s 里。这里没有并发求值（ANE 只有一条固件队列、一次 eval 在飞），重叠完全
+        来自"CPU 在等 ANE/GPU 之前先把另一侧的活排满"。
+        """
         if not 0 <= prefix <= length <= self._width:
             raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
         view = self.seed.array(np.float16, (self._hidden, self._width))
         view[:] = 0
         view[:, :length] = np.asarray(embed, np.float32).T.astype(np.float16)
-        cur: MetalBuffer = self.seed
-        nxt: MetalBuffer = self.x
+        self._chunks_list = list(self._chunks(length))
+        self._length = int(length)
+        self._prefix = int(prefix)
+        # 每个全注意力层分两阶段（投影 → 注意力 body），阶段边界就是旧引擎 `prep` 那道屏障。
+        self._proj_done = [0] * len(self.buffers)
+        self._linear_first = [True] * len(self.buffers)
+        ordinal = 0
         for entry in self.buffers:
             if entry.role is AttentionRole.FULL:
-                self._full_layer(entry, length, prefix, cur, nxt)
+                entry.canvas = ordinal % 2
+                ordinal += 1
             else:
-                self._linear_layer(entry, length, cur, nxt)
-            # 从第二层起，输入和输出都是 `x` 本身（就地）；第一层的输入仍是 `seed`。
-            cur = nxt
-            nxt = self.x
+                entry.canvas = 0
+        # 先按列推进：第 0 层没有前驱，一列一列往下游递。递到某个全注意力层时它只做投影，
+        # 等它的最后一列投影完成，就由 `_advance` 内部一次性把它的 body 跑完（并继续往下游递）。
+        for column in range(len(self._chunks_list)):
+            self._advance(0, column, self._lookahead)
         self._wait_all()
-        self._last = cur
+        self._last = self.x
 
     # ---- 两条命令队列 -------------------------------------------------------
 
@@ -206,74 +235,119 @@ class MudePipeline:
             src_s0=src_s0,
         )
 
-    # ---- 全注意力层 ---------------------------------------------------------
+    # ---- 列段波前 -----------------------------------------------------------
 
-    def _full_layer(
-        self, entry: LayerBuffers, length: int, prefix: int,
-        cur: MetalBuffer, nxt: MetalBuffer,
-    ) -> None:
-        """先按桶分段算投影（ANE 列数受限、边算边把 `proj_out` 搬进全宽的 qg/kv），
-        再按桶分段做注意力与 out/FFN，两相交错。"""
-        proj = entry.surface("proj_out")
-        for start, n in self._chunks(length):
-            kernels.norm_to(
-                self._runtime, cur, entry.weights["input_norm"], entry.surface("proj_in"),
-                stile=n, src_stride=self._width, eps=EPS, s0=start,
-                dst_stride=self._bucket, dst_s0=0,
-            )
-            self._wait(LANE_SMALL)          # GPU 只是排队，ANE 紧接着要读 proj_in
-            # 发射即返回：投影在飞的时候 CPU 不阻塞，这段时间可以用来编码与本段无关的
-            # 搬运/计算（旧引擎 `ISSUE_EVAL` 的用法）。投影要把 `proj_out` 交给下一段，
-            # 所以紧接着回收 —— 真正的叠法要等两套 proj 槽位（见 docs 的 M2.2 第 5 片）。
-            entry.ane.issue_proc("proj")
-            entry.ane.reap_proc()
-            self._copy(proj, self.qg, nchan=self._geometry.qg_rows, n=n, s0=start,
-                       src_stride=self._bucket, dst_stride=self._width)
-            self._copy(proj, self.kv, nchan=self._geometry.kv_rows, src_c0=self._geometry.qg_rows,
-                       n=n, s0=start, src_stride=self._bucket, dst_stride=self._width)
-        # 分段投影的 `proj_out → qg/kv` 搬运在 lane 1 上，而下面两个 prep 在 lane 0 上；
-        # 两者碰的是同一批缓冲，所以必须等 lane 1 排空（否则 prep 之后的 qg 又被裸拷贝覆盖）。
-        self._wait(LANE_SMALL)
-        kernels.q_prep(self._runtime, self.qg, entry.weights["q_norm"],
+    def _advance(self, index: int, column: int, budget: int) -> None:
+        """把第 `index` 层的第 `column` 列段往下游推进，最多再走 `budget` 层。
+
+        线性层：这一列做完（投影 → GDN → out → FFN，写回 `x` 的同一列），再把下一层同一列递一步。
+
+        全注意力层分两段。投影逐列就能做（在上一层 body 的窗口里推进）；但注意力要看本层
+        **全部列**的 k/v，所以最后一列投影完成后才进入 body —— 那一刻就是旧引擎 `attn_steps`
+        的两相边界（`e8_a3.py:352-399` 的 `prep` 屏障）。body 的每一列收完，就继续往下游递
+        （那一列的 `x` 刚写好，下一层同一列立刻可开工）。
+
+        `budget` = 这一列还能往下走几层，默认 `_lookahead`。它决定每个注意力窗口里填多少
+        ANE 活：太小 GPU 空转，太大就把下游抢到前面做完、窗口里反而没活。
+        """
+        if budget <= 0 or index >= len(self.buffers):
+            return
+        entry = self.buffers[index]
+        start, n = self._chunks_list[column]
+        cur = self.seed if index == 0 else self.x
+        if entry.role is AttentionRole.FULL:
+            if self._proj_done[index] >= len(self._chunks_list):
+                return              # 已进入（或已完成）body 阶段，这一列由下面的循环驱动
+            self._proj_chunk(entry, start, n, cur)
+            self._finish_proj(entry, start, n)
+            self._proj_done[index] += 1
+            if self._proj_done[index] < len(self._chunks_list):
+                return              # k/v 还没攒够，body 不能开工
+            self._wait(LANE_SMALL)  # 分段投影的 qg/kv 搬运在 lane 1，prep 在 lane 0 上要读它
+            self._prep(entry)
+            self._dispatch_attention(entry)   # 一次提交全部瓦片，GPU 从头跑到尾
+            for jj, (body_start, body_n) in enumerate(self._chunks_list):
+                self._body_column(entry, body_start, body_n)
+                self._advance(index + 1, jj, self._lookahead)
+            return
+        self._linear_column(entry, index, start, n, cur)
+        self._advance(index + 1, column, budget - 1)
+
+    def _proj_chunk(self, entry: LayerBuffers, start: int, n: int, cur: MetalBuffer) -> None:
+        """一段的输入归一化 + 投影（发射，不回收）。"""
+        kernels.norm_to(
+            self._runtime, cur, entry.weights["input_norm"], entry.surface("proj_in"),
+            stile=n, src_stride=self._width, eps=EPS, s0=start,
+            dst_stride=self._bucket, dst_s0=0,
+        )
+        self._wait(LANE_SMALL)          # GPU 只是排队，ANE 紧接着要读 proj_in
+        entry.ane.issue_proc("proj")
+
+    def _finish_proj(self, entry: LayerBuffers, start: int, n: int) -> None:
+        """回收投影，并把 `proj_out` 的两段分别搬进全宽 qg / kv。"""
+        entry.ane.reap_proc()
+        qg, kv = self._qgkv(entry)
+        self._copy(entry.surface("proj_out"), qg, nchan=self._geometry.qg_rows, n=n, s0=start,
+                   src_stride=self._bucket, dst_stride=self._width)
+        self._copy(entry.surface("proj_out"), kv, nchan=self._geometry.kv_rows,
+                   src_c0=self._geometry.qg_rows, n=n, s0=start,
+                   src_stride=self._bucket, dst_stride=self._width)
+
+    def _prep(self, entry: LayerBuffers) -> None:
+        """全宽的 q/k 归一化 + 部分 RoPE（旧引擎的 `prep`，序列级屏障之后才做）。"""
+        qg, kv = self._qgkv(entry)
+        kernels.q_prep(self._runtime, qg, entry.weights["q_norm"],
                        self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
                        geometry=self._geometry)
-        kernels.kv_prep(self._runtime, self.kv, entry.weights["k_norm"],
+        kernels.kv_prep(self._runtime, kv, entry.weights["k_norm"],
                         self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
                         geometry=self._geometry)
-        # 相位 B（步骤图）：逐段"注意力 → out → norm2 → ffn"，把 ANE 的 out/ffn 埋进
-        # 下一段的 attention 里。这是旧引擎 `attn_steps` 的两相结构（`e8_a3.py:352-399`）：
-        # 每段的 `k_attn` 独立发射（`nk` 是全局上界、`s0`/`out_s0` 是本段列），段与段之间
-        # 没有数据依赖，所以可以先把下一段的 attention 排进 lane 0，再用本轮 ANE 求值回收成本段。
-        chunks = list(self._chunks(length))
-        self._start_attention_tile(chunks[0], length, prefix)
-        for index, (start, n) in enumerate(chunks):
-            self._wait(LANE_LONG)               # 本段 attention 完成（顺带排空上一段的 lane 0）
-            self._copy(self.attn, entry.surface("out_in"), nchan=self._hidden,
-                       n=n, s0=0, src_s0=start,
-                       src_stride=self._width, dst_stride=self._bucket)
-            self._copy(cur, entry.surface("out_in"), nchan=self._hidden,
-                       dst_c0=self._hidden, n=n, s0=0, src_s0=start,
-                       src_stride=self._width, dst_stride=self._bucket)
-            self._wait(LANE_SMALL)              # out_in 两半就绪
-            entry.ane.issue_proc("out")
-            if index + 1 < len(chunks):
-                # ANE 做 out 的这段时间里，下一段的 attention 已经在 lane 0 上跑起来了。
-                self._start_attention_tile(chunks[index + 1], length, prefix)
-            entry.ane.reap_proc()               # norm_residual 要读 out_out
-            kernels.norm_residual(
-                self._runtime, entry.surface("out_out"), entry.weights["post_norm"],
-                entry.surface("ffn_in"),
-                stile=n, src_stride=self._bucket, eps=EPS,
-                dst_stride=self._bucket, dst_s0=0,
-            )
-            self._wait(LANE_SMALL)              # ffn_in 就绪
-            entry.ane.issue_proc("ffn")         # 在飞：下一段的 attention 同时也在跑
-            entry.ane.reap_proc()
-            self._copy(entry.surface("ffn_out"), nxt, nchan=self._hidden,
-                       n=n, s0=start, src_stride=self._bucket, dst_stride=self._width)
-            self._wait(LANE_SMALL)              # ffn_out 已落进 nxt
 
-    def _attention_tile(self, chunk: tuple[int, int], length: int, prefix: int) -> None:
+    def _dispatch_attention(self, entry: LayerBuffers) -> None:
+        """把注意力瓦片**一个瓦片一次提交**，GPU 从头到尾连续跑。
+
+        `commit` 提交的是当前打开的命令缓冲 —— 若 4 个瓦片只提交一次，它们就落在同一个 CB 里，
+        之后 `wait_upto(1)` 会把四个一起等完，交错又退化。一个瓦片一个 CB，才能"只等第 j 个"。
+        注意第一个 CB 里还带着 `_prep` 的两个 dispatch（lane 0 的队列顺序即执行顺序）。
+        """
+        qg, kv = self._qgkv(entry)
+        for chunk in self._chunks_list:
+            self._attention_tile(entry, chunk, qg, kv)
+            self._runtime.commit(LANE_LONG)
+
+    def _qgkv(self, entry: LayerBuffers) -> tuple[MetalBuffer, MetalBuffer]:
+        """这一层用哪一套 qg/kv：相邻两个全注意力层的投影与注意力会同时在飞。"""
+        return self.qg_sets[entry.canvas], self.kv_sets[entry.canvas]
+
+    def _body_column(self, entry: LayerBuffers, start: int, n: int) -> None:
+        """收一列注意力：等第 `jj` 个瓦片 → out（含残差）→ 门控归一 → FFN → 写回 `x`。"""
+        self._runtime.wait_upto(LANE_LONG, 1)   # 只等队首这一个瓦片，后面的还在跑
+        self._copy(self.attn, entry.surface("out_in"), nchan=self._hidden,
+                   n=n, s0=0, src_s0=start,
+                   src_stride=self._width, dst_stride=self._bucket)
+        self._copy(self.x, entry.surface("out_in"), nchan=self._hidden,
+                   dst_c0=self._hidden, n=n, s0=0, src_s0=start,
+                   src_stride=self._width, dst_stride=self._bucket)
+        self._wait(LANE_SMALL)              # out_in 两半就绪
+        entry.ane.issue_proc("out")
+        entry.ane.reap_proc()               # norm_residual 要读 out_out
+        kernels.norm_residual(
+            self._runtime, entry.surface("out_out"), entry.weights["post_norm"],
+            entry.surface("ffn_in"),
+            stile=n, src_stride=self._bucket, eps=EPS,
+            dst_stride=self._bucket, dst_s0=0,
+        )
+        self._wait(LANE_SMALL)              # ffn_in 就绪
+        entry.ane.issue_proc("ffn")
+        entry.ane.reap_proc()
+        self._copy(entry.surface("ffn_out"), self.x, nchan=self._hidden,
+                   n=n, s0=start, src_stride=self._bucket, dst_stride=self._width)
+        self._wait(LANE_SMALL)              # 这一列的 x 落定，下游可以接着读
+
+    def _attention_tile(
+        self, entry: LayerBuffers, chunk: tuple[int, int],
+        qg: MetalBuffer, kv: MetalBuffer,
+    ) -> None:
         """一段 query 的注意力 dispatch；`prefix_noncausal` 的边界若落在这段内就拆两次。
 
         段内的 query 只受 `nk` 一个上界约束，所以"按段发射"与"整条一次发射"在数值上等价 ——
@@ -281,121 +355,84 @@ class MudePipeline:
         """
         start, n = chunk
         end = start + n
-        if prefix <= 0 or prefix >= length:
+        if self._prefix <= 0 or self._prefix >= self._length:
             kernels.attention(
-                self._runtime, self.qg, self.kv, self.attn, self.attn_scratch,
-                T=self._width, stile=n, nk=length, nq=n, s0=start,
+                self._runtime, qg, kv, self.attn, self.attn_scratch,
+                T=self._width, stile=n, nk=self._length, nq=n, s0=start,
                 out_stride=self._width, out_s0=start, fast=True, geometry=self._geometry,
             )
             return
-        boundary = min(end, prefix)
+        boundary = min(end, self._prefix)
         if start < boundary:
             kernels.attention(
-                self._runtime, self.qg, self.kv, self.attn, self.attn_scratch,
-                T=self._width, stile=boundary - start, nk=prefix, nq=boundary - start,
+                self._runtime, qg, kv, self.attn, self.attn_scratch,
+                T=self._width, stile=boundary - start, nk=self._prefix, nq=boundary - start,
                 s0=start, out_stride=self._width, out_s0=start, fast=True,
                 geometry=self._geometry,
             )
         if boundary < end:
             kernels.attention(
-                self._runtime, self.qg, self.kv, self.attn, self.attn_scratch,
-                T=self._width, stile=end - boundary, nk=length, nq=end - boundary,
+                self._runtime, qg, kv, self.attn, self.attn_scratch,
+                T=self._width, stile=end - boundary, nk=self._length, nq=end - boundary,
                 s0=boundary, out_stride=self._width, out_s0=boundary, fast=True,
                 geometry=self._geometry,
             )
 
-    def _start_attention_tile(
-        self, chunk: tuple[int, int], length: int, prefix: int,
-    ) -> None:
-        """发射一段注意力并**立刻提交** lane 0。
-
-        `commit` 才是把命令缓冲交给 GPU，`dispatch` 只是编码；只有提交了，下一段的
-        attention 才会在本轮的 ANE 求值期间真的跑起来 —— 不提交就等到 `_wait(LANE_LONG)`
-        才一起提交，"交错"退化成串行（实测省不出任何时间，正是这一处漏掉的 commit）。
-        """
-        self._attention_tile(chunk, length, prefix)
-        self._runtime.commit(LANE_LONG)
-
     # ---- 线性（GDN）层 ------------------------------------------------------
 
-    def _linear_layer(
-        self, entry: LayerBuffers, length: int, cur: MetalBuffer, nxt: MetalBuffer,
+    def _linear_column(
+        self, entry: LayerBuffers, index: int, start: int, n: int, cur: MetalBuffer,
     ) -> None:
-        """按桶分段：投影 → GDN（递归状态与卷积尾巴跨段接力）→ out → FFN。"""
-        # 每层的递归状态都从零开始（prefill、无 cache）：`k_gdn` 自己不清零，
-        # 旧引擎也是在每层前把 w_state 填零（docs/ANE/anebench/e8_a1m.py:969-971）。
-        self.state.array(np.float32,
-                         (self._geometry.l_v_heads, self._geometry.l_k_dim,
-                          self._geometry.l_v_dim))[:] = 0
-        first = True
-        for start, n in self._chunks(length):
-            kernels.norm_to(
-                self._runtime, cur, entry.weights["input_norm"], entry.surface("proj_in"),
-                stile=n, src_stride=self._width, eps=EPS, s0=start,
-                dst_stride=self._bucket, dst_s0=0,
-            )
-            self._wait(LANE_SMALL)
-            entry.ane.issue_proc("proj")
-            # 残差搬运只读 `cur`、只写 `out_in` 的后半区，与在飞的投影（读写 `proj_in` /
-            # `proj_out`）不冲突，所以排在回收之前 —— 一次 eval 在飞时 CPU 继续编码。
-            self._copy(cur, entry.surface("out_in"), nchan=self._hidden,
-                       dst_c0=self._hidden, n=n, s0=0, src_s0=start,
-                       src_stride=self._width, dst_stride=self._bucket)
-            entry.ane.reap_proc()
-            kernels.gdn(
-                self._runtime, entry.surface("proj_out"), self.state, self.tail,
-                entry.weights["conv"], entry.weights["a_log"], entry.weights["dt_bias"],
-                entry.weights["norm"], entry.surface("out_in"), self.gscratch,
-                # GDN 核里的 `Stile` 既是列界也是**通道步长**（`proj[c*Stile + j]`），所以必须
-                # 传桶宽而不是本段的有效列数；`T` 是它不看的多余字段。
-                stile=self._bucket, eps=EPS, first=first, T=self._bucket,
-                out_stride=self._bucket, fast=True, geometry=self._geometry,
-            )
-            first = False
-            self._wait(LANE_SMALL)   # ANE 的 out 要读 GDN 写出的 out_in 前半区
-            self._out_and_ffn(entry, length, nxt, only=(start, n))
+        """一列的 GDN 层：投影 → GDN（递归状态与卷积尾巴跨段接力）→ out → FFN → 写回 `x`。
 
-    def _out_and_ffn(
-        self, entry: LayerBuffers, length: int, nxt: MetalBuffer,
-        *, only: tuple[int, int] | None = None,
-    ) -> None:
-        """`out` 投影（含残差加）→ 门控前归一 → FFN，按桶分段写回 `nxt` 的对应列。
-
-        只有线性（GDN）层走这里：它在同一段的循环里已经把 GDN 输出与残差写进 `out_in` 的两半，
-        所以这里只需要补 out → norm2 → ffn 这一段。全注意力层走 `_full_layer` 里那段交错流水，
-        它的 `out_in` 由注意力结果与残差就地拼成。
-
-        **段与段之间的软件流水**：某一段的 `ffn` 在 ANE 上跑着的时候，下一段的 `out_in`
-        已经在 lane 1 的队列里等着了（`ffn` 只读写 `ffn_in`/`ffn_out`，与 `out_in` 无关），
-        所以 `ffn` 结束时下一段的输入也已就绪；上一段的 `ffn_out → nxt` 回填则排在下一段
-        `out` 发射之前。没有这一步流水，每段都要"等 ANE 完全空闲再开始搬输入"。
+        状态与尾巴**逐层独立**（`self.states[index]` / `self.tails[index]`）：波前里两层线性层
+        的列段会交错执行，共用一张 1 MB 状态会被后一层的清零冲掉。
         """
-        chunks = [only] if only is not None else list(self._chunks(length))
-        pending: tuple[int, int] | None = None   # 上一次已发射、尚未回填的 ffn 属于哪一段
-        for start, n in chunks:
-            self._wait(LANE_SMALL)              # out_in 两半就绪
-            if pending is not None:
-                entry.ane.reap_proc()           # 上一段的 ffn 算完了，ffn_out 可读
-                self._copy(entry.surface("ffn_out"), nxt, nchan=self._hidden,
-                           n=pending[1], s0=pending[0],
-                           src_stride=self._bucket, dst_stride=self._width)
-            entry.ane.issue_proc("out")
-            entry.ane.reap_proc()               # norm_residual 要读 out_out
-            kernels.norm_residual(
-                self._runtime, entry.surface("out_out"), entry.weights["post_norm"],
-                entry.surface("ffn_in"),
-                stile=n, src_stride=self._bucket, eps=EPS,
-                dst_stride=self._bucket, dst_s0=0,
-            )
-            self._wait(LANE_SMALL)              # ffn_in 就绪
-            entry.ane.issue_proc("ffn")         # 在飞：下一段的搬运可以叠上来
-            pending = (start, n)
-        if pending is not None:
-            entry.ane.reap_proc()
-            self._copy(entry.surface("ffn_out"), nxt, nchan=self._hidden,
-                       n=pending[1], s0=pending[0],
-                       src_stride=self._bucket, dst_stride=self._width)
-            self._wait(LANE_SMALL)              # ffn_out 已落进 nxt，下一层可以读
+        state, tail = self.states[index], self.tails[index]
+        if self._linear_first[index]:
+            # 每层的递归状态都从零开始（prefill、无 cache）：`k_gdn` 自己不清零，
+            # 旧引擎也是在每层前把 w_state 填零（docs/ANE/anebench/e8_a1m.py:969-971）。
+            state.array(np.float32,
+                        (self._geometry.l_v_heads, self._geometry.l_k_dim,
+                         self._geometry.l_v_dim))[:] = 0
+        kernels.norm_to(
+            self._runtime, cur, entry.weights["input_norm"], entry.surface("proj_in"),
+            stile=n, src_stride=self._width, eps=EPS, s0=start,
+            dst_stride=self._bucket, dst_s0=0,
+        )
+        self._wait(LANE_SMALL)
+        entry.ane.issue_proc("proj")
+        # 残差搬运只读 `cur`、只写 `out_in` 的后半区，与在飞的投影（读写 `proj_in` /
+        # `proj_out`）不冲突，所以排在回收之前 —— 一次 eval 在飞时 CPU 继续编码。
+        self._copy(cur, entry.surface("out_in"), nchan=self._hidden,
+                   dst_c0=self._hidden, n=n, s0=0, src_s0=start,
+                   src_stride=self._width, dst_stride=self._bucket)
+        entry.ane.reap_proc()
+        kernels.gdn(
+            self._runtime, entry.surface("proj_out"), state, tail,
+            entry.weights["conv"], entry.weights["a_log"], entry.weights["dt_bias"],
+            entry.weights["norm"], entry.surface("out_in"), self.gscratch,
+            # GDN 核里的 `Stile` 既是列界也是**通道步长**（`proj[c*Stile + j]`），所以必须
+            # 传桶宽而不是本段的有效列数；`T` 是它不看的多余字段。
+            stile=self._bucket, eps=EPS, first=self._linear_first[index], T=self._bucket,
+            out_stride=self._bucket, fast=True, geometry=self._geometry,
+        )
+        self._linear_first[index] = False
+        self._wait(LANE_SMALL)   # ANE 的 out 要读 GDN 写出的 out_in 前半区
+        entry.ane.issue_proc("out")
+        entry.ane.reap_proc()    # norm_residual 要读 out_out
+        kernels.norm_residual(
+            self._runtime, entry.surface("out_out"), entry.weights["post_norm"],
+            entry.surface("ffn_in"),
+            stile=n, src_stride=self._bucket, eps=EPS,
+            dst_stride=self._bucket, dst_s0=0,
+        )
+        self._wait(LANE_SMALL)
+        entry.ane.issue_proc("ffn")
+        entry.ane.reap_proc()
+        self._copy(entry.surface("ffn_out"), self.x, nchan=self._hidden,
+                   n=n, s0=start, src_stride=self._bucket, dst_stride=self._width)
+        self._wait(LANE_SMALL)   # 这一列的 x 落定，下游可以接着读
 
     # ------------------------------------------------------------------ 收尾
 
@@ -408,8 +445,11 @@ class MudePipeline:
         for entry in self.buffers:
             entry.free()
         self.buffers.clear()
-        for name in ("seed", "x", "attn", "qg", "kv", "state", "tail",
-                     "gscratch", "attn_scratch", "_cos", "_sin"):
+        for name in ("seed", "x", "attn", "gscratch", "attn_scratch", "_cos", "_sin"):
             buffer = getattr(self, name, None)
             if buffer is not None:
+                buffer.free()
+        for name in ("qg_sets", "kv_sets", "states", "tails"):
+            group = getattr(self, name, None) or ()
+            for buffer in group:
                 buffer.free()

@@ -60,6 +60,7 @@ _REQUIRED = (
     "e8m_dispatch_l",
     "e8m_commit_l",
     "e8m_wait_l",
+    "e8m_wait_upto",
     "e8m_sync_l",
     "e8m_gpu_ms",
     "e8m_gpu_busy_l",
@@ -256,6 +257,8 @@ class MetalRuntime:
         lib.e8m_commit_l.restype = ctypes.c_int
         lib.e8m_wait_l.argtypes = [ctypes.c_int]
         lib.e8m_wait_l.restype = ctypes.c_double
+        lib.e8m_wait_upto.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.e8m_wait_upto.restype = ctypes.c_double
         lib.e8m_sync_l.argtypes = [ctypes.c_int]
         lib.e8m_sync_l.restype = ctypes.c_double
         lib.e8m_gpu_ms.restype = ctypes.c_double
@@ -343,6 +346,15 @@ class MetalRuntime:
 
     def wait(self, lane: int = 0) -> float:
         return float(self.lib.e8m_wait_l(int(lane)))
+
+    def wait_upto(self, lane: int, count: int) -> float:
+        """等到该 lane 队首的前 `count` 个命令缓冲完成（`count < 0` 等于全等）。
+
+        波前要"只等到第 j 个注意力瓦片"，不能整条 lane 一起等 —— 整条等就把后面还排着的
+        几个瓦片一起结算了，交错又退化成串行。语义与 `e8m_wait_upto(lane, k)` 一致：
+        完成的缓冲出队，返回等待期间的 GPU 毫秒数。
+        """
+        return float(self.lib.e8m_wait_upto(int(lane), int(count)))
 
     def sync(self, lane: int = 0) -> float:
         return float(self.lib.e8m_sync_l(int(lane)))
