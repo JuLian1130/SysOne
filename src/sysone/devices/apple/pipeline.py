@@ -24,6 +24,7 @@ from . import kernels
 from .compile import AneLayer, SurfaceSet
 from .geometry import Geometry, mude_geometry
 from .metal import LANE_LONG, LANE_SMALL, MetalBuffer, MetalRuntime
+from .residency import Residency
 from .schedule import NCH, Chain, Step, attention_steps, blocks, gdn_steps
 
 EPS = 1e-6
@@ -93,6 +94,7 @@ class MudePipeline:
         bucket: int,
         width: int,
         pool: Sequence[SurfaceSet],
+        residency: Residency | None = None,
     ) -> None:
         self._runtime = runtime
         self._geometry = mude_geometry() if geometry is None else geometry
@@ -111,6 +113,8 @@ class MudePipeline:
         # 六张面在池里只 wrap 一次（见 `LayerBuffers`）。包出来的句柄归流水线。
         self._wrapped: list[dict[str, MetalBuffer]] = []
         self.buffers: list[LayerBuffers] = []
+        # 常驻窗口：`None` 表示 20 层全装（今天的行为）。块边界由 `run` 驱动它换窗。
+        self._residency = residency
         try:
             self._wrapped = [
                 {key: runtime.wrap(surface) for key, surface in st.surfaces.items()}
@@ -241,9 +245,17 @@ class MudePipeline:
         # 每层最后编码的那个 `core` 瓦片（两条奇偶链共用递归状态与卷积尾巴，只能按序）。
         self._core_enc: dict[int, int] = {}
         roles = [entry.role for entry in self.buffers]
-        for block_of_layers in blocks(roles):
+        for index, block_of_layers in enumerate(blocks(roles)):
+            if self._residency is not None:
+                self._residency.begin(index)
             self._run_block(block_of_layers)
             self._wait_all()        # 块之间排空：表面池与 qg/kv 画布是跨层复用的
+            if self._residency is not None:
+                # 排空之后才卸：卸掉的层在这一块里刚刚用完，下一次需要它到下一轮的块
+                # （`blocks()` 的块按层号单调，窗口只往后滚）。
+                self._residency.end(index)
+        if self._residency is not None:
+            self._residency.finish()   # 一轮结束落在待命窗口上（服务契约"回到前 W 层"）
         self._last = self.x
 
     # ---- 命令缓冲账 ---------------------------------------------------------
@@ -574,6 +586,9 @@ class MudePipeline:
         return np.asarray(view[:, length - 1], np.float32)
 
     def close(self) -> None:
+        residency, self._residency = getattr(self, "_residency", None), None
+        if residency is not None:
+            residency.finish()          # 先收尾装卸线程：它们可能正在重绑下面的面
         for entry in self.buffers:
             entry.free()
         self.buffers.clear()

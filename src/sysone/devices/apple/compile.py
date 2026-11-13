@@ -466,6 +466,12 @@ class AneLayer:
         self.cout = int(cout)
         self.ffn = int(ffn)
         self.s = int(s)
+        # 产物留着：常驻窗口换窗时按它重装（`reload` 不能走 `__init__`，见那里的注释）。
+        self._files = files
+        # 本层还有几次已发射、未回收的 eval。`AneRuntime.pending` 是**进程级**的单槽，
+        # 分不出"在飞的是哪一层"，而窗口卸载的判据必须是"这一层自己的请求都回来了"
+        # （换窗时下一块常常已经在飞，全局标志一定为真）。
+        self._inflight = 0
         self._owned: SurfaceSet | None = None
         self._sets: list[SurfaceSet] = []
         self._surfaces: dict[str, Surface] = {}
@@ -533,10 +539,13 @@ class AneLayer:
         这是旧引擎 `ISSUE_EVAL` 的做法。违反"只有一个 eval 在飞"会抛 `NotReadyError`。
         """
         self._runtime.issue(self.name, PROCS[proc], slot=slot)
+        self._inflight += 1
 
     def reap_proc(self) -> float:
         """回收上一次 `issue_proc()` 的 eval，返回毫秒数。"""
         ms = self._runtime.reap()
+        if self._inflight:
+            self._inflight -= 1
         if ms < 0:
             raise NotReadyError("ANE 执行失败", program=self.name, reason=self._runtime.error())
         return ms
@@ -557,6 +566,35 @@ class AneLayer:
         self._write("ffn_in", 2 * self.hidden,
                     np.concatenate([xn, residual], axis=0))
         return self._eval("ffn", self.hidden)
+
+    def unload(self) -> None:
+        """卸掉 device 侧常驻（权重），保留产物与对象 —— 常驻窗口换窗的"卸"那一半。
+
+        "这个块已经排空"由调用方判（`Residency` 在流水线 `_wait_all` 之后才调）。这里只守住
+        最后一道：**这一层自己还有 eval 没回收就不许卸**。在飞的请求打到已卸载的 program 上是
+        这套窗口唯一会坏正确性（而不是只坏速度）的地方（旧引擎 `e8_window.py:14-16`）。
+
+        判据是**本层**的在飞计数，不是 `AneRuntime.pending`：换窗时下一块已经在飞，那个全局
+        单槽几乎总是真（实测第一版就是在这里炸的：卸载第 10 层时第 11 层正在跑）。
+        """
+        if self._inflight:
+            raise NotReadyError("这一层还有 eval 没回收就卸载 program",
+                                program=self.name, inflight=self._inflight)
+        self._runtime.unload(self.name)
+
+    def reload(self) -> None:
+        """按产物重新装载，并把表面按槽位重绑 —— 常驻窗口换窗的"装"那一半。
+
+        不能复用 `__init__`：它还会重建 `SurfaceSet`（`pool` 给定时是借的，重建会让池的
+        面被第二份程序引用）。`e8_unload` 会 CFRelease 掉每次 `attach` 给面加的引用、
+        也扔掉那条 program 上的绑定，所以这里必须按 `_sets` 重绑一遍。
+        """
+        self._files.load(self._runtime, self.name)
+        for slot, surface_set in enumerate(self._sets):
+            for proc, pair in SET_KEYS.items():
+                self._runtime.attach_slot(self.name, PROCS[proc], slot,
+                                          surface_set.surfaces[pair[0]],
+                                          surface_set.surfaces[pair[1]])
 
     def close(self) -> None:
         self._runtime.unload(self.name)

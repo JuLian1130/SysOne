@@ -188,11 +188,15 @@ def mude_runner(
     metal: bool = True,
     quantize: bool = True,
     scratch_dir: str | Path | None = None,
+    resident: int | None = None,
 ) -> SplitRunner:
     """装一条 mude split 链：分词器 + 回答码 + ANE/Metal 链。
 
     `bucket` 是 ANE program 的静态列宽（默认 `S_NATIVE`），`width` 是 GPU 侧缓冲的列数
     （默认等于 bucket，prompt 更长时必须给更大的值）。两者都决定内存，所以由调用方说。
+
+    `resident` 是待命常驻的层数，`None` 表示全装；窗口的具体病理见
+    `devices/apple/residency.py`（它是这张卡上最大的一笔内存，所以由调用方决定让不让）。
     """
     from ...devices.apple.chain import MudeChain
     from ...devices.apple.compile import S_NATIVE
@@ -211,6 +215,7 @@ def mude_runner(
             quantize=quantize,
             metal=metal,
             scratch_dir=scratch_dir,
+            resident=resident,
         )
 
     return SplitRunner(load_chain, prompter, max_len=buffer_width)

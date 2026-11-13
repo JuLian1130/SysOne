@@ -47,6 +47,10 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
     common.add_argument("--bucket", type=int, default=0, help="split：ANE program 的列宽（默认 1024）")
     common.add_argument("--width", type=int, default=0, help=f"split：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
+    common.add_argument(
+        "--W", type=int, default=0, dest="resident",
+        help="split：待命常驻的层数（0 = 全部；最小 = 一个块的长度，也就是 4）",
+    )
     return common
 
 
@@ -178,7 +182,8 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
         # 编码器只是 Engine 的必填位：split 不排 MaskPlan，真正渲染在 `mude_runner` 的题面里。
         return Engine(
             descriptor=descriptor,
-            runner=mude_runner(args.weights, bucket=args.bucket or None, width=width),
+            runner=mude_runner(args.weights, bucket=args.bucket or None, width=width,
+                               resident=args.resident or None),
             encoder=CharEncoder(vocab=descriptor.vocab),
             config=config,
         )

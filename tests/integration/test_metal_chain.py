@@ -101,13 +101,57 @@ def test_chunked_bucket_matches_the_single_bucket_run(chains, chunked) -> None:
     assert rel < 1e-6, f"四段与单段结果不一致：{rel:.4e}"
 
 
+@pytest.fixture(scope="module")
+def windowed():
+    """待命窗口 W=4 的链：只在块边界换常驻，其余与 `gpu` 完全一样。"""
+    MudeChain = _chains()
+    chain = MudeChain.load(MUDE, s=S, metal=True, resident=4)
+    try:
+        yield chain
+    finally:
+        chain.close()
+
+
+@pytest.mark.parametrize("prefix", PREFIXES)
+def test_resident_window_keeps_the_answer(chains, windowed, prefix) -> None:
+    """窗口只换常驻、不换数值：答案与 numpy 链在同一容差内。"""
+    cpu, _ = chains
+    lwin = windowed.logits(TOKENS, prefix=prefix)
+    lcpu = cpu.logits(TOKENS, prefix=prefix)
+    rel = float(np.linalg.norm(lwin - lcpu) / np.linalg.norm(lcpu))
+    assert rel < TOL, f"prefix={prefix} 时窗口链的 logits 偏差 {rel:.4e} 超过 {TOL}"
+
+
+def test_resident_window_returns_to_standby(windowed) -> None:
+    """一轮跑完必须落在待命窗口上：4 层常驻、峰值 2W、换窗不泄漏。
+
+    这条就是服务契约"回到前 W 层预装载"的实测版。`programs` 是 dylib 的**进程级**计数
+    （同一个进程里还有别的链），所以这里只钉"一轮换窗前后不变"，绝对层数由 `resident` 钉。
+    """
+    before = windowed._runtime.programs
+    windowed.logits(TOKENS, prefix=0)
+    stats = windowed._pipeline._residency.stats()
+    assert stats["resident"] == 4
+    assert stats["standby"] == [0, 1, 2, 3]
+    assert stats["peak_resident"] == 8       # 块 0 的窗口 + 块 1 的预取 = 2W
+    assert stats["loads"] >= 20              # 一轮要重装窗口外的层（每轮一次全量）
+    assert windowed._runtime.programs == before
+    assert windowed._runtime.pending is False
+
+
 def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> None:
     """S3：最后一层里整段落在公共前缀中的瓦片只做第一相，结果必须逐位不变。
 
     桶宽 S/4、满宽 prompt 正好给 4 个瓦片，`prefix = S/4` 让第 0 个瓦片整段落在前缀里。
-    A/B 用 `_skip_dead`：关掉它只是不省那些瓦片，答案不该有任何差别 —— 被跳过的活没有读者
-    （读出在最后一个瓦片里，K/V 出自投影那一步）。另外数一下 `wait_upto` 的次数，确认注意力
-    瓦片真的少收一个；不数的话"答案一致"也可能是因为根本没跳过。
+    这里量两件事：**出货形态（双链 + S3 开）的答案 == 单链全量计算的答案**（逐位），以及
+    **S3 真的少发了一片注意力**（数 `wait_upto` 的 lane 0 次数，不数的话"答案一致"也可能是因为
+    根本没跳过）。
+
+    A/B 的那一臂（`_skip_dead = False`）**只能在单链下当参照**：双链 + S3 关 的输出与单链不一致
+    （max|Δ| ≈ 1.0，`max` 相对 14 %），而双链 + S3 开 与单链逐位相同 —— 也就是说出货路径是对的，
+    坏的是那个调试开关在双链下的那一臂。证据与机制见
+    `.scratch/m22-chain/issues/01-two-chain-dead-skip.md`，探针 `.scratch/m22_s3_nch.py`。
+    所以计数那一段也放在单链里跑：那里两臂都可信。
     """
     from sysone.devices.apple.metal import LANE_LONG
 
@@ -116,30 +160,37 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
     pipeline = chunked._pipeline
     assert pipeline is not None
     runtime = pipeline._runtime
-    counted = {"n": 0}
+    original_nch = pipeline._nch
     original = runtime.wait_upto
 
-    def counted_wait(lane: int, count: int) -> float:
-        if lane == LANE_LONG:
-            counted["n"] += 1
-        return original(lane, count)
+    def run(nch: int, skip: bool, counted: dict | None = None) -> np.ndarray:
+        pipeline._nch = nch
+        pipeline._skip_dead = skip
+        if counted is not None:
+            def counted_wait(lane: int, count: int) -> float:
+                if lane == LANE_LONG:
+                    counted["n"] += 1
+                return original(lane, count)
 
-    runtime.wait_upto = counted_wait     # type: ignore[method-assign]
-    try:
-        counted["n"] = 0
-        with_dead = chunked.logits(tokens, prefix=prefix)
-        pumped_with_dead = counted["n"]
-        pipeline._skip_dead = False
+            runtime.wait_upto = counted_wait     # type: ignore[method-assign]
         try:
-            counted["n"] = 0
-            without_dead = chunked.logits(tokens, prefix=prefix)
-            pumped_without_dead = counted["n"]
+            return chunked.logits(tokens, prefix=prefix)
         finally:
-            pipeline._skip_dead = True
-    finally:
-        runtime.wait_upto = original   # type: ignore[method-assign]
+            runtime.wait_upto = original          # type: ignore[method-assign]
 
-    assert pumped_with_dead == pumped_without_dead - 1, (
-        f"死瓦片没有少收注意力瓦片：S3 开 {pumped_with_dead} 次、关 {pumped_without_dead} 次"
-    )
-    assert np.array_equal(with_dead, without_dead), "S3 改变了答案（跳过的瓦片不该有读者）"
+    try:
+        shipping = run(original_nch, True)
+        full_single = run(1, False)
+        assert np.array_equal(shipping, full_single), (
+            "出货形态（双链 + S3 开）与单链全量计算不一致"
+        )
+        dead_count, live_count = {"n": 0}, {"n": 0}
+        with_dead = run(1, True, dead_count)
+        without_dead = run(1, False, live_count)
+        assert dead_count["n"] == live_count["n"] - 1, (
+            f"死瓦片没有少收注意力瓦片：S3 开 {dead_count['n']} 次、关 {live_count['n']} 次"
+        )
+        assert np.array_equal(with_dead, without_dead), "S3 改变了答案（跳过的瓦片不该有读者）"
+    finally:
+        pipeline._nch = original_nch
+        pipeline._skip_dead = True

@@ -16,6 +16,7 @@ from typing import Sequence
 import numpy as np
 
 from ...domain.attention import AttentionRole
+from ...errors import ConfigError
 from ...models.families.mude import CODE_ROWS, ane_layer_weights, normalize_norm
 from ...weights.packing.ane_blob import build as build_blob
 from ...weights.store import SafeTensorFile
@@ -31,6 +32,8 @@ from .compile import (
 from .geometry import Geometry
 from .metal import MetalRuntime
 from .pipeline import MudePipeline, pool_slots
+from .residency import Residency, targets_for
+from .schedule import blocks
 
 _CHAIN_IDS = count()
 from .ops import (
@@ -149,6 +152,7 @@ class MudeChain:
         scratch_dir: str | Path | None = None,
         runtime: AneRuntime | None = None,
         metal: bool = False,
+        resident: int | None = None,
     ) -> "MudeChain":
         """编译 20 层程序并从 `model_dir` 读权重。
 
@@ -160,6 +164,10 @@ class MudeChain:
         `s` 是 ANE program 的列数（桶宽，受 program 的 S 上限约束）；`width` 是 GPU 侧缓冲
         的列数，默认等于 `s`（一桶跑完），16k 这类长序列要 `width = 16384, s = 4096`
         （四段 ANE、注意力一次看 16k 键）。
+
+        `resident` 是待命常驻的层数，`None` 表示 20 层全装（今天的行为）。给值时不能小于
+        最大块长 —— `blocks()` 里一个块内的层是同时在飞的，整块必须常驻；窗口在块边界换窗、
+        重装在线程上预取，省掉窗口之外的 ANE 权重，代价是每层约 66 ms（见 `residency.py`）。
         """
         if device != "ane":
             raise ValueError(f"mude 链只有 ANE 设备，收到 {device!r}")
@@ -208,6 +216,13 @@ class MudeChain:
         ]
         if len(roles) != int(text["num_hidden_layers"]):
             raise ValueError("layer_types 数量与 num_hidden_layers 不一致")
+        # 窗口在装载之前算：比块还短时在这里就报错，不必先装完 20 层再失败。
+        targets: tuple[tuple[int, ...], ...] = ()
+        if resident is not None:
+            if not metal:
+                raise ConfigError("常驻窗口只在 Metal 流水线上有意义", resident=int(resident))
+            if int(resident) < len(roles):
+                targets = targets_for(blocks(roles), len(roles), int(resident))
         width = int(s if width is None else width)
         if width < s:
             raise ValueError(f"缓冲宽度 {width} 小于桶宽 {s}：桶不能跨在缓冲之外")
@@ -257,10 +272,14 @@ class MudeChain:
             temperature = float(decision.get("temperature", 1.0))
             cos, sin = _rope_table(theta, width, rotary_dim)
             if metal:
+                # 窗口在装完之后立刻落回待命集：20 层先装再卸是"两条路只能走一条"的代价，
+                # 省掉的是这一轮之外的时间里那 1.47 GB 的 ANE 权重（`residency.py`）。
+                residency = Residency(layers, targets) if targets else None
                 metal_runtime = MetalRuntime(geometry=geometry)
                 pipeline = MudePipeline(
                     runtime=metal_runtime, layers=layers, roles=roles, params=params,
                     cos=cos, sin=sin, geometry=geometry, bucket=s, width=width, pool=pool,
+                    residency=residency,
                 )
         except BaseException:
             if pipeline is not None:
