@@ -15,9 +15,11 @@ import pytest
 
 from sysone.devices.apple import available
 from sysone.devices.apple.compile import (
+    AneLayer,
     AneProgram,
     ffn_mil,
     ffn_parts,
+    layer_mil,
     out_mil,
     projection_mil,
     write_program,
@@ -173,6 +175,79 @@ def test_ffn_matches_numpy(tmp_path: Path) -> None:
 
 def test_ffn_parts_is_three_for_mude_geometry() -> None:
     assert ffn_parts(2048, 6144) == 3
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
+def test_fused_layer_program_runs_three_procedures(tmp_path: Path) -> None:
+    """整层一个 program、三个 procedure，一次 `load` 拿到三段计算。
+
+    第 0 层是线性注意力层，投影的输出通道是 `8224 = qkv 6144 + z 2048 + a 16 + b 16`
+    （全注意力层是 `5120 = q 2048 + k 512 + v 512 + gate 2048`）。这里按真实权重拼出
+    那一整块，顺便验证"投影矩阵是行拼接"这件事在真数据上成立。
+    """
+    names = [
+        PROJ,
+        f"{LAYER0}.linear_attn.in_proj_z.weight",
+        f"{LAYER0}.linear_attn.in_proj_a.weight",
+        f"{LAYER0}.linear_attn.in_proj_b.weight",
+        OUT, GATE, UP, DOWN,
+    ]
+    w = _load(names)
+    proj = np.concatenate([
+        w[PROJ],
+        w[f"{LAYER0}.linear_attn.in_proj_z.weight"],
+        w[f"{LAYER0}.linear_attn.in_proj_a.weight"],
+        w[f"{LAYER0}.linear_attn.in_proj_b.weight"],
+    ], axis=0)
+    assert proj.shape[0] == 8224
+    hidden, cout = proj.shape[1], proj.shape[0]
+    ffn = w[DOWN].shape[1]
+    chunks = [w[DOWN][:, i * hidden:(i + 1) * hidden] for i in range(ffn_parts(hidden, ffn))]
+
+    items = {"proj": proj, "o": w[OUT], "gate": w[GATE], "up": w[UP]}
+    items.update({f"down{i}": c for i, c in enumerate(chunks)})
+    blob, entries = ane_blob.build(items, quantize=True)
+    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=S, entries=entries)
+    assert mil.count("func ") == 3
+    assert "func main<ios18>" in mil and "func p1<ios18>" in mil and "func p2<ios18>" in mil
+
+    files = write_program(tmp_path / "layer0", mil=mil, blob=blob, s=S)
+    rng = np.random.default_rng(17)
+    x = rng.standard_normal((hidden, S)).astype(np.float16)
+    v = rng.standard_normal((hidden, S)).astype(np.float16)
+    r = rng.standard_normal((hidden, S)).astype(np.float16)
+
+    runtime = AneRuntime()
+    layer = AneLayer(runtime, files, name="m22_layer0", hidden=hidden, cout=cout, ffn=ffn, s=S)
+    try:
+        y_proj, ms0 = layer.project(x)
+        y_out, ms1 = layer.output(v, r)
+        y_ffn, ms2 = layer.feed_forward(x, r)
+    finally:
+        layer.close()
+        runtime.close()
+
+    q_proj = ane_blob.quant_per_channel(proj).dequant.astype(np.float32)
+    ref_proj = q_proj @ x.astype(np.float32)
+    assert _rel_l2(y_proj, ref_proj) < PROJ_BUDGET
+
+    q_out = ane_blob.quant_per_channel(w[OUT]).dequant.astype(np.float32)
+    ref_out = (q_out @ v.astype(np.float32) + r.astype(np.float32)).astype(np.float16)
+    assert _rel_l2(y_out, ref_out) < OUT_BUDGET
+
+    q_gate = ane_blob.quant_per_channel(w[GATE]).dequant.astype(np.float32)
+    q_up = ane_blob.quant_per_channel(w[UP]).dequant.astype(np.float32)
+    q_down = [ane_blob.quant_per_channel(c).dequant.astype(np.float32) for c in chunks]
+    h = (_silu(q_gate @ x.astype(np.float32)) * (q_up @ x.astype(np.float32))).astype(np.float16)
+    acc = np.zeros((hidden, S), dtype=np.float32)
+    for i, chunk in enumerate(q_down):
+        acc += chunk @ h[i * hidden:(i + 1) * hidden].astype(np.float32)
+    ref_ffn = (acc + r.astype(np.float32)).astype(np.float16)
+    assert _rel_l2(y_ffn, ref_ffn) < FFN_BUDGET
+
+    # 三个 procedure 的耗时是分开计的，加总就是整层 ANE 时间
+    assert ms0 > 0 and ms1 > 0 and ms2 > 0
+    assert y_proj.shape == (cout, S) and y_out.shape == (hidden, S) and y_ffn.shape == (hidden, S)
 
 
 def test_ffn_parts_rejects_4b_geometry() -> None:

@@ -4,9 +4,10 @@ MIL 文本与旧引擎 `e8_ane.layer_mil` 的三个 func 同形（`docs/ANE/aneb
 区别只在于把 hidden / ffn / S 参数化 —— 旧引擎把 `HID=2048`、`FFN=6144` 写死在文本里。
 形状参数化是 4B 复用的前提，也让对拍能用真实的 (2048 → 6144) 权重。
 
-这里只生成**单 func** 的 program（每个 proc 一个 program），因为 M2.1 的验收是逐 proc 的
-数值对拍；把三段合进一个 program（一次 `load`、三个 procedure）留给 M2.2 的 pipeline，
-那里的收益是省掉两次装载，不是正确性。
+两种装载形态：
+- `AneProgram`：一个 program 一个 func，M2.1 的逐段对拍用它（每段独立装载/执行，便于隔离误差）。
+- `AneLayer`：一个 program 三个 procedure（`main` / `p1` / `p2`，与旧引擎同序），M2.2 的
+  pipeline 用它 —— 一次 `load` 拿到整层，省掉两次装载与两次 program 切换。
 
 编译缓存分两层，别混：
 - **aned 的 lowering 缓存**：`e8_compiled_exists` 能查到，`e8_load_warm` 命中即跳过编译。
@@ -37,14 +38,15 @@ BUILD_INFO = (
 )
 
 # ANE 的 program 形状是静态的，所以 S 分桶：1024 是单桶原生尺寸（4096 由 4 个 1024 拼，
-# 见 `docs/ANE/prefill-engine-design.md`）。M2.1 只用 1024。
+# 见 `docs/ANE/prefill-engine-design.md`）。
 S_NATIVE = 1024
 
 SIDECAR_NAME = "sidecar.json"
 MIL_NAME = "program.mil"
 BLOB_NAME = "weights.bin"
 
-_TORCH_TO_MIL_DTYPE = "fp16"
+# 一层一个 program 时的 procedure 顺序（与旧引擎的 `PROCS` 一致）。
+PROCS = {"proj": 0, "out": 1, "ffn": 2}
 
 
 def ffn_parts(hidden: int, ffn: int) -> int:
@@ -124,45 +126,32 @@ def _slice(tag: str, *, begin: int, size: int, s: int, src: str, out: str) -> li
     ]
 
 
-def _program(*, func_input: str, body: list[str]) -> str:
-    """把一段 func 体包成完整的 MIL 文本（单 func `main`）。"""
-    out = [f"program(1.3)\n{BUILD_INFO}{{\n"]
-    out.append(f"    func main<ios18>({func_input}) {{\n")
+def _func(name: str, *, func_input: str, body: list[str], ret: str = "y") -> str:
+    out = [f"    func {name}<ios18>({func_input}) {{\n"]
     out.extend(line + "\n" for line in body)
-    out.append("    } -> (y);\n")
-    out.append("}\n")
+    out.append(f"    }} -> ({ret});\n")
     return "".join(out)
 
 
-def projection_mil(*, hidden: int, cout: int, s: int, entry: BlobEntry) -> str:
-    """投影 program（旧引擎 proc 0）：`[1, hidden, 1, s]` → `[1, cout, 1, s]`。"""
-    if hidden <= 0 or cout <= 0 or s <= 0:
-        raise NotReadyError("MIL 形状必须为正", hidden=hidden, cout=cout, s=s)
-    body = _conv("p", cin=hidden, cout=cout, s=s, entry=entry, src="x", out="y")
-    return _program(func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x", body=body)
+def _program(funcs: list[str]) -> str:
+    return f"program(1.3)\n{BUILD_INFO}{{\n" + "".join(funcs) + "}\n"
 
 
-def out_mil(*, hidden: int, s: int, entry: BlobEntry) -> str:
-    """输出投影 + 残差（旧引擎 proc 1）：输入是 `[attn_out | residual]` 两段拼接。"""
-    if hidden <= 0 or s <= 0:
-        raise NotReadyError("MIL 形状必须为正", hidden=hidden, s=s)
-    body = (
+def _proj_body(*, hidden: int, cout: int, s: int, entry: BlobEntry) -> list[str]:
+    return _conv("p", cin=hidden, cout=cout, s=s, entry=entry, src="x", out="y")
+
+
+def _out_body(*, hidden: int, s: int, entry: BlobEntry) -> list[str]:
+    return (
         _slice("sv", begin=0, size=hidden, s=s, src="x", out="v")
         + _slice("sr", begin=hidden, size=hidden, s=s, src="x", out="r")
         + _conv("o", cin=hidden, cout=hidden, s=s, entry=entry, src="v", out="ov")
         + [f'        tensor<fp16, [1, {hidden}, 1, {s}]> y = '
            f'add(x = ov, y = r)[name = string("y")];']
     )
-    return _program(func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x", body=body)
 
 
-def ffn_mil(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) -> str:
-    """融合 FFN（旧引擎 proc 2）：gate/up → silu×up → K 切分的 down → 残差。
-
-    `entries` 的键是 `gate`、`up`、`down0`..`down{parts-1}`；parts 由 `ffn_parts()` 定。
-    """
-    if hidden <= 0 or s <= 0:
-        raise NotReadyError("MIL 形状必须为正", hidden=hidden, s=s)
+def _ffn_body(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) -> list[str]:
     parts = ffn_parts(hidden, ffn)
     missing = [f"down{i}" for i in range(parts) if f"down{i}" not in entries]
     if "gate" not in entries or "up" not in entries or missing:
@@ -190,7 +179,61 @@ def ffn_mil(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) 
         acc = nxt
     body.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> y = '
                 f'add(x = {acc}, y = r)[name = string("y")];')
-    return _program(func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x", body=body)
+    return body
+
+
+def projection_mil(*, hidden: int, cout: int, s: int, entry: BlobEntry) -> str:
+    """投影 program（旧引擎 proc 0）：`[1, hidden, 1, s]` → `[1, cout, 1, s]`。"""
+    if hidden <= 0 or cout <= 0 or s <= 0:
+        raise NotReadyError("MIL 形状必须为正", hidden=hidden, cout=cout, s=s)
+    return _program([_func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x",
+                           body=_proj_body(hidden=hidden, cout=cout, s=s, entry=entry))])
+
+
+def out_mil(*, hidden: int, s: int, entry: BlobEntry) -> str:
+    """输出投影 + 残差（旧引擎 proc 1）：输入是 `[attn_out | residual]` 两段拼接。"""
+    if hidden <= 0 or s <= 0:
+        raise NotReadyError("MIL 形状必须为正", hidden=hidden, s=s)
+    return _program([_func("main", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
+                           body=_out_body(hidden=hidden, s=s, entry=entry))])
+
+
+def ffn_mil(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) -> str:
+    """融合 FFN（旧引擎 proc 2）：gate/up → silu×up → K 切分的 down → 残差。
+
+    `entries` 的键是 `gate`、`up`、`down0`..`down{parts-1}`；parts 由 `ffn_parts()` 定。
+    """
+    if hidden <= 0 or s <= 0:
+        raise NotReadyError("MIL 形状必须为正", hidden=hidden, s=s)
+    return _program([_func("main", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
+                           body=_ffn_body(hidden=hidden, ffn=ffn, s=s, entries=entries))])
+
+
+def layer_mil(
+    *,
+    hidden: int,
+    cout: int,
+    ffn: int,
+    s: int,
+    entries: Mapping[str, BlobEntry],
+) -> str:
+    """一整层的三段 MIL：`main`（投影）、`p1`（输出投影+残差）、`p2`（融合 FFN）。
+
+    `entries` 的键是 `proj`、`o`、`gate`、`up`、`down0`..`down{parts-1}`。三个 func 的
+    procedure 序号与旧引擎一致（`PROCS`），`AneLayer` 用它来 `attach` / `eval`。
+    """
+    if hidden <= 0 or cout <= 0 or s <= 0:
+        raise NotReadyError("MIL 形状必须为正", hidden=hidden, cout=cout, s=s)
+    if "proj" not in entries or "o" not in entries:
+        raise NotReadyError("整层 MIL 缺少投影或输出投影权重", keys=sorted(entries))
+    return _program([
+        _func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x",
+              body=_proj_body(hidden=hidden, cout=cout, s=s, entry=entries["proj"])),
+        _func("p1", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
+              body=_out_body(hidden=hidden, s=s, entry=entries["o"])),
+        _func("p2", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
+              body=_ffn_body(hidden=hidden, ffn=ffn, s=s, entries=entries)),
+    ])
 
 
 def _sha256(data: bytes) -> str:
@@ -310,3 +353,87 @@ class AneProgram:
         self._runtime.unload(self.name)
         self._in.free()
         self._out.free()
+
+
+class AneLayer:
+    """一层装成一个 program、三个 procedure：投影 / 输出投影+残差 / 融合 FFN。
+
+    六张 IOSurface 各管一个 stream 边界：ANE 写投影结果 → GPU 读它、写注意力输出 →
+    ANE 读 `[attn | residual]` 算 out → GPU 再读 → ANE 读 `[xn | residual]` 算 FFN。
+    与 `AneProgram` 相比省掉两次 `load` 与两次 program 切换（旧引擎也是这个形态）。
+    """
+
+    def __init__(
+        self,
+        runtime: AneRuntime,
+        files: ProgramFiles,
+        *,
+        name: str,
+        hidden: int,
+        cout: int,
+        ffn: int,
+        s: int,
+    ) -> None:
+        self._runtime = runtime
+        self.name = name
+        self.hidden = int(hidden)
+        self.cout = int(cout)
+        self.ffn = int(ffn)
+        self.s = int(s)
+        files.load(runtime, name)
+        self._surfaces: dict[str, Surface] = {}
+        try:
+            for key, items in (
+                ("proj_in", hidden), ("proj_out", cout),
+                ("out_in", 2 * hidden), ("out_out", hidden),
+                ("ffn_in", 2 * hidden), ("ffn_out", hidden),
+            ):
+                self._surfaces[key] = runtime.surface(items * self.s * 2)
+            runtime.attach(name, PROCS["proj"], self._surfaces["proj_in"],
+                           self._surfaces["proj_out"])
+            runtime.attach(name, PROCS["out"], self._surfaces["out_in"],
+                           self._surfaces["out_out"])
+            runtime.attach(name, PROCS["ffn"], self._surfaces["ffn_in"],
+                           self._surfaces["ffn_out"])
+        except NotReadyError:
+            self.close()
+            raise
+
+    def _write(self, key: str, items: int, x: np.ndarray) -> None:
+        view = self._surfaces[key].array(np.float16, (1, items, 1, self.s))
+        view[...] = np.asarray(x, dtype=np.float16).reshape(1, items, 1, self.s)
+
+    def _read(self, key: str, items: int) -> np.ndarray:
+        view = self._surfaces[key].array(np.float16, (1, items, 1, self.s))
+        return view.reshape(items, self.s).copy()
+
+    def _eval(self, proc: str, cout: int) -> tuple[np.ndarray, float]:
+        ms = self._runtime.eval(self.name, PROCS[proc])
+        if ms < 0:
+            raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc,
+                                reason=self._runtime.error())
+        out_key = f"{proc}_out"
+        return self._read(out_key, cout), ms
+
+    def project(self, x: np.ndarray) -> tuple[np.ndarray, float]:
+        """`[hidden, s]` → `[cout, s]`。"""
+        self._write("proj_in", self.hidden, x)
+        return self._eval("proj", self.cout)
+
+    def output(self, attn: np.ndarray, residual: np.ndarray) -> tuple[np.ndarray, float]:
+        """`[hidden, s]` 注意力输出 + `[hidden, s]` 残差 → `[hidden, s]`（含残差）。"""
+        self._write("out_in", 2 * self.hidden,
+                    np.concatenate([attn, residual], axis=0))
+        return self._eval("out", self.hidden)
+
+    def feed_forward(self, xn: np.ndarray, residual: np.ndarray) -> tuple[np.ndarray, float]:
+        """`[hidden, s]` 归一化输入 + `[hidden, s]` 残差 → `[hidden, s]`（含残差）。"""
+        self._write("ffn_in", 2 * self.hidden,
+                    np.concatenate([xn, residual], axis=0))
+        return self._eval("ffn", self.hidden)
+
+    def close(self) -> None:
+        self._runtime.unload(self.name)
+        for surface in self._surfaces.values():
+            surface.free()
+        self._surfaces.clear()
