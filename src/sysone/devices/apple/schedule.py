@@ -30,7 +30,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ...domain.attention import AttentionRole
 from .metal import LANE_LONG, LANE_SMALL
@@ -62,16 +62,22 @@ class Step:
 class Chain:
     """一层的一条瓦片链：一串有序 step，加一个游标。
 
-    `sets` 是按瓦片号循环的表面集（`set_of(s) = sets[s % len(sets)]`）。旧引擎给 GDN 链一套、
-    给注意力链两套（按瓦片奇偶交替，`e8_a3.py:431-434`）—— 同一个表面集上的两个瓦片
-    （`s` 与 `s + NCH`）永远不会同时在飞。
+    `cbs` 是这条链已经编码过的命令缓冲：`(work, tile) -> (lane, 序号)`。驱动用它来等
+    "这一格的输入是哪个 CB 写的"：序号是这条 lane 上的第几个缓冲，靠 dylib 的 `wait_upto`
+    回收，所以等待的粒度是一个 CB 而不是整条 lane。
+
+    `par` 是瓦片奇偶（`NCH = 1` 时恒为 0），`sets` 是这条链可用的表面集，按瓦片号循环
+    （`set_of(s) = sets[s % len(sets)]`）。旧引擎给每条链一套（`e8_a3.py:431-434`），
+    一条链上的两个瓦片（`s` 与 `s + NCH`）永远不会同时在飞。
     """
 
     layer: int
     steps: tuple[Step, ...]
     sets: tuple[int, ...]
     slot: int = 0
+    par: int = 0
     ptr: int = 0
+    cbs: dict[tuple[str, int], tuple[int, int]] = field(default_factory=dict)
 
     def cur(self) -> Step | None:
         return None if self.done else self.steps[self.ptr]
@@ -86,6 +92,10 @@ class Chain:
     def set_of(self, tile: int) -> int:
         return self.sets[tile % len(self.sets)]
 
+    def encoded(self, work: str) -> int:
+        """这条链已经编码了几个 `work` 类 step（`prep` 是序列级的，`tile = -1`）。"""
+        return sum(1 for (name, _tile) in self.cbs if name == work)
+
 
 def _gpu(work: str, tile: int, lane: int) -> Step:
     return Step("gpu", work, tile, lane)
@@ -95,13 +105,14 @@ def _ane(work: str, tile: int) -> Step:
     return Step("ane", work, tile)
 
 
-def gdn_steps(n: int, par: int = 0) -> tuple[Step, ...]:
+def gdn_steps(n: int, par: int = 0, *, nch: int = NCH) -> tuple[Step, ...]:
     """一个 GDN 层的瓦片链：`norm → proj → core → out → norm2 → ffn → tail`。
 
-    `n` 是瓦片数（不是 token 数），链只拿 `tile % NCH == par` 的那些。
+    `n` 是瓦片数（不是 token 数），链只拿 `tile % nch == par` 的那些；`nch=1` 就是一条链跑全部
+    瓦片（第 2 步的单链驱动用它，第 3 步再切回两条）。
     """
     out: list[Step] = []
-    for s in range(par, n, NCH):
+    for s in range(par, n, nch):
         out += [
             _gpu("norm", s, LANE_SMALL),
             _ane("proj", s),
@@ -114,7 +125,9 @@ def gdn_steps(n: int, par: int = 0) -> tuple[Step, ...]:
     return tuple(out)
 
 
-def attention_steps(n: int, par: int = 0, *, dead: int = 0) -> tuple[Step, ...]:
+def attention_steps(
+    n: int, par: int = 0, *, dead: int = 0, nch: int = NCH
+) -> tuple[Step, ...]:
     """一个全注意力层的瓦片链，分两相。
 
     **第一相**（每个瓦片）：`norm → proj1 → gather`。`gather` 把 `proj_out` 的两段搬进全宽的
@@ -131,7 +144,7 @@ def attention_steps(n: int, par: int = 0, *, dead: int = 0) -> tuple[Step, ...]:
     不依赖注意力输出）。所以这些瓦片保留第一相、丢掉第二相。`tail` 随之没写，那些列的 `h`
     也没人读 —— 这就是它安全的原因。
     """
-    tiles = [s for s in range(n) if s % NCH == par]
+    tiles = [s for s in range(n) if s % nch == par]
     out: list[Step] = []
     for s in tiles:
         out += [

@@ -79,6 +79,23 @@ def test_the_two_chains_of_a_layer_partition_the_tiles():
     assert first | second == set(range(7))
 
 
+def test_one_chain_covers_every_tile_in_order():
+    """`nch=1`（第 2 步的单链驱动）下一条链走全部瓦片，且每个相里都是瓦片序。
+
+    卷积尾巴与递归状态是按瓦片序接力的，所以"一条链"不只是少一条，它还把顺序交回给一条链。
+    全注意力层的两相各自从瓦片 0 从头走一遍（第一相按瓦片攒 K/V，第二相按瓦片算 body）。
+    """
+    steps = gdn_steps(5, nch=1)
+    assert [step.tile for step in steps] == [tile for tile in range(5) for _ in range(7)]
+
+    steps = attention_steps(5, nch=1)
+    prep = next(i for i, step in enumerate(steps) if step.work == "prep")
+    assert [step.tile for step in steps[:prep]] == [tile for tile in range(5) for _ in range(3)]
+    assert [step.tile for step in steps[prep + 1:]] == [
+        tile for tile in range(5) for _ in range(5)
+    ]
+
+
 def test_attention_sequence_is_gathers_then_prep_then_attention():
     steps = attention_steps(4, par=0)
     gathers = [i for i, step in enumerate(steps) if step.work == "gather"]

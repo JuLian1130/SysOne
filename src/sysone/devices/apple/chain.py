@@ -22,7 +22,7 @@ from ...weights.store import SafeTensorFile
 from .compile import S_NATIVE, AneLayer, SurfaceSet, layer_mil, write_program
 from .geometry import Geometry
 from .metal import MetalRuntime
-from .pipeline import MudePipeline
+from .pipeline import MudePipeline, pool_slots
 
 _CHAIN_IDS = count()
 from .ops import (
@@ -222,7 +222,8 @@ class MudeChain:
         pool: list[SurfaceSet] | None = None
         if metal:
             pool = [SurfaceSet(runtime, hidden=hidden,
-                               cout=max(geometry.cout_full, geometry.cout_gdn), s=s)]
+                               cout=max(geometry.cout_full, geometry.cout_gdn), s=s)
+                    for _ in range(pool_slots(roles))]
         try:
             params = [_layer_params(store, index, role) for index, role in enumerate(roles)]
             for index, role in enumerate(roles):

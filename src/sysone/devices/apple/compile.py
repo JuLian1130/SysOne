@@ -469,6 +469,11 @@ class AneLayer:
                                 reason=self._runtime.error())
         return ms
 
+    @property
+    def pending(self) -> bool:
+        """是否还有一次已发射、未回收的 eval 在飞。"""
+        return self._runtime.pending
+
     def issue_proc(self, proc: str, *, slot: int = 0) -> None:
         """异步发射一个 procedure（不等待），随后用 `reap_proc()` 回收。
 
