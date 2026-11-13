@@ -1,4 +1,4 @@
-"""命令行入口：`sysone inspect` / `sysone run`。"""
+"""命令行入口：`sysone inspect` / `sysone run` / `sysone doctor`。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 
 from .config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig
-from .devices.reference import CharEncoder, ReferenceRunner
+from .devices.apple import ApplePlatform
+from .devices.reference import CharEncoder, ReferencePlatform, ReferenceRunner
 from .domain.attention import MaskMode
 from .domain.decision import DecisionRequest, Question
 from .engine.engine import Engine
@@ -36,6 +37,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--input", type=Path, required=True, help="请求 JSON")
     run.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
     run.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
+
+    doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
+    doctor.add_argument("--platform", default="auto", choices=("auto", "reference", "apple"))
     return parser
 
 
@@ -106,9 +110,38 @@ def _print(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+def _platform_report(target: str) -> dict[str, object]:
+    """报告一个平台的能力与预算；不可用写成数据，不抛异常（doctor 的职责是诊断）。"""
+    if target == "reference":
+        caps = ReferencePlatform().capabilities()
+        return {
+            "platform": "reference",
+            "available": True,
+            "dtypes": sorted(dtype.value for dtype in caps.dtypes),
+            "quant": sorted(scheme.value for scheme in caps.quant),
+            "modes": sorted(mode.value for mode in caps.modes),
+            "note": "M0 的语义裁判，只做全注意力层",
+        }
+    try:
+        return {"available": True, **ApplePlatform().probe()}
+    except SysOneError as exc:
+        return {
+            "platform": "apple",
+            "available": False,
+            "reason": exc.message,
+            "context": exc.context,
+        }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command == "doctor":
+            if args.platform == "auto":
+                _print({name: _platform_report(name) for name in ("reference", "apple")})
+            else:
+                _print(_platform_report(args.platform))
+            return 0
         if args.command == "inspect":
             descriptor = family(args.model).parse_config(args.weights)
             _print(descriptor.summary())
