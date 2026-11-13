@@ -15,6 +15,19 @@ import numpy as np
 
 from ..errors import MissingTensorError
 
+# 每种 dtype 的单元素字节数；`read_rows` 用它算行跨度（BF16 不在 `_NP_DTYPES` 里）。
+_ITEM_BYTES: dict[str, int] = {
+    "F32": 4,
+    "F16": 2,
+    "F64": 8,
+    "I8": 1,
+    "U8": 1,
+    "I16": 2,
+    "I32": 4,
+    "I64": 8,
+    "BF16": 2,
+}
+
 _NP_DTYPES: dict[str, type] = {
     "F32": np.float32,
     "F16": np.float16,
@@ -158,6 +171,45 @@ class SafeTensorFile:
         absolute = self._data_start + start
         raw = self._mmap[absolute : self._data_start + end]
         return _decode(raw, dtype, shape, self.path, name)
+
+    def read_rows(self, name: str, rows: Sequence[int]) -> np.ndarray:
+        """只读二维张量的若干行：`v` 有 248320×2048 的 embedding 表，按整表读会物化 2 GB。
+
+        行优先存储，所以一行的字节区间是 `行首 + row * 列数 * 元素字节`，可以直接切 mmap。
+        返回的行顺序与 `rows` 一致（允许重复行，embedding 取词表就这样用）。
+        """
+        try:
+            meta = self._header[name]
+        except KeyError:
+            raise MissingTensorError("权重缺少张量", tensor=name, path=str(self.path)) from None
+        dtype = str(meta.get("dtype"))
+        start = int(meta.get("data_offsets", (0, 0))[0])
+        shape = tuple(int(value) for value in meta.get("shape", ()))
+        if len(shape) != 2:
+            raise MissingTensorError("按行读取只支持二维张量", tensor=name, shape=list(shape))
+        item_bytes = _ITEM_BYTES.get(dtype)
+        if item_bytes is None:
+            raise MissingTensorError("不支持的 safetensors dtype", path=str(self.path), tensor=name, dtype=dtype)
+        count, columns = shape
+        indices = np.asarray(rows, dtype=np.int64).reshape(-1)
+        if indices.size and (int(indices.min()) < 0 or int(indices.max()) >= count):
+            raise MissingTensorError("行号越界", tensor=name, rows=int(indices.max()), shape=list(shape))
+        row_bytes = columns * item_bytes
+        base = self._data_start + start
+        numpy_dtype = _NP_DTYPES.get(dtype)
+        if numpy_dtype is not None:
+            out = np.empty((indices.size, columns), dtype=numpy_dtype)
+            for position, row in enumerate(indices):
+                begin = base + int(row) * row_bytes
+                out[position] = np.frombuffer(self._mmap[begin:begin + row_bytes], dtype=numpy_dtype)
+            return out
+        # BF16 这类 numpy 没有对应 dtype 的格式逐行解码再拼（prompt 行数不多，够用）。
+        parts = [
+            _decode(self._mmap[base + int(row) * row_bytes:base + int(row) * row_bytes + row_bytes],
+                    dtype, (1, columns), self.path, name)
+            for row in indices
+        ]
+        return np.concatenate(parts, axis=0)
 
     def close(self) -> None:
         self._mmap.close()

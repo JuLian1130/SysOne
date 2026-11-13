@@ -87,6 +87,37 @@ def test_delta_rule_padding_tail_does_not_disturb_prefix():
     np.testing.assert_allclose(out_padded[:s], out, rtol=1e-5, atol=1e-5)
 
 
+def test_delta_rule_is_causal_across_chunks():
+    """跨 chunk 的状态递推只能往前传：改最后一个 token 的 q 不影响它之前的输出。
+
+    `test_ops_vs_torch` 里的参考对拍在装了 torch 的环境才有；这条纯 numpy 的不变量
+    在没有 torch 的 CI 上照样守住 chunk 间递推的方向（曾经整段跨 chunk 路径没被覆盖）。
+    """
+    rng = np.random.default_rng(5)
+    s, h, d = 130, 2, 8       # 130 > 64，跨 3 个 chunk
+    q, k, v = (rng.standard_normal((s, h, d)).astype(np.float32) for _ in range(3))
+    g = -np.abs(rng.standard_normal((s, h)).astype(np.float32)) * 0.1
+    beta = rng.random((s, h)).astype(np.float32)
+    base = ops.delta_rule(q, k, v, g, beta)
+
+    changed = q.copy()
+    changed[-1] += 1.0
+    perturbed = ops.delta_rule(changed, k, v, g, beta)
+    np.testing.assert_allclose(perturbed[:-1], base[:-1], rtol=1e-6, atol=1e-6)
+    assert not np.allclose(perturbed[-1], base[-1])
+
+
+def test_attention_rejects_mismatched_mask():
+    """掩码长度必须等于 q/k 长度：调用方按未裁剪长度建掩码是 bug，不许静默截断。"""
+    import pytest
+
+    from sysone.errors import MaskPlanError
+
+    q = np.ones((3, 2, 4), np.float32)
+    with pytest.raises(MaskPlanError):
+        ops.attention(q, q, q, np.ones((5, 5), bool))
+
+
 def test_softplus_is_stable_for_large_input():
     x = np.array([[-1e4, 0.0, 1e4]], np.float32)
     out = ops.softplus(x)

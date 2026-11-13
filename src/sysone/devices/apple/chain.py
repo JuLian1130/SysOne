@@ -1,0 +1,384 @@
+"""mude 的 20 层前向链：ANE 跑三段程序，numpy 只跑 norm / RoPE / 注意力 / GDN。
+
+M2.2 第 2 片先求打通与逐层对齐，不做性能优化：全注意力层与线性注意力层的"热点"仍是
+numpy，第 3 片再换 Metal。精度路径与旧引擎一致（int8 权重 + fp16 累加），所以与 torch
+bf16 参照不会逐位相同；链路里也不能出现 torch（`src/` 只用 numpy）。
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+from typing import Sequence
+
+import numpy as np
+
+from ...domain.attention import AttentionRole
+from ...models.families.mude import CODE_ROWS, ane_layer_weights, normalize_norm
+from ...weights.packing.ane_blob import build as build_blob
+from ...weights.store import SafeTensorFile
+from .compile import S_NATIVE, AneLayer, layer_mil, write_program
+from .ops import (
+    apply_rotary,
+    attention,
+    causal_depthwise_conv,
+    delta_rule,
+    rms_norm,
+    rms_norm_gated,
+    sigmoid,
+    softplus,
+    softmax,
+)
+from .runtime import AneRuntime
+
+
+def _rms(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """`[hidden, s]` 布局的 RMSNorm：通道在前，所以转成 `[s, hidden]` 再复用 `ops.rms_norm`。"""
+    return rms_norm(x.T, weight).T
+
+
+def _place(sequence_first: np.ndarray, hidden: int, s: int) -> np.ndarray:
+    """`[L, hidden]` 的行序列放进 ANE 要求的 `[hidden, s]` 通道优先布局，其余列清零。"""
+    out = np.zeros((hidden, s), np.float32)
+    out[:, : sequence_first.shape[0]] = np.asarray(sequence_first, np.float32).T
+    return out
+
+
+def _rope_table(theta: float, s: int, rotary_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    """位置 0..s-1 的 RoPE 正余弦表，各 `[s, rotary_dim/2]`。
+
+    文本 RoPE 的 cos/sin 两个半区相同（`Qwen3_5TextRotaryEmbedding` 里 `cat(freqs, freqs)`），
+    而 `ops.apply_rotary` 按前半/后半配对，所以这里只留前一半的频率。
+    """
+    frequencies = theta ** (-np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim)
+    angles = np.arange(s, dtype=np.float64)[:, None] * frequencies[None, :]
+    return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+
+
+class MudeChain:
+    """mude 20 层链：`forward()` 给出前 `options` 个码的概率，`logits()` 给 255 个原始 logits。
+
+    `s` 是 ANE 程序的静态列宽，prompt 长度必须不超过它；一层的三段 ANE 程序在 `load()` 里
+    编译并常驻，`close()` 统一卸载。参数全部 fp32（numpy 一侧）与 fp16（surfaces）混合，
+    与旧引擎的数值路径一致。
+    """
+
+    def __init__(
+        self,
+        *,
+        runtime: AneRuntime,
+        layers: list[AneLayer],
+        params: list[dict[str, np.ndarray]],
+        roles: list[AttentionRole],
+        store: SafeTensorFile,
+        embed_name: str,
+        final_norm: np.ndarray,
+        readout: np.ndarray,
+        temperature: float,
+        cos: np.ndarray,
+        sin: np.ndarray,
+        hidden: int,
+        s: int,
+        heads: int,
+        kv_heads: int,
+        head_dim: int,
+        rotary_dim: int,
+        linear_heads: int,
+        linear_dim: int,
+        own_runtime: bool = True,
+    ) -> None:
+        self._runtime = runtime
+        self._own_runtime = own_runtime
+        self._layers = layers
+        self._params = params
+        self._roles = roles
+        self._store = store
+        self._embed_name = embed_name
+        self._final_norm = final_norm
+        self._readout = readout
+        self._temperature = float(temperature)
+        self._cos = cos
+        self._sin = sin
+        self._hidden = int(hidden)
+        self._s = int(s)
+        self._heads = int(heads)
+        self._kv_heads = int(kv_heads)
+        self._head_dim = int(head_dim)
+        self._rotary_dim = int(rotary_dim)
+        self._linear_heads = int(linear_heads)
+        self._linear_dim = int(linear_dim)
+        self._closed = False
+
+    # ------------------------------------------------------------------ 加载
+
+    @classmethod
+    def load(
+        cls,
+        model_dir: str | Path,
+        *,
+        device: str = "ane",
+        s: int = S_NATIVE,
+        quantize: bool = True,
+        scratch_dir: str | Path | None = None,
+        runtime: AneRuntime | None = None,
+    ) -> "MudeChain":
+        """编译 20 层程序并从 `model_dir` 读权重。
+
+        `device` 目前只有 `"ane"`（这条链就是 ANE 链）；`scratch_dir` 放 MIL/blob 产物，
+        默认在系统临时目录，产物按内容哈希复用。
+        """
+        if device != "ane":
+            raise ValueError(f"mude 链只有 ANE 设备，收到 {device!r}")
+        root = Path(model_dir)
+        text = _text_config(root)
+        decision = _load_json(root / "decision_config.json")
+        mode = str(decision.get("attention_mode", "prefix_noncausal"))
+        if mode not in ("prefix_noncausal", "noncausal_full"):
+            # 这两个模式下单个问题的 key 掩码就是"prompt 内双向、padding 外不可见"；
+            # causal 需要真三角掩码，这条链还没实现。
+            raise ValueError(f"mude 链只实现了双向掩码，收到 attention_mode={mode!r}")
+
+        hidden = int(text["hidden_size"])
+        ffn = int(text["intermediate_size"])
+        heads = int(text["num_attention_heads"])
+        kv_heads = int(text["num_key_value_heads"])
+        head_dim = int(text["head_dim"])
+        rope = text.get("rope_parameters", {})
+        theta = float(rope.get("rope_theta", 10_000_000.0))
+        rotary_dim = int(head_dim * float(rope.get("partial_rotary_factor", 1.0)))
+        linear_heads = int(text["linear_num_key_heads"])
+        linear_dim = int(text["linear_key_head_dim"])
+        # GDN 的 q/k 与 v 在这里同头数同头维，所以不用 repeat_interleave（参考实现里那一步恒等）。
+        if int(text.get("linear_num_value_heads", linear_heads)) != linear_heads:
+            raise ValueError("GDN 的 v 头数与 k 头数不同，当前实现没做 repeat_interleave")
+        if int(text.get("linear_value_head_dim", linear_dim)) != linear_dim:
+            raise ValueError("GDN 的 v 头维与 k 头维不同，当前实现没做 repeat_interleave")
+        roles = [
+            AttentionRole.LINEAR if kind == "linear_attention" else AttentionRole.FULL
+            for kind in text["layer_types"]
+        ]
+        if len(roles) != int(text["num_hidden_layers"]):
+            raise ValueError("layer_types 数量与 num_hidden_layers 不一致")
+
+        store = SafeTensorFile(root / "model.safetensors")
+        scratch = (Path(scratch_dir) if scratch_dir is not None
+                   else Path(tempfile.gettempdir()) / "sysone-mude-chain")
+        own_runtime = runtime is None
+        runtime = runtime if runtime is not None else AneRuntime()
+        layers: list[AneLayer] = []
+        try:
+            params = [_layer_params(store, index, role) for index, role in enumerate(roles)]
+            for index, role in enumerate(roles):
+                entries = ane_layer_weights(store.read, layer=index, layer_type=role)
+                cout = int(entries["proj"].shape[0])
+                blob, blob_entries = build_blob(entries, quantize=quantize)
+                mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=blob_entries)
+                files = write_program(
+                    scratch / f"layer{index:02d}",
+                    mil=mil,
+                    blob=blob,
+                    s=s,
+                    meta={"layer": index, "type": str(role), "cout": cout},
+                )
+                layers.append(AneLayer(runtime, files, name=f"mude_layer_{index}",
+                                       hidden=hidden, cout=cout, ffn=ffn, s=s))
+            final_norm = normalize_norm(store.read("language_model.norm.weight"))
+            readout = _readout(root)
+            temperature = float(decision.get("temperature", 1.0))
+            cos, sin = _rope_table(theta, s, rotary_dim)
+        except BaseException:
+            for layer in layers:
+                layer.close()
+            if own_runtime:
+                runtime.close()
+            store.close()
+            raise
+
+        return cls(
+            runtime=runtime, layers=layers, params=params, roles=roles, store=store,
+            embed_name="language_model.embed_tokens.weight", final_norm=final_norm,
+            readout=readout, temperature=temperature, cos=cos, sin=sin,
+            hidden=hidden, s=s, heads=heads, kv_heads=kv_heads, head_dim=head_dim,
+            rotary_dim=rotary_dim, linear_heads=linear_heads, linear_dim=linear_dim,
+            own_runtime=own_runtime,
+        )
+
+    # ------------------------------------------------------------------ 前向
+
+    def logits(self, tokens: Sequence[int], *, trace: list[np.ndarray] | None = None,
+               prefix: int = 0, debug: dict | None = None) -> np.ndarray:
+        """整条 prompt 走 20 层，返回 `[CODE_ROWS]` 原始 logits（fp32，未除温度）。
+
+        `trace` 非空时把每层输出（最后一条 token 的 `[hidden]`）按顺序追加进去，
+        供探针与 torch 的逐层 hidden 对比。`prefix` 是 `prefix_noncausal` 的公共前缀长度
+        （厂商 `Prepared.prefix()` 给出的那个数）：全注意力层的掩码是
+        `(q >= prefix) | (k < prefix)`，额外把 padding 列当不可见。单问题、无 padding 时
+        prefix=0 就退化为整段双向。
+        """
+        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
+        length = int(ids.size)
+        if length == 0:
+            raise ValueError("prompt 至少要有一个 token")
+        if length > self._s:
+            raise ValueError(f"prompt 长度 {length} 超过链的静态宽度 s={self._s}；用更大的 s 重新 load")
+        if not 0 <= prefix <= length:
+            raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
+        x = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._s)
+        if trace is not None:
+            # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
+            # 任何一层跑偏都能定位到该层本身而不是前一层。
+            trace.append(x[:, length - 1].copy())
+        cos, sin = self._cos[:length], self._sin[:length]
+        for index, layer in enumerate(self._layers):
+            params = self._params[index]
+            layer_debug = debug if (debug is not None and index == 0) else None
+            if self._roles[index] is AttentionRole.FULL:
+                x = self._full_layer(layer, params, x, length, cos, sin, prefix)
+            else:
+                x = self._linear_layer(layer, params, x, length, layer_debug)
+            if trace is not None:
+                trace.append(x[:, length - 1].copy())
+        final = rms_norm(x.T, self._final_norm)[length - 1]
+        return self._readout @ final
+
+    def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0) -> np.ndarray:
+        """前 `options` 个码的 softmax 概率（选项顺序 = `codes` 顺序）。
+
+        与厂商 `D3.probabilities` 的约定一致：越界码行在 softmax 前置 -inf（exp 为 0），
+        因此等价于只在前 `options` 行上归一化。
+        """
+        if not 1 <= options <= CODE_ROWS:
+            raise ValueError(f"options 必须在 1..{CODE_ROWS}，收到 {options}")
+        return softmax(self.logits(tokens, prefix=prefix)[:options] / self._temperature)
+
+    def _full_layer(
+        self,
+        layer: AneLayer,
+        params: dict[str, np.ndarray],
+        x: np.ndarray,
+        length: int,
+        cos: np.ndarray,
+        sin: np.ndarray,
+        prefix: int,
+    ) -> np.ndarray:
+        """全注意力层：q|gate 交错投影 → q/k 各做 head_dim 的 RMSNorm → 半维 RoPE → GQA → 门控。"""
+        xn = _rms(x, params["input_norm"])
+        projected, _ = layer.project(xn)
+        p = projected.T.astype(np.float32)                 # [s, 5120]，多出的列是 padding
+        heads, kv_heads, head_dim = self._heads, self._kv_heads, self._head_dim
+        q_rows = heads * head_dim * 2
+        k_rows = kv_heads * head_dim
+        # q_proj 的行是每个 head 的 [q(head_dim) | gate(head_dim)] 交错排列。
+        qg = p[:length, :q_rows].reshape(length, heads, 2, head_dim)
+        query = rms_norm(qg[:, :, 0, :], params["q_norm"])
+        gate = qg[:, :, 1, :].reshape(length, heads * head_dim)
+        key = rms_norm(p[:length, q_rows:q_rows + k_rows].reshape(length, kv_heads, head_dim),
+                       params["k_norm"])
+        value = p[:length, q_rows + k_rows:q_rows + 2 * k_rows].reshape(length, kv_heads, head_dim)
+        query = apply_rotary(query, cos, sin, rotary_dim=self._rotary_dim)
+        key = apply_rotary(key, cos, sin, rotary_dim=self._rotary_dim)
+        repeat = heads // kv_heads
+        key = np.repeat(key, repeat, axis=1)
+        value = np.repeat(value, repeat, axis=1)
+        # k/v 已裁到真实 `length` 行，padding 列进不了注意力，所以掩码就是厂商
+        # `prefix_noncausal` 的 `(q >= prefix) | (k < prefix)`，形状 `[length, length]`。
+        queries = np.arange(length)[:, None]
+        keys = np.arange(length)[None, :]
+        mask = (queries >= prefix) | (keys < prefix)
+        context = attention(query, key, value, mask).reshape(length, heads * head_dim)
+        y, _ = layer.output(_place(context * sigmoid(gate), self._hidden, self._s), x)
+        xn2 = _rms(y, params["post_norm"])
+        return layer.feed_forward(xn2, y)[0]
+
+    def _linear_layer(
+        self,
+        layer: AneLayer,
+        params: dict[str, np.ndarray],
+        x: np.ndarray,
+        length: int,
+        debug: dict | None = None,
+    ) -> np.ndarray:
+        """线性注意力层（GDN）：depthwise 因果卷积 → q/k/v → chunked delta rule → 门控 norm。"""
+        xn = _rms(x, params["input_norm"])
+        projected, _ = layer.project(xn)
+        p = projected.T.astype(np.float32)                 # [s, 8224]
+        heads, dim = self._linear_heads, self._linear_dim
+        conv_rows = 3 * heads * dim                        # q丨k丨v，各 2048
+        mixed = causal_depthwise_conv(p[:length, :conv_rows], params["conv"])   # 已过 silu
+        query = mixed[:, :heads * dim].reshape(length, heads, dim)
+        key = mixed[:, heads * dim:2 * heads * dim].reshape(length, heads, dim)
+        value = mixed[:, 2 * heads * dim:].reshape(length, heads, dim)
+        z = p[:length, conv_rows:conv_rows + self._hidden].reshape(length, heads, dim)
+        a = p[:length, conv_rows + self._hidden:conv_rows + self._hidden + heads]
+        # 注意本仓库 `mude.ane_layer_weights` 的行序是 a 在 b 前（旧引擎是 b 在前），
+        # 这里必须按本仓库的 blob 顺序读，否则 beta 与 g 的输入会互换。
+        b = p[:length, conv_rows + self._hidden + heads:conv_rows + self._hidden + 2 * heads]
+        beta = sigmoid(b)
+        g = -np.exp(params["a_log"]) * softplus(a + params["dt_bias"])
+        core = delta_rule(query, key, value, g, beta)      # [L, heads, dim]
+        # 门控 norm 是按头做的：参考实现在 [S*heads, dim] 上归一化，不能摊平成 [S, hidden]。
+        gated = rms_norm_gated(core.reshape(length * heads, dim), z.reshape(length * heads, dim),
+                               params["norm"]).reshape(length, heads * dim)
+        y, _ = layer.output(_place(gated, self._hidden, self._s), x)
+        xn2 = _rms(y, params["post_norm"])
+        if debug is not None:
+            debug.update(xn=xn, projected=p, mixed=mixed, z=p[:length, conv_rows:conv_rows + self._hidden],
+                         a=a, b=b, beta=beta, g=g, core=core, gated=gated, y=y, xn2=xn2)
+        return layer.feed_forward(xn2, y)[0]
+
+    # ------------------------------------------------------------------ 收尾
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for layer in self._layers:
+            layer.close()
+        self._layers.clear()
+        if self._own_runtime:
+            self._runtime.close()
+        self._store.close()
+
+
+# ---------------------------------------------------------------------- 权重
+
+
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def _text_config(root: Path) -> dict:
+    config = _load_json(root / "config.json")
+    return config.get("text_config", config)
+
+
+def _readout(root: Path) -> np.ndarray:
+    """`readout.safetensors` 的 `[255, hidden]` 表，按配置的 readout_dtype 转 fp32。"""
+    handle = SafeTensorFile(root / "readout.safetensors")
+    try:
+        weight = handle.read("weight")
+    finally:
+        handle.close()
+    return np.asarray(weight, np.float32)
+
+
+def _layer_params(store: SafeTensorFile, index: int, role: AttentionRole) -> dict[str, np.ndarray]:
+    """一层的 numpy 侧权重：各 norm、卷积、A_log / dt_bias。norm 都补 `+1`（零中心保存）。"""
+    base = f"language_model.layers.{index}"
+    params = {
+        "input_norm": normalize_norm(store.read(f"{base}.input_layernorm.weight")),
+        "post_norm": normalize_norm(store.read(f"{base}.post_attention_layernorm.weight")),
+    }
+    if role is AttentionRole.FULL:
+        attn = f"{base}.self_attn"
+        params["q_norm"] = normalize_norm(store.read(f"{attn}.q_norm.weight"))
+        params["k_norm"] = normalize_norm(store.read(f"{attn}.k_norm.weight"))
+    else:
+        attn = f"{base}.linear_attn"
+        params["conv"] = np.asarray(store.read(f"{attn}.conv1d.weight"), np.float32).reshape(-1, 4)
+        params["a_log"] = np.asarray(store.read(f"{attn}.A_log"), np.float32)
+        params["dt_bias"] = np.asarray(store.read(f"{attn}.dt_bias"), np.float32)
+        # `linear_attn.norm.weight` 不是零中心存的（`RMSNormGated` 的初始化是全 1），直接用。
+        params["norm"] = np.asarray(store.read(f"{attn}.norm.weight"), np.float32)
+    return params

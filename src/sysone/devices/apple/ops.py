@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from ...errors import MaskPlanError
+
 EPS = 1e-6
 CHUNK = 64
 
@@ -88,7 +90,15 @@ def attention(q: np.ndarray, k: np.ndarray, v: np.ndarray, mask: np.ndarray | No
     dk = kh.shape[-1]
     s = np.einsum("hsd,htd->hst", qh, kh) * (scale if scale is not None else dk ** -0.5)
     if mask is not None:
-        s = np.where(np.asarray(mask)[None, :, :], s, -np.inf)
+        m = np.asarray(mask)
+        if m.ndim == 3:
+            m = m[0]
+        if m.shape != (qh.shape[1], kh.shape[1]):
+            # 不接受隐式截断：掩码长度与 k/v 长度不一致说明调用方契约错
+            #（M2.2 首版曾按未裁剪的全序列长度建掩码，由这里兜底掩盖了真问题）。
+            raise MaskPlanError("注意力掩码形状与 q/k 长度不一致",
+                                mask=tuple(m.shape), queries=qh.shape[1], keys=kh.shape[1])
+        s = np.where(m[None, :, :], s, -np.inf)
     a = softmax(s, axis=-1)
     # 全遮的行（理论不会出现）会得到 nan，置 0 免得污染下游
     a = np.where(np.isnan(a), 0.0, a)
@@ -134,8 +144,11 @@ def delta_rule(q: np.ndarray, k: np.ndarray, v: np.ndarray, g: np.ndarray, beta:
     q_decayed = q * np.exp(cum)[..., None]
 
     idx = np.arange(CHUNK)
-    lower = idx[:, None] > idx[None, :]
-    pairwise = np.exp(cum[:, :, None, :] - cum[:, None, :, :])  # [n, i, j, heads]
+    # 参考实现遮掉的是严格上三角，**对角线保留**（intra 的对角项 q_i·k_i 非零，
+    # 少了它整块输出就偏；ut 的对角线被 unitriangular 求解忽略，保留也无害）。
+    lower = idx[:, None] >= idx[None, :]
+    # 先在掩码掉的那半边填 -inf 再取 exp，否则 i>j 时的正指数会溢出
+    pairwise = np.exp(np.where(lower[:, :, None], cum[:, :, None, :] - cum[:, None, :, :], -np.inf))
     pairwise = np.where(lower[:, :, None], pairwise, 0.0)
 
     ut = np.einsum("nihd,njhd->nijh", k_beta, k) * pairwise       # [n, 64, 64, heads]
