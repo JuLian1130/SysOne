@@ -22,6 +22,12 @@ class EnvSpec:
 
 REGISTRY: tuple[EnvSpec, ...] = (
     EnvSpec("SYS1_LOG_LEVEL", "str", "info", "日志级别（debug/info/warning/error）"),
+    EnvSpec(
+        "DECISION_API_KEY",
+        "str",
+        "",
+        "服务层的 bearer key；设了非空值后 /v1/models 与 /v1/systemone 必须带 Authorization",
+    ),
 )
 
 _BOOL_TRUE = frozenset({"1", "true", "yes", "on"})

@@ -15,16 +15,39 @@ from .domain.attention import MaskMode
 from .domain.decision import DecisionRequest, Question
 from .engine.engine import Engine
 from .engine.strategies.split import mude_runner
+from .env import read as read_env
 from .errors import ConfigError, SysOneError
 from .models import families as _family_modules  # noqa: F401  导入即注册
 from .models.descriptor import ModelDescriptor
 from .models.registry import families, family
+from .service import app as service_app
+from .service.app import EngineDecider
+from .service.protocol import KEY_VARIABLE
 from .weights.store import TensorStore
 
 _INPUT_KEYS = {"state", "questions", "attention_mode", "request_id"}
 # split 链的缓冲宽度默认取调度上限：链在装载时就按它分配 GPU 侧的面，
 # 而超过它的 prompt 在 `SplitRunner` 里就是 422。
 _SPLIT_WIDTH = SchedulerConfig().max_len
+
+
+def _model_flags() -> argparse.ArgumentParser:
+    """`run` 与 `serve` 共用的模型/后端选择（`add_help=False` 让它们挂在子命令下）。"""
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--backend",
+        default="reference",
+        choices=("reference", "split"),
+        help="执行路径：reference（M0 语义裁判，只做全注意力层）/ split（mude 整链）",
+    )
+    common.add_argument("--model", default=None, choices=families(), help="split 路径的家族（默认 mude）")
+    common.add_argument("--descriptor", type=Path, default=None, help="descriptor JSON；reference 路径必填")
+    common.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
+    common.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
+    common.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
+    common.add_argument("--bucket", type=int, default=0, help="split：ANE program 的列宽（默认 1024）")
+    common.add_argument("--width", type=int, default=0, help=f"split：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
+    return common
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -35,21 +58,15 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--model", required=True, choices=families())
     inspect.add_argument("--weights", type=Path, required=True, help="模型目录")
 
-    run = sub.add_parser("run", help="跑一次请求：参考后端，或 mude 的 ANE+GPU 链")
-    run.add_argument(
-        "--backend",
-        default="reference",
-        choices=("reference", "split"),
-        help="执行路径：reference（M0 语义裁判，只做全注意力层）/ split（mude 整链）",
-    )
-    run.add_argument("--model", default=None, choices=families(), help="split 路径的家族（默认 mude）")
-    run.add_argument("--descriptor", type=Path, default=None, help="descriptor JSON；reference 路径必填")
-    run.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
+    run = sub.add_parser("run", parents=[_model_flags()], help="跑一次请求")
     run.add_argument("--input", type=Path, required=True, help="请求 JSON")
-    run.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
-    run.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
-    run.add_argument("--bucket", type=int, default=0, help="split：ANE program 的列宽（默认 1024）")
-    run.add_argument("--width", type=int, default=0, help=f"split：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
+
+    serve = sub.add_parser("serve", parents=[_model_flags()], help="起 /v1/systemone 服务")
+    serve.add_argument("--host", default="127.0.0.1", help="监听地址（默认只回环）")
+    serve.add_argument("--port", type=int, default=8000, help="监听端口（0 表示随机空闲端口）")
+    serve.add_argument("--queue", type=int, default=None, help="准入等待位（默认取 scheduler.queue）")
+    serve.add_argument("--admit-timeout", type=float, default=120.0, help="排队超过这么多秒就 429")
+    serve.add_argument("--name", default=None, help="回包里的 model 名（默认模型 id）")
 
     doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
     doctor.add_argument("--platform", default="auto", choices=("auto", "reference", "apple"))
@@ -182,6 +199,34 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
     )
 
 
+def _serve(args: argparse.Namespace) -> int:
+    """前台服务：先绑口、再在后台线程里装载引擎，装载期间探针拿到 503。"""
+
+    def load() -> tuple[EngineDecider, object]:
+        engine = _build_engine(args, _parse_mode(args.attention_mode))
+        startup = engine.start()
+        return (
+            EngineDecider(
+                engine,
+                model_name=args.name or engine.descriptor.model_id,
+                max_input_tokens=engine.config.scheduler.max_len,
+                debug_timings=bool(args.debug_timings),
+            ),
+            startup,
+        )
+
+    queue = SchedulerConfig().queue if args.queue is None else int(args.queue)
+    return service_app.run(
+        load=load,
+        host=args.host,
+        port=args.port,
+        api_key=read_env()[KEY_VARIABLE] or None,
+        queue=queue,
+        admit_timeout=float(args.admit_timeout),
+        debug_timings=bool(args.debug_timings),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -195,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
             descriptor = family(args.model).parse_config(args.weights)
             _print(descriptor.summary())
             return 0
+        if args.command == "serve":
+            return _serve(args)
         engine = _build_engine(args, _parse_mode(args.attention_mode))
         engine.start()
         result = engine.run(_load_request(args.input))
