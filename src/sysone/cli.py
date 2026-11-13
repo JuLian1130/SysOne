@@ -14,6 +14,7 @@ from .devices.reference import CharEncoder, ReferencePlatform, ReferenceRunner
 from .domain.attention import MaskMode
 from .domain.decision import DecisionRequest, Question
 from .engine.engine import Engine
+from .engine.strategies.split import mude_runner
 from .errors import ConfigError, SysOneError
 from .models import families as _family_modules  # noqa: F401  导入即注册
 from .models.descriptor import ModelDescriptor
@@ -21,6 +22,9 @@ from .models.registry import families, family
 from .weights.store import TensorStore
 
 _INPUT_KEYS = {"state", "questions", "attention_mode", "request_id"}
+# split 链的缓冲宽度默认取调度上限：链在装载时就按它分配 GPU 侧的面，
+# 而超过它的 prompt 在 `SplitRunner` 里就是 422。
+_SPLIT_WIDTH = SchedulerConfig().max_len
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -31,12 +35,21 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--model", required=True, choices=families())
     inspect.add_argument("--weights", type=Path, required=True, help="模型目录")
 
-    run = sub.add_parser("run", help="用参考后端跑一次请求")
-    run.add_argument("--descriptor", type=Path, required=True, help="descriptor JSON")
+    run = sub.add_parser("run", help="跑一次请求：参考后端，或 mude 的 ANE+GPU 链")
+    run.add_argument(
+        "--backend",
+        default="reference",
+        choices=("reference", "split"),
+        help="执行路径：reference（M0 语义裁判，只做全注意力层）/ split（mude 整链）",
+    )
+    run.add_argument("--model", default=None, choices=families(), help="split 路径的家族（默认 mude）")
+    run.add_argument("--descriptor", type=Path, default=None, help="descriptor JSON；reference 路径必填")
     run.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
     run.add_argument("--input", type=Path, required=True, help="请求 JSON")
     run.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
     run.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
+    run.add_argument("--bucket", type=int, default=0, help="split：ANE program 的列宽（默认 1024）")
+    run.add_argument("--width", type=int, default=0, help=f"split：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
 
     doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
     doctor.add_argument("--platform", default="auto", choices=("auto", "reference", "apple"))
@@ -133,6 +146,42 @@ def _platform_report(target: str) -> dict[str, object]:
         }
 
 
+def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
+    """按 `--backend` 装配引擎：参考后端（M0 语义裁判）或 mude 的 ANE+GPU 链。"""
+    if args.backend == "split":
+        name = args.model or "mude"
+        width = int(args.width or _SPLIT_WIDTH)
+        descriptor = family(name).parse_config(args.weights)
+        config = EngineConfig(
+            model=ModelSelection(name=args.weights.name, dir=args.weights),
+            scheduler=SchedulerConfig(attention_mode=mode, max_len=width),
+            service=ServiceConfig(debug_timings=bool(args.debug_timings)),
+        )
+        config.validate()
+        # 编码器只是 Engine 的必填位：split 不排 MaskPlan，真正渲染在 `mude_runner` 的题面里。
+        return Engine(
+            descriptor=descriptor,
+            runner=mude_runner(args.weights, bucket=args.bucket or None, width=width),
+            encoder=CharEncoder(vocab=descriptor.vocab),
+            config=config,
+        )
+    if args.descriptor is None:
+        raise ConfigError("reference 后端需要 --descriptor")
+    descriptor = ModelDescriptor.from_mapping(_load_json(args.descriptor))
+    config = EngineConfig(
+        model=ModelSelection(name=args.weights.name, dir=args.weights),
+        scheduler=SchedulerConfig(attention_mode=mode),
+        service=ServiceConfig(debug_timings=bool(args.debug_timings)),
+    )
+    config.validate()
+    return Engine(
+        descriptor=descriptor,
+        runner=ReferenceRunner(descriptor, TensorStore(_tensor_files(args.weights))),
+        encoder=CharEncoder(vocab=descriptor.vocab),
+        config=config,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -146,21 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             descriptor = family(args.model).parse_config(args.weights)
             _print(descriptor.summary())
             return 0
-        descriptor = ModelDescriptor.from_mapping(_load_json(args.descriptor))
-        store = TensorStore(_tensor_files(args.weights))
-        mode = _parse_mode(args.attention_mode)
-        config = EngineConfig(
-            model=ModelSelection(name=args.weights.name, dir=args.weights),
-            scheduler=SchedulerConfig(attention_mode=mode),
-            service=ServiceConfig(debug_timings=bool(args.debug_timings)),
-        )
-        config.validate()
-        engine = Engine(
-            descriptor=descriptor,
-            runner=ReferenceRunner(descriptor, store),
-            encoder=CharEncoder(vocab=descriptor.vocab),
-            config=config,
-        )
+        engine = _build_engine(args, _parse_mode(args.attention_mode))
         engine.start()
         result = engine.run(_load_request(args.input))
         _print(dataclasses.asdict(result))

@@ -1,0 +1,343 @@
+"""split 策略的管线测试（假链 + 假分词器，不依赖 ANE / transformers）。
+
+真链只在设了 `SYS1_MUDE_WEIGHTS` 的集成测试里跑；这里验证的是"题面 → id → 一次整链
+前向 → 答案"这段接线的语义：线格式的字节、前缀切在哪、noul 的序号、模式门禁、
+超长与预热失败。
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from helpers import load_tiny_descriptor, make_request
+
+from sysone.config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig
+from sysone.domain.attention import MaskMode
+from sysone.domain.decision import Question
+from sysone.domain.work import CompilationTimes
+from sysone.engine.engine import Engine
+from sysone.engine.strategies.split import SplitRunner
+from sysone.errors import ConfigError, NotReadyError, RequestTooLongError, UnsupportedModeError
+from sysone.models.families import mude
+
+CODES = tuple(f"K{index:03d}" for index in range(mude.CODE_ROWS))
+
+
+class FakeTokenizer:
+    """字符级假分词器（`token = ord(ch)`）：chat 模板只加定位用的标记，user 内容原样保留。"""
+
+    def __init__(self) -> None:
+        self.chat_calls = 0
+
+    def apply_chat_template(self, conversation, *, tokenize, add_generation_prompt, enable_thinking):
+        assert tokenize is False
+        assert add_generation_prompt is True
+        assert enable_thinking is False
+        self.chat_calls += 1
+        return f"<|system|>{conversation[0]['content']}<|user|>{conversation[1]['content']}<|assistant|>"
+
+    def __call__(self, text, *, add_special_tokens):
+        assert add_special_tokens is False
+        return {"input_ids": [ord(char) for char in text]}
+
+
+class FakeChain:
+    """只记账、按 `options` 给均匀概率；`shares` 可覆盖成不等概率。"""
+
+    def __init__(self, *, shares: tuple[float, ...] | None = None) -> None:
+        self.calls: list[tuple[tuple[int, ...], int, int]] = []
+        self.closed = False
+        self._shares = shares
+
+    def forward(self, tokens, *, options, prefix=0):
+        self.calls.append((tuple(tokens), int(options), int(prefix)))
+        if self._shares is not None:
+            values = list(self._shares[:options])
+            return [value / sum(values) for value in values]
+        return [1.0 / options] * options
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _prompter(tokenizer: FakeTokenizer | None = None) -> tuple[mude.MudePrompter, FakeTokenizer]:
+    tokenizer = tokenizer or FakeTokenizer()
+    return mude.MudePrompter(tokenizer, CODES), tokenizer
+
+
+def _config(mode: MaskMode | None = None, max_len: int = 4096) -> EngineConfig:
+    return EngineConfig(
+        model=ModelSelection(name="fake", dir="."),
+        scheduler=SchedulerConfig(attention_mode=mode, max_len=max_len),
+        service=ServiceConfig(debug_timings=True),
+    )
+
+
+def _runner(
+    chain: FakeChain, *, max_len: int = 4096, tokenizer: FakeTokenizer | None = None
+) -> SplitRunner:
+    prompter, _ = _prompter(tokenizer)
+    return SplitRunner(lambda: chain, prompter, max_len=max_len)
+
+
+def _engine(chain: FakeChain, config: EngineConfig | None = None, *, max_len: int = 4096) -> Engine:
+    from sysone.devices.reference.encoding import CharEncoder
+
+    descriptor = load_tiny_descriptor()
+    return Engine(
+        descriptor=descriptor,
+        runner=_runner(chain, max_len=max_len),
+        encoder=CharEncoder(vocab=descriptor.vocab),
+        config=config or _config(),
+    )
+
+
+# ---------------------------------------------------------------------- 线格式
+
+
+def test_option_plan_choice_keeps_options_in_order() -> None:
+    question = Question(text="选一个", options=("甲", "乙", "丙"))
+    texts, labels, indexes = mude.option_plan(question)
+    assert texts == ("甲", "乙", "丙")
+    assert labels == ("甲", "乙", "丙")
+    assert indexes == (0, 1, 2)
+
+
+def test_option_plan_noul_reverses_the_prompt_order() -> None:
+    """prompt 里是 "No / false, Yes / true"，答案标签仍是 ("yes", "no") ⇒ 序号反着放。"""
+    texts, labels, indexes = mude.option_plan(Question(text="要看这个文件吗？", kind="noul"))
+    assert texts == mude._NOUL_TEXTS
+    assert labels == ("yes", "no")
+    assert indexes == (1, 0)
+
+
+def test_option_plan_rejects_unknown_kind_and_empty_options() -> None:
+    with pytest.raises(ConfigError):
+        mude.option_plan(Question(text="打分", kind="score"))
+    with pytest.raises(ConfigError):
+        mude.option_plan(Question(text="选一个"))
+
+
+def test_render_messages_matches_the_wire_format() -> None:
+    question = Question(text="选哪个？", options=("甲", "乙"))
+    messages = mude.render_messages("只有这一句", question, ("甲", "乙"), CODES)
+    assert messages[0] == {"role": "system", "content": mude.SYSTEM_PROMPT}
+    assert messages[1]["content"] == (
+        "State:\n"
+        "只有这一句\n"
+        "\n"
+        "Question:\n"
+        "选哪个？\n"
+        "\n"
+        "Options:\n"
+        "K000: 甲\n"
+        "K001: 乙\n"
+        "\n"
+        "Reply with only the code of the best option."
+    )
+
+
+def test_render_messages_falls_back_for_empty_state_and_text() -> None:
+    messages = mude.render_messages("", Question(text="", options=("甲",)), ("甲",), CODES)
+    assert "State:\n(empty)\n" in messages[1]["content"]
+    assert "Question:\nChoose the best matching option.\n" in messages[1]["content"]
+
+
+# ---------------------------------------------------------------------- 题面
+
+
+def test_prompter_cuts_the_prefix_right_before_the_question() -> None:
+    prompter, _ = _prompter()
+    question = Question(text="选哪个？", options=("甲", "乙"))
+    sequence, prefix_len, labels, indexes = prompter.encode("只有这一句", question)
+    assert labels == ("甲", "乙")
+    assert indexes == (0, 1)
+    # 前缀停在"Question:"换行之后，所以前缀之后第一个 token 就是题干的第一个字符。
+    assert prefix_len > 0
+    assert sequence[prefix_len] == ord(question.text[0])
+    assert sequence[prefix_len - 10:prefix_len] == tuple(ord(char) for char in "Question:\n")
+
+
+def test_prompter_caches_the_prefix_for_one_state() -> None:
+    prompter, tokenizer = _prompter()
+    question = Question(text="选哪个？", options=("甲", "乙"))
+    prompter.encode("同一个 state", question)
+    calls = tokenizer.chat_calls
+    prompter.encode("同一个 state", question)
+    # 同一 state 的第二题不再重渲染哨兵题（第二题只多一次正常模板）。
+    assert tokenizer.chat_calls - calls == 1
+
+
+def test_prompter_requires_the_sentinel_to_survive_the_template() -> None:
+    class StrippingTokenizer(FakeTokenizer):
+        def apply_chat_template(self, conversation, **kwargs):
+            text = super().apply_chat_template(conversation, **kwargs)
+            return text.replace(mude.PREFIX_SENTINEL, "")
+
+    prompter, _ = _prompter(StrippingTokenizer())
+    with pytest.raises(ConfigError):
+        prompter.encode("s", Question(text="q?", options=("甲",)))
+
+
+# ---------------------------------------------------------------------- 装配
+
+
+def test_answers_cover_every_question_and_forward_the_prefix() -> None:
+    chain = FakeChain()
+    engine = _engine(chain)
+    engine.start()
+
+    request = make_request(mode=MaskMode.PREFIX_NONCAUSAL, questions=2)
+    result = engine.run(request)
+
+    assert len(chain.calls) == 3  # 预热一次 + 两道题
+    assert len(result.answers) == 2
+    assert result.answers[0].question_index == 0
+    assert result.answers[0].labels == ("A", "B", "C", "D")
+    assert result.answers[0].probs == (0.25, 0.25, 0.25, 0.25)
+    assert result.answers[0].confidence == 0.25
+    assert result.answers[0].value == "A"  # 平分时取第一个
+    assert result.usage.prefill_calls == 2
+    assert all(options == 4 for _, options, _ in chain.calls[1:])
+    assert all(prefix > 0 for _, _, prefix in chain.calls)
+    assert result.timings is not None
+
+
+def test_noncausal_full_sends_a_zero_prefix() -> None:
+    chain = FakeChain()
+    engine = _engine(chain)
+    engine.start()
+    engine.run(make_request(mode=MaskMode.NONCAUSAL_FULL, questions=1))
+    assert chain.calls[-1][2] == 0
+
+
+def test_the_winning_option_is_the_largest_share() -> None:
+    chain = FakeChain(shares=(0.1, 0.6, 0.2, 0.1))
+    engine = _engine(chain)
+    engine.start()
+    result = engine.run(make_request(mode=MaskMode.PREFIX_NONCAUSAL, questions=1))
+    answer = result.answers[0]
+    assert answer.value == "B"
+    assert answer.confidence == pytest.approx(0.6)
+
+
+def test_noul_question_reports_yes_no_in_engine_order() -> None:
+    chain = FakeChain(shares=(0.25, 0.75))  # prompt 顺序是 No, Yes
+    engine = _engine(chain)
+    engine.start()
+    request = make_request(mode=MaskMode.PREFIX_NONCAUSAL, questions=1)
+    request = type(request)(state=request.state, questions=(Question(text="要看这个文件吗？", kind="noul"),))
+    result = engine.run(request)
+    answer = result.answers[0]
+    assert answer.labels == ("yes", "no")
+    assert answer.probs == (0.75, 0.25)
+    assert answer.value == "yes"
+    assert chain.calls[-1][1] == 2  # 两道选项: No / Yes
+
+
+def test_causal_mode_is_rejected() -> None:
+    engine = _engine(FakeChain())
+    engine.start()
+    with pytest.raises(UnsupportedModeError) as info:
+        engine.run(make_request(mode=MaskMode.CAUSAL))
+    assert info.value.status == 400
+    assert info.value.context["strategy"] == "split"
+    assert info.value.context["mode"] == MaskMode.CAUSAL.value
+
+
+def test_prompt_over_max_len_is_422() -> None:
+    """上限是链的缓冲宽度：超了在 `answers_for` 里就是 422，不是让链抛裸 ValueError。"""
+    from sysone.domain.decision import DecisionRequest
+
+    chain = FakeChain()
+    runner = _runner(chain, max_len=8)
+    runner.load_weights()
+    with pytest.raises(RequestTooLongError) as info:
+        runner.answers_for(
+            DecisionRequest(state="s", questions=(Question(text="q", options=("甲", "乙")),)),
+            MaskMode.PREFIX_NONCAUSAL,
+        )
+    assert info.value.status == 422
+    assert info.value.context["max_len"] == 8
+    assert chain.calls == []  # 一次前向都没发生过
+
+
+def test_warmup_failure_blocks_start() -> None:
+    class UnnormalizedChain(FakeChain):
+        def forward(self, tokens, *, options, prefix=0):
+            self.calls.append((tuple(tokens), int(options), int(prefix)))
+            return [0.1] * options  # 和为 0.1，不是归一化的概率
+
+    engine = _engine(UnnormalizedChain())
+    with pytest.raises(NotReadyError):
+        engine.start()
+
+
+def test_bad_readout_is_reported_not_rounded() -> None:
+    class NaNChain(FakeChain):
+        def forward(self, tokens, *, options, prefix=0):
+            self.calls.append((tuple(tokens), int(options), int(prefix)))
+            return [float("nan")] + [0.3] * (options - 1)
+
+    runner = _runner(NaNChain())
+    runner.load_weights()
+    from sysone.domain.decision import DecisionRequest
+
+    with pytest.raises(Exception) as info:
+        runner.answers_for(
+            DecisionRequest(state="s", questions=(Question(text="q", options=("甲", "乙")),)),
+            MaskMode.PREFIX_NONCAUSAL,
+        )
+    assert "概率" in str(info.value)
+
+
+def test_shutdown_closes_the_chain_and_requires_load() -> None:
+    chain = FakeChain()
+    runner = _runner(chain)
+    with pytest.raises(ConfigError) as info:
+        runner.answers_for(make_request(), MaskMode.PREFIX_NONCAUSAL)
+    assert "尚未装载" in str(info.value)
+    runner.load_weights()
+    assert runner.check_health() is False  # 还没预热
+    times = runner.compile_or_warm_up()
+    assert isinstance(times, CompilationTimes)
+    assert runner.check_health() is True
+    runner.shutdown()
+    assert chain.closed is True
+    assert runner.check_health() is False
+
+
+def test_execute_is_not_the_split_entry() -> None:
+    with pytest.raises(ConfigError):
+        _runner(FakeChain()).execute(plan=None, session=None)
+
+
+# ---------------------------------------------------------------------- 码表
+
+
+def _write_decision(tmp_path: Path, payload: dict) -> Path:
+    root = tmp_path / "mude"
+    root.mkdir()
+    (root / "decision_config.json").write_text(json.dumps(payload), encoding="utf-8")
+    return root
+
+
+def test_read_codes_takes_the_trained_table(tmp_path: Path) -> None:
+    root = _write_decision(tmp_path, {"format_id": mude.FORMAT_ID, "codes": list(CODES)})
+    assert mude.read_codes(root) == CODES
+
+
+def test_read_codes_rejects_another_wire_format(tmp_path: Path) -> None:
+    root = _write_decision(tmp_path, {"format_id": "other-v1", "codes": list(CODES)})
+    with pytest.raises(ConfigError) as info:
+        mude.read_codes(root)
+    assert info.value.context["expected"] == mude.FORMAT_ID
+
+
+def test_read_codes_rejects_a_short_table(tmp_path: Path) -> None:
+    root = _write_decision(tmp_path, {"format_id": mude.FORMAT_ID, "codes": list(CODES[:-1])})
+    with pytest.raises(ConfigError) as info:
+        mude.read_codes(root)
+    assert info.value.context["rows"] == mude.CODE_ROWS
