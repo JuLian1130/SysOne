@@ -92,10 +92,6 @@ class Chain:
     def set_of(self, tile: int) -> int:
         return self.sets[tile % len(self.sets)]
 
-    def encoded(self, work: str) -> int:
-        """这条链已经编码了几个 `work` 类 step（`prep` 是序列级的，`tile = -1`）。"""
-        return sum(1 for (name, _tile) in self.cbs if name == work)
-
 
 def _gpu(work: str, tile: int, lane: int) -> Step:
     return Step("gpu", work, tile, lane)

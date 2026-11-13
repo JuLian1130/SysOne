@@ -24,12 +24,13 @@ from . import kernels
 from .compile import AneLayer, SurfaceSet
 from .geometry import Geometry, mude_geometry
 from .metal import LANE_LONG, LANE_SMALL, MetalBuffer, MetalRuntime
-from .schedule import Chain, Step, attention_steps, blocks, gdn_steps
+from .schedule import NCH, Chain, Step, attention_steps, blocks, gdn_steps
 
 EPS = 1e-6
 
-# 一层的瓦片链数。第 2 步只跑一条链（先把步骤驱动本身跑通），第 3 步切成两条 `NCH`。
-CHAINS = 1
+# 一层的瓦片链数（旧引擎 `NCH = 2`，`e8_a3.py:109`）：再多就把每条链排得太短，等 `core` 时
+# 没有别的链可喂。
+CHAINS = NCH
 
 
 def pool_slots(roles: Sequence[AttentionRole]) -> int:
@@ -235,6 +236,10 @@ class MudePipeline:
         self._h: dict[int, set[int]] = {index: set() for index in range(len(self.buffers))}
         self._preps: dict[int, bool] = {}
         self._prev: dict[int, int | None] = {}
+        # 每层已经编码了几个 gather（两相屏障要的是**两条奇偶链**的合计）。
+        self._gathers: dict[int, int] = {}
+        # 每层最后编码的那个 `core` 瓦片（两条奇偶链共用递归状态与卷积尾巴，只能按序）。
+        self._core_enc: dict[int, int] = {}
         roles = [entry.role for entry in self.buffers]
         for block_of_layers in blocks(roles):
             self._run_block(block_of_layers)
@@ -356,7 +361,9 @@ class MudePipeline:
 
         - `ane`：整台 ANE 只有一条固件队列、一次一个 eval 在飞，所以前一次没回收就不能发射；
         - `norm`：要读上一层同一瓦片的 `h`，而 `h` 是上一层 `tail` 那一步写的；
-        - `prep`：全序列屏障 —— 本层所有瓦片的第一相都得先编码完；
+        - `core`：本层的递归状态与卷积尾巴是两条奇偶链共用的，所以瓦片 `s` 的 core 必须排在
+          瓦片 `s-1` 的 core **编码之后**（lane 1 一条有序队列，编码序即执行序）；
+        - `prep`：全序列屏障 —— 本层所有瓦片（两条链的合计）的第一相都得先编码完；
         - `attn`：得先有 `prep` 编码。
 
         其余依赖（`proj` 要读 `norm` 写的 `proj_in`、`out` 要读 `attn` / `core` 写的那半……）
@@ -368,8 +375,10 @@ class MudePipeline:
         if work == "norm":
             prev = self._prev.get(chain.layer)
             return prev is None or step.tile in self._h[prev]
+        if work == "core":
+            return self._core_enc.get(chain.layer, -1) >= step.tile - 1
         if work == "prep":
-            return chain.encoded("gather") >= len(self._chunks_list)
+            return self._gathers.get(chain.layer, 0) >= len(self._chunks_list)
         if work == "attn":
             return self._preps.get(chain.layer, False)
         return True
@@ -436,6 +445,7 @@ class MudePipeline:
                    src_c0=self._geometry.qg_rows, n=n, s0=start,
                    src_stride=self._bucket, dst_stride=self._width, lane=LANE_LONG)
         self._commit(chain, LANE_LONG, "gather", tile)
+        self._gathers[chain.layer] = self._gathers.get(chain.layer, 0) + 1
 
     def _step_attn(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
         """`attn`：这一段 query 的注意力，写进共享的 `attn` 缓冲。"""
@@ -481,6 +491,7 @@ class MudePipeline:
             out_stride=self._bucket, fast=True, geometry=self._geometry,
         )
         self._commit(chain, LANE_SMALL, "core", tile)
+        self._core_enc[chain.layer] = tile
 
     def _step_norm2(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
         """`norm2`：`[rmsnorm(out) | out]` 写进 `ffn_in`（ANE FFN 那一段的入口）。"""
