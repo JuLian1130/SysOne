@@ -107,6 +107,13 @@ class MudePipeline:
             self._chunks_list: list[tuple[int, int]] = []
             self._length = 0
             self._prefix = 0
+            self._dead = 0
+            # 只有模型的最后一层能把前缀瓦片的第二相省掉：别层的 `h` 还有读者。
+            self._last_is_full = bool(self.buffers) and (
+                self.buffers[-1].role is AttentionRole.FULL
+            )
+            # S3 的回退开关。关掉它只是不省那些瓦片，答案不该变 —— 对拍拿它做 A/B。
+            self._skip_dead = True
             self._proj_done: list[int] = []
             self._linear_first: list[bool] = []
         except BaseException:
@@ -169,6 +176,9 @@ class MudePipeline:
         的列段工作（3 × 136 ms）与再下一个全注意力层的投影（66 ms）——把 ANE 的 3.6 s 摊进
         GPU 的 2.8 s 里。这里没有并发求值（ANE 只有一条固件队列、一次 eval 在飞），重叠完全
         来自"CPU 在等 ANE/GPU 之前先把另一侧的活排满"。
+
+        `prefix` 非 0 时还会省掉最后一层的死瓦片（S3，见下面的注释）：出货口径
+        （T=16884 / P=16384）那个形状上，最后一层有 4/5 的瓦片整段落在前缀里。
         """
         if not 0 <= prefix <= length <= self._width:
             raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
@@ -178,6 +188,17 @@ class MudePipeline:
         self._chunks_list = list(self._chunks(length))
         self._length = int(length)
         self._prefix = int(prefix)
+        # S3（旧引擎的 `LASTDEAD`，`docs/ANE/anebench/e8_a3.py:291-302`）：模型最后一层里整段落在
+        # 公共前缀中的瓦片只欠 K/V —— 前缀行的注意力输出与 MLP 输出都没有读者（读出在 query
+        # 行上，K/V 出自投影那一步，不依赖注意力）。所以这些瓦片丢掉第二相（`attn` 与它之后的
+        # `out`/`norm2`/`ffn`/`tail`）。
+        #
+        # 最后一个瓦片永远不丢：`prefix == length` 时读出那一行自己也在前缀里，它就变成读者了。
+        dead = 0
+        if self._skip_dead and prefix > 0 and self._last_is_full:
+            dead = sum(1 for start, n in self._chunks_list if start + n <= prefix)
+            dead = min(dead, len(self._chunks_list) - 1)
+        self._dead = dead
         # 每个全注意力层分两阶段（投影 → 注意力 body），阶段边界就是旧引擎 `prep` 那道屏障。
         self._proj_done = [0] * len(self.buffers)
         self._linear_first = [True] * len(self.buffers)
@@ -265,9 +286,11 @@ class MudePipeline:
                 return              # k/v 还没攒够，body 不能开工
             self._wait(LANE_SMALL)  # 分段投影的 qg/kv 搬运在 lane 1，prep 在 lane 0 上要读它
             self._prep(entry)
-            self._dispatch_attention(entry)   # 一次提交全部瓦片，GPU 从头跑到尾
+            dead = self._dead_tiles(index)
+            self._dispatch_attention(entry, dead)   # 一次提交全部瓦片，GPU 从头跑到尾
             for jj, (body_start, body_n) in enumerate(self._chunks_list):
-                self._body_column(entry, body_start, body_n)
+                if jj >= dead:                      # S3：前缀瓦片没有第二相
+                    self._body_column(entry, body_start, body_n)
                 self._advance(index + 1, jj, self._lookahead)
             return
         self._linear_column(entry, index, start, n, cur)
@@ -303,15 +326,24 @@ class MudePipeline:
                         self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
                         geometry=self._geometry)
 
-    def _dispatch_attention(self, entry: LayerBuffers) -> None:
+    def _dead_tiles(self, index: int) -> int:
+        """这一层有几个瓦片整段落在公共前缀里（S3）；只有模型的最后一层能省。"""
+        return self._dead if index == len(self.buffers) - 1 else 0
+
+    def _dispatch_attention(self, entry: LayerBuffers, dead: int = 0) -> None:
         """把注意力瓦片**一个瓦片一次提交**，GPU 从头到尾连续跑。
 
         `commit` 提交的是当前打开的命令缓冲 —— 若 4 个瓦片只提交一次，它们就落在同一个 CB 里，
         之后 `wait_upto(1)` 会把四个一起等完，交错又退化。一个瓦片一个 CB，才能"只等第 j 个"。
-        注意第一个 CB 里还带着 `_prep` 的两个 dispatch（lane 0 的队列顺序即执行顺序）。
+        第一个**实发**的 CB 里还带着 `_prep` 的两个 dispatch（lane 0 的队列顺序即执行顺序）。
+
+        S3 的死瓦片（`dead`，前 `dead` 个）不在这里提交：它们的注意力没有读者，`k_attn` 也就
+        不该跑。提交数与 `_body_column` 的 `wait_upto(1)` 次数要一一对应，所以两边跳过同一批。
         """
         qg, kv = self._qgkv(entry)
-        for chunk in self._chunks_list:
+        for jj, chunk in enumerate(self._chunks_list):
+            if jj < dead:
+                continue
             self._attention_tile(entry, chunk, qg, kv)
             self._runtime.commit(LANE_LONG)
 

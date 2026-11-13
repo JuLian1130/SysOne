@@ -99,3 +99,47 @@ def test_chunked_bucket_matches_the_single_bucket_run(chains, chunked) -> None:
     segment = chunked.logits(tokens, prefix=0)
     rel = float(np.linalg.norm(segment - once) / np.linalg.norm(once))
     assert rel < 1e-6, f"四段与单段结果不一致：{rel:.4e}"
+
+
+def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> None:
+    """S3：最后一层里整段落在公共前缀中的瓦片只做第一相，结果必须逐位不变。
+
+    桶宽 S/4、满宽 prompt 正好给 4 个瓦片，`prefix = S/4` 让第 0 个瓦片整段落在前缀里。
+    A/B 用 `_skip_dead`：关掉它只是不省那些瓦片，答案不该有任何差别 —— 被跳过的活没有读者
+    （读出在最后一个瓦片里，K/V 出自投影那一步）。另外数一下 `wait_upto` 的次数，确认注意力
+    瓦片真的少收一个；不数的话"答案一致"也可能是因为根本没跳过。
+    """
+    from sysone.devices.apple.metal import LANE_LONG
+
+    tokens = TOKENS * (S // len(TOKENS))
+    prefix = S // 4
+    pipeline = chunked._pipeline
+    assert pipeline is not None
+    runtime = pipeline._runtime
+    counted = {"n": 0}
+    original = runtime.wait_upto
+
+    def counted_wait(lane: int, count: int) -> float:
+        if lane == LANE_LONG:
+            counted["n"] += 1
+        return original(lane, count)
+
+    runtime.wait_upto = counted_wait     # type: ignore[method-assign]
+    try:
+        counted["n"] = 0
+        with_dead = chunked.logits(tokens, prefix=prefix)
+        pumped_with_dead = counted["n"]
+        pipeline._skip_dead = False
+        try:
+            counted["n"] = 0
+            without_dead = chunked.logits(tokens, prefix=prefix)
+            pumped_without_dead = counted["n"]
+        finally:
+            pipeline._skip_dead = True
+    finally:
+        runtime.wait_upto = original   # type: ignore[method-assign]
+
+    assert pumped_with_dead == pumped_without_dead - 1, (
+        f"死瓦片没有少收注意力瓦片：S3 开 {pumped_with_dead} 次、关 {pumped_without_dead} 次"
+    )
+    assert np.array_equal(with_dead, without_dead), "S3 改变了答案（跳过的瓦片不该有读者）"
