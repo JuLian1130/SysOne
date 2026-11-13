@@ -122,9 +122,10 @@ class MudePipeline:
         rt, hidden, width, bucket = self._runtime, self._hidden, self._width, self._bucket
         geom = self._geometry
         self.seed = rt.alloc(2 * hidden * width)
-        # 每层的隐藏态在两张等宽缓冲之间交替；第一层读 `seed`，之后读上一层的输出。
-        self.h_a = rt.alloc(2 * hidden * width)
-        self.h_b = rt.alloc(2 * hidden * width)
+        # 隐藏态只有一张：逐段"读出本段、写回本段"，所以同一张 `[hidden, width]` 当输入又当输出。
+        # 段内所有读（`norm_to`、残差搬运）都在写（`ffn_out` 回填）之前完成，段与段的列不重叠，
+        # 所以就地是安全的；这也是旧引擎 `e8_a1m.py` 的 `w_h` 的做法（它连乒乓缓冲都没有）。
+        self.x = rt.alloc(2 * hidden * width)
         # 注意力的输出，全宽、单通道带（残差不经过这里，见 `_out_and_ffn`）。
         self.attn = rt.alloc(2 * hidden * width)
         # [rows, width] 的 fp16 缓冲：行数来自几何（qg 是 2*q_heads*head_dim，kv 是 2*kv_proj）。
@@ -153,13 +154,15 @@ class MudePipeline:
         view[:] = 0
         view[:, :length] = np.asarray(embed, np.float32).T.astype(np.float16)
         cur: MetalBuffer = self.seed
-        nxt: MetalBuffer = self.h_a
+        nxt: MetalBuffer = self.x
         for entry in self.buffers:
             if entry.role is AttentionRole.FULL:
                 self._full_layer(entry, length, prefix, cur, nxt)
             else:
                 self._linear_layer(entry, length, cur, nxt)
-            cur, nxt = nxt, cur
+            # 从第二层起，输入和输出都是 `x` 本身（就地）；第一层的输入仍是 `seed`。
+            cur = nxt
+            nxt = self.x
             self._sync()
         self._sync()
         self._last = cur
@@ -332,7 +335,7 @@ class MudePipeline:
         for entry in self.buffers:
             entry.free()
         self.buffers.clear()
-        for name in ("seed", "h_a", "h_b", "attn", "qg", "kv", "state", "tail",
+        for name in ("seed", "x", "attn", "qg", "kv", "state", "tail",
                      "gscratch", "attn_scratch", "_cos", "_sin"):
             buffer = getattr(self, name, None)
             if buffer is not None:
