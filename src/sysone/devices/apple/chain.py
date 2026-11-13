@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from itertools import count
 from pathlib import Path
 from typing import Sequence
 
@@ -19,6 +20,10 @@ from ...models.families.mude import CODE_ROWS, ane_layer_weights, normalize_norm
 from ...weights.packing.ane_blob import build as build_blob
 from ...weights.store import SafeTensorFile
 from .compile import S_NATIVE, AneLayer, layer_mil, write_program
+from .metal import MetalRuntime
+from .pipeline import MudePipeline
+
+_CHAIN_IDS = count()
 from .ops import (
     apply_rotary,
     attention,
@@ -87,9 +92,15 @@ class MudeChain:
         linear_heads: int,
         linear_dim: int,
         own_runtime: bool = True,
+        pipeline: object | None = None,
+        own_metal: bool = False,
+        metal_runtime: object | None = None,
     ) -> None:
         self._runtime = runtime
         self._own_runtime = own_runtime
+        self._pipeline = pipeline
+        self._own_metal = own_metal
+        self._metal_runtime = metal_runtime
         self._layers = layers
         self._params = params
         self._roles = roles
@@ -122,11 +133,14 @@ class MudeChain:
         quantize: bool = True,
         scratch_dir: str | Path | None = None,
         runtime: AneRuntime | None = None,
+        metal: bool = False,
     ) -> "MudeChain":
         """编译 20 层程序并从 `model_dir` 读权重。
 
         `device` 目前只有 `"ane"`（这条链就是 ANE 链）；`scratch_dir` 放 MIL/blob 产物，
-        默认在系统临时目录，产物按内容哈希复用。
+        默认在系统临时目录，产物按内容哈希复用。`metal=True` 时额外建一条 GPU 流水线
+        （`MudePipeline`）：norm / 注意力 / GDN 走 Metal 核，中间量全程留在 IOSurface 上，
+        不再经 numpy 中转；此时 `logits()` 不提供逐层 trace。
         """
         if device != "ane":
             raise ValueError(f"mude 链只有 ANE 设备，收到 {device!r}")
@@ -164,8 +178,13 @@ class MudeChain:
         store = SafeTensorFile(root / "model.safetensors")
         scratch = (Path(scratch_dir) if scratch_dir is not None
                    else Path(tempfile.gettempdir()) / "sysone-mude-chain")
+        # dylib 的 program 缓存按名字键，进程内允许多条链共存（对拍时 numpy 与 Metal 各一条），
+        # 所以每条链的 program 名必须带自己的编号。
+        chain_id = next(_CHAIN_IDS)
         own_runtime = runtime is None
         runtime = runtime if runtime is not None else AneRuntime()
+        pipeline = None
+        metal_runtime = None
         layers: list[AneLayer] = []
         try:
             params = [_layer_params(store, index, role) for index, role in enumerate(roles)]
@@ -181,13 +200,23 @@ class MudeChain:
                     s=s,
                     meta={"layer": index, "type": str(role), "cout": cout},
                 )
-                layers.append(AneLayer(runtime, files, name=f"mude_layer_{index}",
+                layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
                                        hidden=hidden, cout=cout, ffn=ffn, s=s))
             final_norm = normalize_norm(store.read("language_model.norm.weight"))
             readout = _readout(root)
             temperature = float(decision.get("temperature", 1.0))
             cos, sin = _rope_table(theta, s, rotary_dim)
+            if metal:
+                metal_runtime = MetalRuntime()
+                pipeline = MudePipeline(
+                    runtime=metal_runtime, layers=layers, roles=roles, params=params,
+                    cos=cos, sin=sin, hidden=hidden, s=s,
+                )
         except BaseException:
+            if pipeline is not None:
+                pipeline.close()
+            if metal_runtime is not None:
+                metal_runtime.close()
             for layer in layers:
                 layer.close()
             if own_runtime:
@@ -201,7 +230,8 @@ class MudeChain:
             readout=readout, temperature=temperature, cos=cos, sin=sin,
             hidden=hidden, s=s, heads=heads, kv_heads=kv_heads, head_dim=head_dim,
             rotary_dim=rotary_dim, linear_heads=linear_heads, linear_dim=linear_dim,
-            own_runtime=own_runtime,
+            own_runtime=own_runtime, pipeline=pipeline,
+            own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
         )
 
     # ------------------------------------------------------------------ 前向
@@ -224,6 +254,14 @@ class MudeChain:
             raise ValueError(f"prompt 长度 {length} 超过链的静态宽度 s={self._s}；用更大的 s 重新 load")
         if not 0 <= prefix <= length:
             raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
+        if self._pipeline is not None:
+            if trace is not None or debug is not None:
+                raise ValueError("Metal 流水线不提供逐层 trace 或 debug（中间量留在面上）",
+                                 hint="用 metal=False 的 numpy 链做逐层对拍")
+            embed = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._s)
+            self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix)
+            final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
+            return self._readout @ final
         x = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._s)
         if trace is not None:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
@@ -332,6 +370,13 @@ class MudeChain:
         if self._closed:
             return
         self._closed = True
+        if self._pipeline is not None:
+            # 先解绑 GPU 侧的包装句柄，再让 AneLayer 释放那六张面。
+            self._pipeline.close()
+            self._pipeline = None
+        if self._own_metal and self._metal_runtime is not None:
+            self._metal_runtime.close()
+            self._metal_runtime = None
         for layer in self._layers:
             layer.close()
         self._layers.clear()

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ...errors import NotReadyError
+from ...errors import NotReadyError, SysOneError
 
 MTL_DYLIB_NAME = "libe8mtl.dylib"
 
@@ -79,11 +79,13 @@ class MetalBuffer:
     所以 host 看得见。
     """
 
-    def __init__(self, runtime: "MetalRuntime", handle: int, nbytes: int, wrapped: bool) -> None:
+    def __init__(self, runtime: "MetalRuntime", handle: int, nbytes: int, wrapped: bool,
+                 surface=None) -> None:
         self._runtime = runtime
         self.handle = int(handle)
         self.nbytes = int(nbytes)
         self.wrapped = wrapped
+        self.surface = surface
 
     @property
     def base(self) -> int:
@@ -101,9 +103,16 @@ class MetalBuffer:
         return view
 
     def free(self) -> None:
-        if self.handle:
+        if not self.handle:
+            return
+        if self.wrapped:
+            # 包装句柄在 dylib 里按 IOSurface 指针做缓存，只能解绑、不能 free，
+            # 否则下一次分配复用同一地址时会拿到一条已释放的句柄。
+            if self.surface is not None:
+                self._runtime.unwind(self.surface)
+        else:
             self._runtime.lib.e8m_free(self.handle)
-            self.handle = 0
+        self.handle = 0
 
     def __enter__(self) -> "MetalBuffer":
         return self
@@ -116,7 +125,28 @@ class MetalBuffer:
 
 
 class MetalRuntime:
-    """设备 + 命令队列 + 编译好的 kernel 库。一个进程一份，由 ApplePlatform 持有。"""
+    """设备 + 命令队列 + 编译好的 kernel 库。一个进程一份，由 ApplePlatform 持有。
+
+    **必须共享**：`e8m_init_src` 会重建 dylib 内部的命令队列与 pipeline 状态，第二次调用之后
+    之前那次发出的 dispatch 就再也到不了 GPU（实测第二个运行时建出的链输出全零）。所以这里
+    按进程缓存，后来的构造返回同一个对象（`tests/integration/test_metal_chain.py` 的两个用例
+    会各建一条链，正是踩这个坑才发现的）。
+    """
+
+    _shared: "MetalRuntime | None" = None
+
+    def __new__(
+        cls,
+        path: str | os.PathLike | None = None,
+        sources_dir: str | os.PathLike | None = None,
+        *,
+        verbose: bool = False,
+    ) -> "MetalRuntime":
+        if cls._shared is not None:
+            return cls._shared
+        self = super().__new__(cls)
+        cls._shared = self
+        return self
 
     def __init__(
         self,
@@ -125,10 +155,13 @@ class MetalRuntime:
         *,
         verbose: bool = False,
     ) -> None:
+        if getattr(self, "_ready", False):
+            return
         if sys.platform != "darwin":
             raise NotReadyError("Metal 运行时只在 macOS 上可用", platform=sys.platform)
         dylib = _dylib_path(path)
         if not dylib.is_file():
+            MetalRuntime._shared = None
             raise NotReadyError(
                 "找不到 libe8mtl.dylib",
                 path=str(dylib),
@@ -136,8 +169,13 @@ class MetalRuntime:
             )
         self.path = dylib
         self.lib = ctypes.CDLL(str(dylib))
-        self._bind()
-        self._compile(_sources_dir(sources_dir), verbose=verbose)
+        try:
+            self._bind()
+            self._compile(_sources_dir(sources_dir), verbose=verbose)
+        except SysOneError:
+            MetalRuntime._shared = None  # 初始化失败就别缓存，下次还能重试
+            raise
+        self._ready = True
 
     # -- 绑定 ----------------------------------------------------------------
     def _bind(self) -> None:
@@ -203,7 +241,8 @@ class MetalRuntime:
         handle = int(self.lib.e8m_wrap(int(surface.handle)))
         if handle == 0:
             raise NotReadyError("包装 IOSurface 失败", reason=self.error(), surface=int(surface.handle))
-        return MetalBuffer(self, handle, int(self.lib.e8m_bytes(handle)), wrapped=True)
+        return MetalBuffer(self, handle, int(self.lib.e8m_bytes(handle)), wrapped=True,
+                           surface=surface)
 
     def unwind(self, surface) -> None:
         """surface 释放前必须调用：包装缓存按 IOSurface 指针键，地址会被下一次分配复用。"""
@@ -266,8 +305,9 @@ class MetalRuntime:
         return "" if raw is None else raw.decode(errors="replace")
 
     def close(self) -> None:
-        # dylib 的生命周期跟进程一样；这里只把引用放开，方便测试重复初始化。
-        self.lib = None  # type: ignore[assignment]
+        # dylib 的生命周期跟进程一样，而且重复初始化会清掉命令队列（见类 docstring），
+        # 所以这里什么都不做：运行时按进程共享，调用方随时可以再拿到同一个对象。
+        return None
 
 
 def available(e8_dir: str | os.PathLike | None = None) -> bool:

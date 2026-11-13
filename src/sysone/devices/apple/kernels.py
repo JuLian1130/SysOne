@@ -184,6 +184,7 @@ def copy_columns(
 def norm_to(
     runtime: MetalRuntime,
     src: MetalBuffer,
+    weight: MetalBuffer,
     dst: MetalBuffer,
     *,
     stile: int,
@@ -195,11 +196,14 @@ def norm_to(
     dst_stride: int = 0,
     dst_s0: int = 0,
 ) -> None:
-    """`k_norm_to`：对 `src` 的每一列做（零中心 +1 之后的）RMSNorm，写进 `dst`。"""
+    """`k_norm_to`：对 `src` 的每一列做 RMSNorm（`weight` 已在装配时补过 +1），写进 `dst`。
+
+    核是三个缓冲 `[src, weight, dst]` —— 少了 `weight` 这一格 ANE 会读到空 buffer。
+    """
     grid, tg = _norm_grid(stile)
     runtime.dispatch(
         "k_norm_to",
-        [src, dst],
+        [src, weight, dst],
         args=nrm_args(
             stile=stile,
             s0=s0,
@@ -218,6 +222,7 @@ def norm_to(
 def norm_residual(
     runtime: MetalRuntime,
     src: MetalBuffer,
+    weight: MetalBuffer,
     dst: MetalBuffer,
     *,
     stile: int,
@@ -227,11 +232,14 @@ def norm_residual(
     dst_stride: int = 0,
     dst_s0: int = 0,
 ) -> None:
-    """`k_norm_resid`：`dst = [rmsnorm(src) | src]`（两半各 HID 通道，正是 ANE 的 ffn 入口）。"""
+    """`k_norm_resid`：`dst = [rmsnorm(src) | src]`（两半各 HID 通道，正是 ANE 的 ffn 入口）。
+
+    与 `k_norm_to` 一样是三个缓冲 `[src, weight, dst]`：漏掉中间那格 ANE 会读到空 buffer。
+    """
     grid, tg = _norm_grid(stile)
     runtime.dispatch(
         "k_norm_resid",
-        [src, dst],
+        [src, weight, dst],
         args=nrm_args(
             stile=stile,
             s0=s0,

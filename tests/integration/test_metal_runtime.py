@@ -113,3 +113,17 @@ def test_wraps_an_ane_surface_without_copying():
     surface.free()
     ane.close()
     runtime.close()
+
+
+def test_runtime_is_shared_per_process():
+    """同一个进程只能初始化一次：第二次 `e8m_init_src` 会重建命令队列，之后的 dispatch 静默失效。
+
+    这条是在 `test_metal_chain.py` 的两个用例里暴露的（第一个过、第二个输出全零），所以把它
+    钉在这里，免得以后又把 `close()` 写成"把引用放开、下次重建"。
+    """
+    first = _runtime()
+    second = MetalRuntime()
+    assert first is second
+    assert second.lib is not None
+    second.close()
+    assert MetalRuntime() is first, "close() 之后仍应复用同一份运行时"

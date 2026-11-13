@@ -381,6 +381,15 @@ class AneLayer:
             self.close()
             raise
 
+    @property
+    def surfaces(self) -> dict[str, Surface]:
+        """六张 IOSurface（`proj_in` / `proj_out` / `out_in` / `out_out` / `ffn_in` / `ffn_out`）。
+
+        Metal 侧要直接 wrap 这几张面做零拷贝：GPU 读 ANE 刚写过的面、写 ANE 下一步要读的
+        面，中间不该经过 numpy。给出去的是**同一批对象**，调用方不许释放。
+        """
+        return self._surfaces
+
     def _write(self, key: str, items: int, x: np.ndarray) -> None:
         view = self._surfaces[key].array(np.float16, (1, items, 1, self.s))
         view[...] = np.asarray(x, dtype=np.float16).reshape(1, items, 1, self.s)
@@ -396,6 +405,14 @@ class AneLayer:
                                 reason=self._runtime.error())
         out_key = f"{proc}_out"
         return self._read(out_key, cout), ms
+
+    def eval_proc(self, proc: str) -> float:
+        """只执行一个 procedure，不读回结果（流水线里结果留在面上给 GPU 核用）。"""
+        ms = self._runtime.eval(self.name, PROCS[proc])
+        if ms < 0:
+            raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc,
+                                reason=self._runtime.error())
+        return ms
 
     def project(self, x: np.ndarray) -> tuple[np.ndarray, float]:
         """`[hidden, s]` → `[cout, s]`。"""
