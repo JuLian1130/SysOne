@@ -54,6 +54,17 @@ def chains():
         cpu.close()
 
 
+@pytest.fixture(scope="module")
+def chunked():
+    """桶宽只有 S/4 的链：同一个 256 列的缓冲要分四段算，用来钉住"桶宽 / 缓冲宽"这条分界。"""
+    MudeChain = _chains()
+    chain = MudeChain.load(MUDE, s=S // 4, width=S, metal=True)
+    try:
+        yield chain
+    finally:
+        chain.close()
+
+
 @pytest.mark.parametrize("prefix", PREFIXES)
 def test_metal_chain_matches_the_numpy_chain(chains, prefix: int) -> None:
     cpu, gpu = chains
@@ -72,3 +83,19 @@ def test_metal_chain_keeps_the_last_layer_hidden_in_range(chains) -> None:
     ref = np.asarray(trace[-1], np.float32)
     rel = float(np.linalg.norm(last - ref) / np.linalg.norm(ref))
     assert rel < 5e-2, f"末层 hidden 偏差 {rel:.4e}"
+
+
+def test_chunked_bucket_matches_the_single_bucket_run(chains, chunked) -> None:
+    """桶宽 S/4（四段）与桶宽 S（一段）跑同一个满宽 prompt，结果应逐位相同。
+
+    这条用例专门钉住 `GdnArgs.Stile` 的双重身份：它既是列界也是通道步长
+    （`shaders/e8_gdn.metal:332-360` 的 `proj[c*Stile + j]`），传成"本段有效列数"会让短
+    prompt 全错而满桶恰好正确 —— 见 `docs/sysone/plan.md` 的 M2.2 第 4 片 B。
+    """
+    _, gpu = chains
+    tokens = TOKENS * (S // len(TOKENS))  # 正好填满 256 列的缓冲
+    assert len(tokens) == S
+    once = gpu.logits(tokens, prefix=0)
+    segment = chunked.logits(tokens, prefix=0)
+    rel = float(np.linalg.norm(segment - once) / np.linalg.norm(once))
+    assert rel < 1e-6, f"四段与单段结果不一致：{rel:.4e}"

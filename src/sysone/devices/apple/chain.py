@@ -85,6 +85,7 @@ class MudeChain:
         sin: np.ndarray,
         hidden: int,
         s: int,
+        width: int,
         heads: int,
         kv_heads: int,
         head_dim: int,
@@ -113,6 +114,8 @@ class MudeChain:
         self._sin = sin
         self._hidden = int(hidden)
         self._s = int(s)
+        # GPU 侧缓冲的列数（= 一轮要算的 token 总数）；numpy 链把它当画布宽度用。
+        self._width = int(width)
         self._heads = int(heads)
         self._kv_heads = int(kv_heads)
         self._head_dim = int(head_dim)
@@ -130,6 +133,7 @@ class MudeChain:
         *,
         device: str = "ane",
         s: int = S_NATIVE,
+        width: int | None = None,
         quantize: bool = True,
         scratch_dir: str | Path | None = None,
         runtime: AneRuntime | None = None,
@@ -141,6 +145,10 @@ class MudeChain:
         默认在系统临时目录，产物按内容哈希复用。`metal=True` 时额外建一条 GPU 流水线
         （`MudePipeline`）：norm / 注意力 / GDN 走 Metal 核，中间量全程留在 IOSurface 上，
         不再经 numpy 中转；此时 `logits()` 不提供逐层 trace。
+
+        `s` 是 ANE program 的列数（桶宽，受 program 的 S 上限约束）；`width` 是 GPU 侧缓冲
+        的列数，默认等于 `s`（一桶跑完），16k 这类长序列要 `width = 16384, s = 4096`
+        （四段 ANE、注意力一次看 16k 键）。
         """
         if device != "ane":
             raise ValueError(f"mude 链只有 ANE 设备，收到 {device!r}")
@@ -174,6 +182,9 @@ class MudeChain:
         ]
         if len(roles) != int(text["num_hidden_layers"]):
             raise ValueError("layer_types 数量与 num_hidden_layers 不一致")
+        width = int(s if width is None else width)
+        if width < s:
+            raise ValueError(f"缓冲宽度 {width} 小于桶宽 {s}：桶不能跨在缓冲之外")
 
         store = SafeTensorFile(root / "model.safetensors")
         scratch = (Path(scratch_dir) if scratch_dir is not None
@@ -205,12 +216,12 @@ class MudeChain:
             final_norm = normalize_norm(store.read("language_model.norm.weight"))
             readout = _readout(root)
             temperature = float(decision.get("temperature", 1.0))
-            cos, sin = _rope_table(theta, s, rotary_dim)
+            cos, sin = _rope_table(theta, width, rotary_dim)
             if metal:
                 metal_runtime = MetalRuntime()
                 pipeline = MudePipeline(
                     runtime=metal_runtime, layers=layers, roles=roles, params=params,
-                    cos=cos, sin=sin, hidden=hidden, s=s,
+                    cos=cos, sin=sin, hidden=hidden, bucket=s, width=width,
                 )
         except BaseException:
             if pipeline is not None:
@@ -228,7 +239,7 @@ class MudeChain:
             runtime=runtime, layers=layers, params=params, roles=roles, store=store,
             embed_name="language_model.embed_tokens.weight", final_norm=final_norm,
             readout=readout, temperature=temperature, cos=cos, sin=sin,
-            hidden=hidden, s=s, heads=heads, kv_heads=kv_heads, head_dim=head_dim,
+            hidden=hidden, s=s, width=width, heads=heads, kv_heads=kv_heads, head_dim=head_dim,
             rotary_dim=rotary_dim, linear_heads=linear_heads, linear_dim=linear_dim,
             own_runtime=own_runtime, pipeline=pipeline,
             own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
@@ -250,19 +261,22 @@ class MudeChain:
         length = int(ids.size)
         if length == 0:
             raise ValueError("prompt 至少要有一个 token")
-        if length > self._s:
-            raise ValueError(f"prompt 长度 {length} 超过链的静态宽度 s={self._s}；用更大的 s 重新 load")
+        if length > self._width:
+            raise ValueError(
+                f"prompt 长度 {length} 超过链的缓冲宽度 width={self._width}；"
+                "用更大的 width 重新 load")
         if not 0 <= prefix <= length:
             raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
         if self._pipeline is not None:
             if trace is not None or debug is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace 或 debug（中间量留在面上）",
                                  hint="用 metal=False 的 numpy 链做逐层对拍")
-            embed = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._s)
+            embed = _place(self._store.read_rows(self._embed_name, ids), self._hidden,
+                           self._width)
             self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix)
             final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
             return self._readout @ final
-        x = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._s)
+        x = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._width)
         if trace is not None:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
             # 任何一层跑偏都能定位到该层本身而不是前一层。
