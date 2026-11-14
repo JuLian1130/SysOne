@@ -143,6 +143,9 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     const ulong sp  = a.Stile;
     const int   St  = int(a.cols ? a.cols : a.Stile);
     const int   t0  = int(tgid.y) * E8G_TB;
+    // Ticket 10: a batched tail pass runs one slot per dispatch, so every read of the source
+    // surface is at `a.s0 + <tile-local column>`; 0 is the old single-state call.
+    const uint  so  = a.s0;
     if (t0 >= St) return;
 
     threadgroup float red[2 * E8G_TB][8];      // per-token sumq (rows 0..TB-1), sumk (TB..)
@@ -167,9 +170,9 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     for (int i = 0; i < 3; i++) {
         int tc = t0 - 3 + i;
         if (tc >= 0) {
-            rq[i] = float(proj[(ulong)cq * sp + (ulong)tc]);
-            rk[i] = float(proj[(ulong)ck * sp + (ulong)tc]);
-            rv[i] = float(proj[(ulong)cv * sp + (ulong)tc]);
+            rq[i] = float(proj[(ulong)cq * sp + (ulong)so + (ulong)tc]);
+            rk[i] = float(proj[(ulong)ck * sp + (ulong)so + (ulong)tc]);
+            rv[i] = float(proj[(ulong)cv * sp + (ulong)so + (ulong)tc]);
         } else if (a.first) {
             rq[i] = 0.0f; rk[i] = 0.0f; rv[i] = 0.0f;
         } else {
@@ -179,10 +182,13 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
             rv[i] = float(tail[(ulong)cv * 3u + ti]);
         }
     }
-    if ((sp & 7ul) == 0ul && t0 + E8G_TB <= St) {
-        vec<half, 8> hq = *(device const vec<half, 8> *)(proj + (ulong)cq * sp + (ulong)t0);
-        vec<half, 8> hk = *(device const vec<half, 8> *)(proj + (ulong)ck * sp + (ulong)t0);
-        vec<half, 8> hv = *(device const vec<half, 8> *)(proj + (ulong)cv * sp + (ulong)t0);
+    if ((sp & 7ul) == 0ul && (so & 7u) == 0u && t0 + E8G_TB <= St) {
+        vec<half, 8> hq = *(device const vec<half, 8> *)(proj + (ulong)cq * sp + (ulong)so
+                                                        + (ulong)t0);
+        vec<half, 8> hk = *(device const vec<half, 8> *)(proj + (ulong)ck * sp + (ulong)so
+                                                        + (ulong)t0);
+        vec<half, 8> hv = *(device const vec<half, 8> *)(proj + (ulong)cv * sp + (ulong)so
+                                                        + (ulong)t0);
         #pragma unroll
         for (int i = 0; i < E8G_TB; i++) {
             rq[i + 3] = float(hq[i]); rk[i + 3] = float(hk[i]); rv[i + 3] = float(hv[i]);
@@ -191,9 +197,9 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
         #pragma unroll
         for (int i = 0; i < E8G_TB; i++) {
             int tc = min(t0 + i, St - 1);
-            rq[i + 3] = float(proj[(ulong)cq * sp + (ulong)tc]);
-            rk[i + 3] = float(proj[(ulong)ck * sp + (ulong)tc]);
-            rv[i + 3] = float(proj[(ulong)cv * sp + (ulong)tc]);
+            rq[i + 3] = float(proj[(ulong)cq * sp + (ulong)so + (ulong)tc]);
+            rk[i + 3] = float(proj[(ulong)ck * sp + (ulong)so + (ulong)tc]);
+            rv[i + 3] = float(proj[(ulong)cv * sp + (ulong)so + (ulong)tc]);
         }
     }
 
@@ -218,8 +224,10 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
         if (tid >= 64u && tid < 64u + (uint)E8G_TB) {          // one thread per token: gate
             uint tokn = tid - 64u;
             int  tc = min(t0 + int(tokn), St - 1);
-            float av = float(proj[((ulong)(E8_COUT_GDN - 16u) + h) * sp + (ulong)tc]);
-            float bv = float(proj[((ulong)(E8_COUT_GDN - 32u) + h) * sp + (ulong)tc]);
+            float av = float(proj[((ulong)(E8_COUT_GDN - 16u) + h) * sp + (ulong)so
+                                  + (ulong)tc]);
+            float bv = float(proj[((ulong)(E8_COUT_GDN - 32u) + h) * sp + (ulong)so
+                                  + (ulong)tc]);
             tg_gt[tokn] = exp(-exp(A_log[h]) * e8_softplus0(av + dtb[h]));
             tg_bt[tokn] = 1.0f / (1.0f + exp(-bv));
         }
@@ -242,7 +250,7 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     for (int i = 0; i < E8G_TB; i++) {
         int t = t0 + i;
         if (t < St) {
-            ulong row = (ulong)t * E8G_S_ROW;
+            ulong row = (ulong)(so + t) * E8G_S_ROW;
             scr[row + E8G_S_QN + cq] = half(float(cq8[i]) * sc[i]);
             scr[row + E8G_S_KN + cq] = half(float(ck8[i]) * sc[E8G_TB + i]);
             scr[row + E8G_S_V  + cq] = cv8[i];
@@ -251,7 +259,7 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     if (tid < (uint)E8G_TB) {
         int t = t0 + int(tid);
         if (t < St) {
-            ulong row = (ulong)t * E8G_S_ROW;
+            ulong row = (ulong)(so + t) * E8G_S_ROW;
             scr[row + E8G_S_G + h]    = half(tg_gt[tid]);
             scr[row + E8G_S_BETA + h] = half(tg_bt[tid]);
         }
@@ -294,6 +302,7 @@ kernel void k_gdn_tail(device const half  *proj   [[buffer(0)]],
     const uint h   = tgid.x;
     const ulong sp = a.Stile;
     const uint  ncol = a.cols ? a.cols : a.Stile;
+    const uint  so   = a.s0;
     if (ncol < 3u || h >= (uint)E8_L_HEADS || tid >= (uint)E8G_D) return;
     const uint cq = h * E8G_D + tid;
     const uint ck = E8_HID + cq;
@@ -301,9 +310,9 @@ kernel void k_gdn_tail(device const half  *proj   [[buffer(0)]],
     const ulong c0 = (ulong)(ncol - 3u);
     #pragma unroll
     for (int k = 0; k < 3; k++) {
-        tail[(ulong)cq * 3u + (uint)k] = proj[(ulong)cq * sp + c0 + (ulong)k];
-        tail[(ulong)ck * 3u + (uint)k] = proj[(ulong)ck * sp + c0 + (ulong)k];
-        tail[(ulong)cv * 3u + (uint)k] = proj[(ulong)cv * sp + c0 + (ulong)k];
+        tail[(ulong)cq * 3u + (uint)k] = proj[(ulong)cq * sp + so + c0 + (ulong)k];
+        tail[(ulong)ck * 3u + (uint)k] = proj[(ulong)ck * sp + so + c0 + (ulong)k];
+        tail[(ulong)cv * 3u + (uint)k] = proj[(ulong)cv * sp + so + c0 + (ulong)k];
     }
 }
 
@@ -349,12 +358,13 @@ kernel void k_gdn(device const half  *proj   [[buffer(0)]],
         S[i + 0] = t.x; S[i + 1] = t.y; S[i + 2] = t.z; S[i + 3] = t.w;
     }
     const int   St    = int(a.cols ? a.cols : a.Stile);
+    const uint  so    = a.s0;                        // ticket 10: first source column
     const ulong qbase = E8G_S_QN + h * E8G_D + tq;   // this lane's 32 qn halves within a row
     const ulong kbase = E8G_S_KN + h * E8G_D + tq;
     const ulong vbase = E8G_S_V  + h * E8G_D + dv;
 
     for (int j = 0; j < St; j++) {
-        const ulong row  = (ulong)j * E8G_S_ROW;
+        const ulong row  = (ulong)(so + j) * E8G_S_ROW;
         const float g    = float(scr[row + E8G_S_G + h]);
         const float beta = float(scr[row + E8G_S_BETA + h]);
         const float vv   = float(scr[row + vbase]);
@@ -442,7 +452,8 @@ kernel void k_gdn_norm(device const half  *proj   [[buffer(0)]],
     const uint  dv  = lane * 4u;
     const ulong off = (ulong)(h * E8G_D + dv) * osp + os0 + (ulong)s;
     device half *o = out + off;
-    device const half *z = proj + (ulong)(E8_FFN + h * E8G_D + dv) * sp + (ulong)s;
+    device const half *z = proj + (ulong)(E8_FFN + h * E8G_D + dv) * sp + (ulong)a.s0
+                                + (ulong)s;
     float y[4];
     float sq = 0.0f;
     #pragma unroll

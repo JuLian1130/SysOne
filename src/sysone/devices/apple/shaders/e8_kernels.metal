@@ -218,7 +218,10 @@ kernel void k_q_prep(device half        *qg     [[buffer(0)]],
     // one, the slots' rows are the same requests' rows at their own positions (e8_fold).
     // A1: `qg` may be a K-slot ring, so the column a query lives at is not its position --
     // `pos0` is how far the ring slot base sits behind the tile's first token.
-    const uint p = a.pos0 + e8_fold(a.nka, a.segw, s);
+    // Ticket 10: fold the *absolute* column.  Folding the ring column first would put a slot's
+    // first row at `pos0 + slot_offset` instead of at `prefix`.  `segw == 0` keeps both forms
+    // identical (`e8_fold` then returns its argument), so no pre-existing caller moves.
+    const uint p = e8_fold(a.nka, a.segw, a.pos0 + s);
     threadgroup float qn[E8_HEAD_DIM];
     threadgroup float red[8];
     device half *base = qg + (ulong)(h * 2u * D) * a.src_stride;
@@ -253,7 +256,7 @@ kernel void k_kv_prep(device half        *kv     [[buffer(0)]],
     const uint t = a.s0 + tgid.x, j = tgid.y, D = E8_HEAD_DIM, tid = tid2.x;
     // S6: rope position, not the slot column.  A1：kv 是整窗缓存，`pos0` 恒为 0（留在这里只是
     // 让两条 prep 核的写法一致）。
-    const uint p = a.pos0 + e8_fold(a.nka, a.segw, t);
+    const uint p = e8_fold(a.nka, a.segw, a.pos0 + t);   // ticket 10: fold the absolute column
     threadgroup float kn[E8_HEAD_DIM];
     threadgroup float red[8];
     device half *base = kv + (ulong)(j * D) * a.src_stride;

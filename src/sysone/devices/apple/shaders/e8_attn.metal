@@ -412,10 +412,23 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     // so a threadgroup is always inside one slot.  `segw` = 0 gives nka = nkc = nk, nkb = 0, i.e.
     // the single bound every pre-S6 caller passes.
     const uint nka  = a.segw ? a.nka : nk;
-    const uint qpos = a.s0 + j0;                        // first query column of this threadgroup
-    const uint slot = (a.segw && qpos > nka) ? (qpos - nka) / a.segw : 0u;
+    // Ticket 10: the slot index needs the *sequence* column.  Once qg is a ring (A1), `s0` is the
+    // ring column and not the position, so a batched tail pass passes `qseq`; every single-buffer
+    // caller leaves it 0 and keeps the old `s0` meaning.
+    const uint qpos = (a.segw && a.qseq ? a.qseq : a.s0) + j0;      // first query column here
+    const uint slot = (a.segw && qpos >= nka) ? (qpos - nka) / a.segw : 0u;
     const uint nkb  = a.segw ? nka + slot * a.segw : 0u;            // first key of the own slot
-    const uint nkc  = a.segw ? min(nkb + a.nkw, T) : nk;            // one past its last key
+    // Ticket 10: per-slot row count.  Equal-length tails could still use the single `nkw`; the
+    // table is non-zero exactly when a request's questions differ.  `rel` is this slot's index
+    // *within the dispatch* and the host aligns every dispatch to a slot boundary, so the table
+    // stays 8 entries wide however many slots the pass has.
+    uint cnt = a.nkw;
+    if (a.segw && (a.nkw0 | a.nkw1 | a.nkw2 | a.nkw3)) {
+        const uint rel  = min((a.qseq ? qpos - a.qseq : qpos) / a.segw, 7u);
+        const uint word = rel < 2u ? a.nkw0 : rel < 4u ? a.nkw1 : rel < 6u ? a.nkw2 : a.nkw3;
+        cnt = (word >> ((rel & 1u) * 16u)) & 0xFFFFu;
+    }
+    const uint nkc  = a.segw ? min(nkb + cnt, T) : nk;              // one past its last key
     const uint kvh = head / uint(E8_Q_HEADS / E8_KV_HEADS);
     const float K1 = a.scale * AT_LOG2E;                // score -> base-2 logit
 

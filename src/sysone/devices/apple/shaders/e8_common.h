@@ -140,6 +140,17 @@ struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIII" -> 48 bytes
     // layout (stride = Stile, offset = 0).
     uint  out_stride;      // 10 columns per channel in out; 0 = Stile
     uint  out_s0;          // 11 output column offset inside out
+    // Batch-tails (ticket 10): the slot rule above assumes one `nkw` for the whole tile, which
+    // forces equal-length tails.  A request's questions are not equal, and the tail mask is
+    // bidirectional (padding rows would be visible), so the per-slot row count arrives as a
+    // table instead: 8 slots x 16 bit, low slot in `nkw0`'s low half.  `qseq` is the sequence
+    // column of this call's first query row -- `s0` is the qg ring column and is not the position
+    // once qg is a ring (A1), so the slot index has to come from a separate field.
+    uint  qseq;            // 12 first query row's *sequence* column (0 = use s0)
+    uint  nkw0;            // 13 slots 0,1    (16 bit each)
+    uint  nkw1;            // 14 slots 2,3
+    uint  nkw2;            // 15 slots 4,5
+    uint  nkw3;            // 16 slots 6,7
 };
 
 struct GdnArgs {           // e8_mtl.py: "<IIIIfIII" -> 32 bytes

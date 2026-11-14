@@ -118,13 +118,19 @@ def test_argument_structs_match_the_c_header() -> None:
     """CPU-only：结构体字段顺序/宽度就是与 `e8_common.h` 的契约。"""
     assert kernels._NRM.size == 36          # A1（票据 06）在尾部加了 `pos0`
     assert kernels._COPY.size == 32
-    assert kernels._ATTN.size == 48
+    assert kernels._ATTN.size == 68         # 批尾巴（票据 10）在尾部加了 qseq + 4 个 16-bit 表
     assert kernels._GDN.size == 32          # 共享前缀在尾部加了 `cols`（真实列数）
     args = kernels.nrm_args(stile=8, s0=2, src_stride=64, eps=1e-6, pos0=96)
     assert kernels._NRM.unpack(args) == (8, 2, 64, pytest.approx(1e-6), 0, 0, 0, 0, 96)
     assert kernels._ATTN.unpack(kernels.attn_args(T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8,
                                                   qgT=16)) == (
-        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 16, 0, 0,
+        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0,
+    )
+    # 8 个槽位的表：低槽位在 `nkw0` 的低 16 位
+    assert kernels._ATTN.unpack(kernels.attn_args(
+        T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8, nka=1024, segw=128, qseq=1024,
+        nkw_slots=[60, 63, 66, 69, 72, 75, 80, 90]))[12:] == (
+        1024, 60 | (63 << 16), 66 | (69 << 16), 72 | (75 << 16), 80 | (90 << 16),
     )
     assert kernels._GDN.unpack(kernels.gdn_args(stile=4, s0=0, T=4, first=True, eps=1e-6))[:4] == (
         4, 0, 4, 1,

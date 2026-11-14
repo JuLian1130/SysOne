@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 
 from ...errors import NotReadyError
 from .geometry import Geometry, mude_geometry
@@ -56,7 +57,7 @@ HEAD_SCALE = GEOMETRY.head_scale  # attention 的 1/sqrt(head_dim)
 # ---- 参数结构体（与 e8_common.h 一一对应，单位是字节数）-------------------------------
 _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
-_ATTN = struct.Struct("<IIIfIIIIIIII")  # struct AttnArgs，48 B
+_ATTN = struct.Struct("<IIIfIIIIIIIIIIIII")  # struct AttnArgs，68 B
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
 
 
@@ -105,6 +106,8 @@ def attn_args(
     nka: int = 0,
     segw: int = 0,
     nkw: int = 0,
+    nkw_slots: Sequence[int] | None = None,
+    qseq: int = 0,
     qgT: int = 0,
     out_stride: int = 0,
     out_s0: int = 0,
@@ -115,8 +118,16 @@ def attn_args(
     causal 传 `s0+j` 对应的位置、`noncausal_full` 传全长、`prefix_noncausal` 的前缀窗传 P。
     `nka`/`segw`/`nkw` 是"一批 tail 共享一个 prefix"的槽位（S6/S7 的批量形态），单请求传 0。
     """
+    # 批尾巴（票据 10）：8 个槽位的可见行数，每项 16 bit。`nkw_slots` 缺省时表全 0，
+    # 核退回"一个 `nkw` 管整片"的老规则。
+    words = [0, 0, 0, 0]
+    for index, count in enumerate(nkw_slots or ()):
+        if index >= 8:
+            break
+        words[index >> 1] |= (min(int(count), 0xFFFF) & 0xFFFF) << ((index & 1) * 16)
     return _ATTN.pack(
-        T, stile, s0, scale, nk, nq, nka, segw, nkw, qgT, out_stride, out_s0
+        T, stile, s0, scale, nk, nq, nka, segw, nkw, qgT, out_stride, out_s0,
+        qseq, words[0], words[1], words[2], words[3],
     )
 
 
@@ -390,6 +401,8 @@ def attention(
     nka: int = 0,
     segw: int = 0,
     nkw: int = 0,
+    nkw_slots: Sequence[int] | None = None,
+    qseq: int = 0,
     out_stride: int = 0,
     out_s0: int = 0,
     fast: bool = True,
@@ -428,6 +441,8 @@ def attention(
             nka=nka,
             segw=segw,
             nkw=nkw,
+            nkw_slots=nkw_slots,
+            qseq=qseq,
             qgT=qgT,
             out_stride=out_stride,
             out_s0=out_s0,

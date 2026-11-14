@@ -66,6 +66,20 @@ def chunked():
 
 
 @pytest.fixture(scope="module")
+def packed():
+    """批尾巴（票据 10）用的链：前缀落在桶边界（256），宽缓冲留出打包区（2 桶 = 512 列）。
+
+    槽宽 128（尾巴 ≤ 128 token）、每桶 2 格，所以四条尾巴正好一个桶、两条桶的打包区。
+    """
+    MudeChain = _chains()
+    chain = MudeChain.load(MUDE, s=S, width=S + 2 * S, metal=True)
+    try:
+        yield chain
+    finally:
+        chain.close()
+
+
+@pytest.fixture(scope="module")
 def windowed():
     """带待命窗口（`--W 4`）的桶 64 链：共享前缀的按块形状必须能在换窗里跑完。"""
     MudeChain = _chains()
@@ -252,6 +266,20 @@ def test_forward_shared_matches_per_question_passes_on_a_single_tile(chains) -> 
 def test_forward_shared_on_a_chunked_chain(chunked) -> None:
     """桶 64 的链：前缀跨两段、尾巴从非桶对齐的位置起（`_chunks_from` 的那条路）。"""
     _shared_vs_single(chunked, 70, (3, 9, 5))
+
+
+def test_batched_tails_match_per_question_passes(packed) -> None:
+    """四条等长尾巴塞进一个桶：每格一份状态与前缀末状态，答案与逐题整趟相同。
+
+    实测这几条用例逐位相同（`max|d| == 0`），这里仍按仓库既有的 `SHARED_TOL` 守，
+    因为票据 07 记着一条未查到根因的 fp16 漂移。
+    """
+    _shared_vs_single(packed, 256, (60, 60, 60, 60))
+
+
+def test_batched_tails_with_unequal_lengths(packed) -> None:
+    """四条不等长尾巴：按槽位的可行数表让短的看不见邻居与自己的 padding 行。"""
+    _shared_vs_single(packed, 256, (60, 63, 66, 69))
 
 
 def test_forward_shared_under_a_resident_window(windowed) -> None:
