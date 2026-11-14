@@ -145,39 +145,34 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
     桶宽 S/4、满宽 prompt 正好给 4 个瓦片，`prefix = S/4` 让第 0 个瓦片整段落在前缀里。
 
     这条用例拿**第一次** `logits()` 比，不预热。分块链的首趟曾经与后续不同（对 numpy 链
-    `relL2 1.47e-1`，pass2 起 `1.31e-3`）：`proj` 的 ANE 写不在任何一条 lane 上，而读同一张
+    `relL2 1.47e-1`，pass2 起 `1.31e-3`）：投影的 ANE 写不在任何一条 lane 上，而读同一张
     `proj_out` 的 `gather` 在 lane 0 —— 首趟拷贝冷页慢，写就把上一片的读盖掉了。修法是在
-    `proj` 发射前也等到同一槽位上一片 `gather` 的 CB（见 `pipeline._issue`，票据 02）。
+    投影发射前也等到同一槽位上一片 `gather` 的 CB（见 `pipeline._issue`，票据 02/06）。
 
     量两件事：**出货形态（双链 + S3 开）与单链全量计算逐位相同**，以及 **S3 真的少发了一片
-    注意力**（数 `wait_upto` 的 lane 0 次数，不数的话"答案一致"也可能是因为根本没跳过）。
-    票据 01 原先把 `_skip_dead = False`（双链）那臂记成"坏参照"——那一臂其实是该进程的
-    第一次运行，票据已据此改写。
+    注意力**（直接数 `_step_attn` 被编码的次数 —— 数 lane 0 的 `wait_upto` 次数在拆投影之后
+    不再一一对应，因为死瓦片丢的是整段第二相、不止一片注意力）。
     """
-    from sysone.devices.apple.metal import LANE_LONG
-
     tokens = TOKENS * (S // len(TOKENS))
     prefix = S // 4
     pipeline = chunked._pipeline
     assert pipeline is not None
-    runtime = pipeline._runtime
     original_nch = pipeline._nch
-    original = runtime.wait_upto
+    original = pipeline._step_attn
 
     def run(nch: int, skip: bool, counted: dict | None = None) -> np.ndarray:
         pipeline._nch = nch
         pipeline._skip_dead = skip
         if counted is not None:
-            def counted_wait(lane: int, count: int) -> float:
-                if lane == LANE_LONG:
-                    counted["n"] += 1
-                return original(lane, count)
+            def counted_attn(chain, entry, tile):      # type: ignore[no-untyped-def]
+                counted["n"] += 1
+                return original(chain, entry, tile)
 
-            runtime.wait_upto = counted_wait     # type: ignore[method-assign]
+            pipeline._step_attn = counted_attn         # type: ignore[method-assign]
         try:
             return chunked.logits(tokens, prefix=prefix)
         finally:
-            runtime.wait_upto = original          # type: ignore[method-assign]
+            pipeline._step_attn = original               # type: ignore[method-assign]
 
     try:
         shipping = run(original_nch, True)
@@ -189,7 +184,7 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
         with_dead = run(1, True, dead_count)
         without_dead = run(1, False, live_count)
         assert dead_count["n"] == live_count["n"] - 1, (
-            f"死瓦片没有少收注意力瓦片：S3 开 {dead_count['n']} 次、关 {live_count['n']} 次"
+            f"死瓦片没有少发一片注意力：S3 开 {dead_count['n']} 次、关 {live_count['n']} 次"
         )
         assert np.array_equal(with_dead, without_dead), "S3 改变了答案（跳过的瓦片不该有读者）"
     finally:

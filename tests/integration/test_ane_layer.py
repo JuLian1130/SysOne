@@ -179,6 +179,70 @@ def test_ffn_parts_is_three_for_mude_geometry() -> None:
 
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
+def test_split_projection_matches_numpy(tmp_path: Path) -> None:
+    """全注意力层（第 3 层）：投影拆成 q 段 + kv 段，两段各写各自的行，`project()` 拼回整块。
+
+    这条用例同时钉住拆投影（票据 06）的两个前提：**切行不改变量化**（int8 是按输出行量的，
+    所以两半的 codes 与整块逐字节相同），以及"比声明小的输出张量可以落在更大的面上"
+    （kv 段只有 1024 行，落到 `out_in` 的 4096 行里 —— 这是 A1 借面的全部依据）。
+    """
+    full = 3
+    qkv = tuple(f"language_model.layers.{full}.self_attn.{n}_proj.weight" for n in ("q", "k", "v"))
+    rest = (
+        f"language_model.layers.{full}.self_attn.o_proj.weight",
+        f"language_model.layers.{full}.mlp.gate_proj.weight",
+        f"language_model.layers.{full}.mlp.up_proj.weight",
+        f"language_model.layers.{full}.mlp.down_proj.weight",
+    )
+    w = _load(list(qkv) + list(rest))
+    proj = np.concatenate([w[name] for name in qkv], axis=0)
+    hidden = int(proj.shape[1])
+    q_rows = int(w[qkv[0]].shape[0])
+    kv_rows = int(proj.shape[0]) - q_rows
+    assert (q_rows, kv_rows) == (4096, 1024), "第 3 层的 q/kv 行数不是 mude 几何"
+
+    ffn = int(w[rest[3]].shape[1])
+    entries = {
+        "proj_q": proj[:q_rows], "proj_kv": proj[q_rows:],
+        "o": w[rest[0]], "gate": w[rest[1]], "up": w[rest[2]],
+    }
+    entries.update({f"down{i}": w[rest[3]][:, i * hidden:(i + 1) * hidden]
+                    for i in range(ffn_parts(hidden, ffn))})
+
+    blob, blob_entries = ane_blob.build(entries, quantize=True)
+    mil = layer_mil(hidden=hidden, cout=q_rows + kv_rows, ffn=ffn, s=S,
+                    entries=blob_entries, split=True)
+    assert mil.count("func ") == 4
+    files = write_program(tmp_path / "layer3_split", mil=mil, blob=blob, s=S)
+
+    rng = np.random.default_rng(23)
+    x = rng.standard_normal((hidden, S)).astype(np.float16)
+    runtime = AneRuntime()
+    layer = AneLayer(runtime, files, name="m22_layer3_split", hidden=hidden,
+                     cout=q_rows + kv_rows, ffn=ffn, s=S, split_rows=(q_rows, kv_rows))
+    try:
+        y, ms = layer.project(x)
+        # 两段各自读回来：q 段落在 proj_out，kv 段落在 out_in 的前 kv_rows 行
+        layer._write("proj_in", hidden, x)
+        layer.eval_proc("proj_q")
+        got_q = layer._read("proj_out", q_rows)
+        layer._write("proj_in", hidden, x)
+        layer.eval_proc("proj_kv")
+        got_kv = layer._read("out_in", kv_rows)
+    finally:
+        layer.close()
+        runtime.close()
+
+    # 整块量化（与按行切开再量化逐字节相同）就是两段共同的参考
+    reference = ane_blob.quant_per_channel(proj).dequant.astype(np.float32) @ x.astype(np.float32)
+    assert _rel_l2(y, reference) < PROJ_BUDGET, "拼回的整块与 numpy 参考不一致"
+    assert _rel_l2(got_q, reference[:q_rows]) < PROJ_BUDGET, "q 段与整块的前 4096 行不一致"
+    assert _rel_l2(got_kv, reference[q_rows:]) < PROJ_BUDGET, "kv 段与整块的后 1024 行不一致"
+    assert y.shape == (q_rows + kv_rows, S)
+    assert ms > 0
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
 def test_fused_layer_program_runs_three_procedures(tmp_path: Path) -> None:
     """整层一个 program、三个 procedure，一次 `load` 拿到三段计算。
 

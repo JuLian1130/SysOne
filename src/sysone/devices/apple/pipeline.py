@@ -25,7 +25,16 @@ from .compile import AneLayer, SurfaceSet
 from .geometry import Geometry, mude_geometry
 from .metal import LANE_LONG, LANE_SMALL, MetalBuffer, MetalRuntime
 from .residency import Residency
-from .schedule import NCH, Chain, Step, attention_steps, blocks, gdn_steps
+from .schedule import (
+    NCH,
+    Chain,
+    Step,
+    attention_steps,
+    blocks,
+    gdn_steps,
+    ring_columns,
+    ring_slot,
+)
 
 EPS = 1e-6
 
@@ -102,6 +111,14 @@ class MudePipeline:
         self._width = int(width)
         if self._width < self._bucket:
             raise ConfigError("傍宽不能小于桶宽", width=width, bucket=bucket)
+        # `qg` 的环：每条瓦片链一个槽位（票据 06）。整窗只有一片瓦片时一个槽位就够，
+        # 所以 1k/4k 那种 `width == bucket` 的路不会因为成环多花内存。
+        self._ring = ring_columns(self._width, self._bucket)
+        if self._geometry.kv_rows > 2 * self._hidden:
+            # 拆投影之后 kv 段借 `out_in` 的前 kv_rows 行（`compile.SET_KEYS`），借不出落脚点
+            # 就别装作能拆 —— 否则 ANE 会写过界，那是坏答案不是慢答案。
+            raise ConfigError("kv 行数超过 out_in 面，拆投影没有落脚点",
+                              kv_rows=self._geometry.kv_rows, out_in_rows=2 * self._hidden)
         if not pool:
             raise ConfigError("表面池至少要有一套面")
         need = pool_slots(roles)
@@ -176,7 +193,11 @@ class MudePipeline:
         # 排空，所以同一时刻只有一个全注意力层碰这两张画布（16k 的活性账：同时"开着"的层恒为
         # 1）。两套是 27c6250 的"列波前"留下的 —— 那一版块间不排空，相邻两个全注意力层真的
         # 会同时在飞。
-        self.qg = rt.alloc(2 * geom.qg_rows * width)
+        #
+        # `qg` 是**环**（票据 06）：全注意力层的投影拆成 kv 遍 + q 遍之后，q 从 `proj_q` 到
+        # `attn` 只活一个瓦片，所以它只需要每条瓦片链一个槽位（`self._ring` 列），不再整窗。
+        # `kv` 仍是整窗缓存 —— 非因果注意力每个 query 都要读整条 kv，这一条没变。
+        self.qg = rt.alloc(2 * geom.qg_rows * self._ring)
         self.kv = rt.alloc(2 * geom.kv_rows * width)
         self.gscratch = rt.alloc(2 * 8192 * bucket)
         # 快核不读 scratch，但 kernel 声明了 buffer(3)，必须绑定。全宽的参考核才要 (T,T)。
@@ -364,21 +385,29 @@ class MudePipeline:
         - `norm`：要读上一层同一瓦片的 `h`，而 `h` 是上一层 `tail` 那一步写的；
         - `core`：本层的递归状态与卷积尾巴是两条奇偶链共用的，所以瓦片 `s` 的 core 必须排在
           瓦片 `s-1` 的 core **编码之后**（lane 1 一条有序队列，编码序即执行序）；
-        - `prep`：全序列屏障 —— 本层所有瓦片（两条链的合计）的第一相都得先编码完；
-        - `attn`：得先有 `prep` 编码。
+        - `proj`（只出现在线性层）：用**和 `core` 同一个瓦片序 gate**。`proj` 一发射就占住整台
+          ANE，而只有本链的 `core(t)` 会回收它 —— 若让 `proj(t)` 跑到 `core(t-1)` 前面，就会
+          出现"一条链握着 ANE 等另一条链的 `core(t-1)`"、而另一条握着自己的 `proj` 等 ANE 的环
+          （票据 06 实测：4 瓦片、桶 64 时死锁；A1 之前没触发只是步数少、跑得没那么前）。共用
+          一个 gate 没有额外代价：ANE 本来就一次只有一个 eval 在飞。
+        - `prep_kv`：全序列屏障 —— 本层所有瓦片的 `gather_kv`（两条链的合计）都得先编码完；
+        - `attn`：得先有 `prep_kv` 编码。`prep_q` 不需要屏障：它只碰自己那条链的环槽位，
+          而 `gather_q → prep_q → attn` 三步在同一条 lane 的编码序上连着排（票据 06）。
 
         其余依赖（`proj` 要读 `norm` 写的 `proj_in`、`out` 要读注意力 / `core` 写的那半……）
         不是"能不能编码"而是"数据在哪"，在 `_issue` 里用 `_wait_for` 精确等到那一个命令缓冲。
         """
         work = step.work
-        if step.kind == "ane":
-            return not self.buffers[chain.layer].ane.pending
+        if step.kind == "ane" and self.buffers[chain.layer].ane.pending:
+            return False
         if work == "norm":
             prev = self._prev.get(chain.layer)
             return prev is None or step.tile in self._h[prev]
-        if work == "core":
+        if work in ("core", "proj"):
+            # `proj` 只在 GDN 层的步表里；`core` 只在 GDN 层。全注意力层的 `proj_kv`/`proj_q`
+            # 不在这里：它们的回收步（`gather_kv`/`gather_q`）紧跟在本链下一步、不被任何门挡住。
             return self._core_enc.get(chain.layer, -1) >= step.tile - 1
-        if work == "prep":
+        if work == "prep_kv":
             return self._gathers.get(chain.layer, 0) >= len(self._chunks_list)
         if work == "attn":
             return self._preps.get(chain.layer, False)
@@ -390,20 +419,28 @@ class MudePipeline:
         work, tile = step.work, step.tile
         if work == "norm":
             self._step_norm(chain, entry, tile)
-        elif work in ("proj1", "proj"):
+        elif work in ("proj", "proj_kv", "proj_q"):
             self._wait_for(chain, "norm", tile)
-            # 同一槽位的上一片 `gather` 还在读这张 `proj_out`（lane 0），而 ANE 的写不在任何一条
-            # lane 上：不显式等它，`proj` 的写就会与那一片的读重叠 —— 首趟拷贝冷页慢，实测
-            # 块 1（第一个全注意力层）的输出与后续趟差 2.6e-1。GDN 层没有这个洞：读 `proj_out`
+            # 同一槽位的上一片 `gather` 还在读这张面（lane 0），而 ANE 的写不在任何一条 lane 上：
+            # 不显式等它，投影的写就会与那一片的读重叠 —— 首趟拷贝冷页慢，实测块 1（第一个
+            # 全注意力层）的输出与后续趟差 2.6e-1（票据 02）。GDN 层没有这个洞：读 `proj_out`
             # 的 gdn 核在 `core` 那个 CB 里，与后来的 `norm2` 同一条 lane，等 `norm2` 等于等它。
-            self._wait_for(chain, "gather", tile - self._nch)
-            entry.ane.issue_proc("proj", slot=chain.slot)
-        elif work == "gather":
-            self._step_gather(chain, entry, tile)
-        elif work == "prep":
-            self._prep(entry)
+            # 拆投影之后三条投影各自盯自己那张面的上一片读（票据 06）：
+            #   `proj`    → `proj_out` ← `gather`
+            #   `proj_q`  → `proj_out` ← `gather_q`
+            #   `proj_kv` → `out_in`   ← `gather_kv`
+            self._wait_for(chain, work.replace("proj", "gather"), tile - self._nch)
+            entry.ane.issue_proc(work, slot=chain.slot)
+        elif work == "gather_kv":
+            self._step_gather_kv(chain, entry, tile)
+        elif work == "gather_q":
+            self._step_gather_q(chain, entry, tile)
+        elif work == "prep_kv":
+            self._prep_kv(entry)
             self._preps[chain.layer] = True
-            self._commit(chain, LANE_LONG, "prep", -1)
+            self._commit(chain, LANE_LONG, "prep_kv", -1)
+        elif work == "prep_q":
+            self._step_prep_q(chain, entry, tile)
         elif work == "attn":
             self._step_attn(chain, entry, tile)
         elif work == "core":
@@ -436,22 +473,33 @@ class MudePipeline:
         )
         self._commit(chain, LANE_SMALL, "norm", tile)
 
-    def _step_gather(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
-        """`gather`：把 `proj_out` 的两段搬进全宽的 `qg` / `kv`，走 lane 0。
+    def _step_gather_kv(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
+        """`gather_kv`：把 `proj_kv` 写在 `out_in` 前 `kv_rows` 行的那一段搬进整窗的 `kv`。
 
-        lane 0 是因为 `prep` 也在 lane 0 —— 两者之间不需要跨 lane 的同步，编码序即执行序
+        lane 0 是因为 `prep_kv` 也在 lane 0 —— 两者之间不需要跨 lane 的同步，编码序即执行序
         （旧引擎的 `gather` 同样在长 lane 上）。
         """
-        entry.ane.reap_proc()                    # 投影的输出就在 proj_out 上
+        entry.ane.reap_proc()                    # proj_kv 的输出就在 out_in 的前 kv_rows 行
         start, n = self._chunks_list[tile]
-        qg, kv = self.qg, self.kv
-        self._copy(entry.surface("proj_out", chain.slot), qg, nchan=self._geometry.qg_rows, n=n, s0=start,
+        self._copy(entry.surface("out_in", chain.slot), self.kv,
+                   nchan=self._geometry.kv_rows, n=n, s0=start,
                    src_stride=self._bucket, dst_stride=self._width, lane=LANE_LONG)
-        self._copy(entry.surface("proj_out", chain.slot), kv, nchan=self._geometry.kv_rows,
-                   src_c0=self._geometry.qg_rows, n=n, s0=start,
-                   src_stride=self._bucket, dst_stride=self._width, lane=LANE_LONG)
-        self._commit(chain, LANE_LONG, "gather", tile)
+        self._commit(chain, LANE_LONG, "gather_kv", tile)
         self._gathers[chain.layer] = self._gathers.get(chain.layer, 0) + 1
+
+    def _step_gather_q(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
+        """`gather_q`：把 `proj_q` 的 q|gate 半搬进 `qg` 的环槽位（`ring_slot`）。
+
+        目标是环槽位而不是整窗列，所以 `dst_stride` 是环的列数（`self._ring`）；源仍是桶宽的
+        面，从列 0 开始读。
+        """
+        entry.ane.reap_proc()                    # proj_q 的输出就在 proj_out 上
+        start, n = self._chunks_list[tile]
+        slot = ring_slot(tile, self._bucket)
+        self._copy(entry.surface("proj_out", chain.slot), self.qg,
+                   nchan=self._geometry.qg_rows, n=n, s0=slot,
+                   src_stride=self._bucket, dst_stride=self._ring, lane=LANE_LONG)
+        self._commit(chain, LANE_LONG, "gather_q", tile)
 
     def _step_attn(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
         """`attn`：这一段 query 的注意力，**直写**进本槽位 `out_in` 的前半（旧引擎的 `ia`）。
@@ -460,8 +508,8 @@ class MudePipeline:
         那一段 ANE 要读的 `[v|x]` 的 v 半，搬到别处再搬回来是白搬（16k 每瓦片 16 MB）。
         """
         start, n = self._chunks_list[tile]
-        qg, kv = self.qg, self.kv
-        self._attention_tile(entry, chain.slot, (start, n), qg, kv)
+        self._attention_tile(entry, chain.slot, (start, n), self.qg, self.kv,
+                             ring_slot(tile, self._bucket))
         self._commit(chain, LANE_LONG, "attn", tile)
 
     def _step_out_in(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
@@ -530,24 +578,41 @@ class MudePipeline:
         self._commit(chain, LANE_SMALL, "tail", tile)
         self._h[chain.layer].add(tile)
 
-    def _prep(self, entry: LayerBuffers) -> None:
-        """全宽的 q/k 归一化 + 部分 RoPE（旧引擎的 `prep`，序列级屏障之后才做）。"""
-        qg, kv = self.qg, self.kv
-        kernels.q_prep(self._runtime, qg, entry.weights["q_norm"],
-                       self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
-                       geometry=self._geometry)
-        kernels.kv_prep(self._runtime, kv, entry.weights["k_norm"],
-                        self._cos, self._sin, stile=self._width, src_stride=self._width, eps=EPS,
-                        geometry=self._geometry)
+    def _prep_kv(self, entry: LayerBuffers) -> None:
+        """全宽的 k 归一 + 部分 RoPE（旧引擎 `prep` 的 k 半，序列级屏障之后才做）。
+
+        q 不在这里：投影拆开之后 q 只活一个瓦片，归一与 RoPE 挪进了每个瓦片的 `prep_q`
+        （见 `_step_prep_q`）—— 这也是 `qg` 能成环的原因（票据 06）。
+        """
+        kernels.kv_prep(self._runtime, self.kv, entry.weights["k_norm"],
+                        self._cos, self._sin, stile=self._width, src_stride=self._width,
+                        eps=EPS, geometry=self._geometry)
+
+    def _step_prep_q(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
+        """`prep_q`：环槽位里的 q 做 RMSNorm+半维 RoPE、gate 做 sigmoid（`k_q_prep`，原地）。
+
+        `qg` 成环之后列号不是 rope 位置：槽位从 `ring_slot(tile)` 起，而这一瓦片第一个 token
+        在整条序列里的位置是 `start`，所以 `pos0 = start - 槽位`。同一槽位每 `nch` 个瓦片被
+        重写一次，而写之前上一次的 `attn` 已经在这条 lane 上执行完（编码序即执行序）。
+        """
+        start, n = self._chunks_list[tile]
+        slot = ring_slot(tile, self._bucket)
+        kernels.q_prep(self._runtime, self.qg, entry.weights["q_norm"],
+                       self._cos, self._sin, stile=n, s0=slot, src_stride=self._ring,
+                       eps=EPS, pos0=start - slot, geometry=self._geometry)
+        self._commit(chain, LANE_LONG, "prep_q", tile)
 
     def _attention_tile(
         self, entry: LayerBuffers, slot: int, chunk: tuple[int, int],
-        qg: MetalBuffer, kv: MetalBuffer,
+        qg: MetalBuffer, kv: MetalBuffer, qslot: int,
     ) -> None:
         """一段 query 的注意力 dispatch；`prefix_noncausal` 的边界若落在这段内就拆两次。
 
         段内的 query 只受 `nk` 一个上界约束，所以"按段发射"与"整条一次发射"在数值上等价 ——
         `test_metal_chain.py` 的 `prefix ∈ {0,4}` 用例守住这一点。
+
+        两套列号是分开的：`qg` 按环槽位读（`s0 = qslot`、`qgT = self._ring`），`kv` 仍按整窗
+        缓存读（`T = self._width`、`nk` 是可见上界）。`k_attn` 早就把这两件事拆成了两个字段。
 
         输出写进本槽位 `out_in` 的前半：面里只有桶宽列，所以 `out_s0` 是**段内**偏移（拆成
         两次时第二次从 `boundary - start` 列接着写），`out_stride` 必须显式传桶宽
@@ -559,7 +624,7 @@ class MudePipeline:
         if self._prefix <= 0 or self._prefix >= self._length:
             kernels.attention(
                 self._runtime, qg, kv, out, self.attn_scratch,
-                T=self._width, stile=n, nk=self._length, nq=n, s0=start,
+                T=self._width, stile=n, nk=self._length, nq=n, s0=qslot, qgT=self._ring,
                 out_stride=self._bucket, out_s0=0, fast=True, geometry=self._geometry,
             )
             return
@@ -570,15 +635,15 @@ class MudePipeline:
             kernels.attention(
                 self._runtime, qg, kv, out, self.attn_scratch,
                 T=self._width, stile=boundary - start, nk=self._prefix, nq=boundary - start,
-                s0=start, out_stride=self._bucket, out_s0=0, fast=True,
+                s0=qslot, qgT=self._ring, out_stride=self._bucket, out_s0=0, fast=True,
                 geometry=self._geometry,
             )
         if boundary < end:
             kernels.attention(
                 self._runtime, qg, kv, out, self.attn_scratch,
                 T=self._width, stile=end - boundary, nk=self._length, nq=end - boundary,
-                s0=boundary, out_stride=self._bucket, out_s0=boundary - start, fast=True,
-                geometry=self._geometry,
+                s0=qslot + (boundary - start), qgT=self._ring, out_stride=self._bucket,
+                out_s0=boundary - start, fast=True, geometry=self._geometry,
             )
 
     # ------------------------------------------------------------------ 收尾

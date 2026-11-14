@@ -4,14 +4,22 @@ import pytest
 
 from sysone.devices.apple.metal import LANE_LONG, LANE_SMALL
 from sysone.devices.apple.schedule import (
+    NCH,
     Chain,
     attention_steps,
     blocks,
     gdn_steps,
+    ring_columns,
+    ring_slot,
 )
 from sysone.domain.attention import AttentionRole
 
 FULL_AT = (3, 7, 11, 15, 19)
+
+# 全注意力层的两相步表（`attention_steps`）：第一相只产 K/V，第二相产 q 并立刻用它。
+KV_PHASE = ("norm", "proj_kv", "gather_kv")
+Q_PHASE = ("norm", "proj_q", "gather_q", "prep_q", "attn", "out", "norm2", "ffn", "tail")
+BODY = ("attn", "out", "norm2", "ffn", "tail")
 
 
 def _mude_roles() -> tuple[AttentionRole, ...]:
@@ -80,31 +88,50 @@ def test_the_two_chains_of_a_layer_partition_the_tiles():
 
 
 def test_one_chain_covers_every_tile_in_order():
-    """`nch=1`（第 2 步的单链驱动）下一条链走全部瓦片，且每个相里都是瓦片序。
-
-    卷积尾巴与递归状态是按瓦片序接力的，所以"一条链"不只是少一条，它还把顺序交回给一条链。
-    全注意力层的两相各自从瓦片 0 从头走一遍（第一相按瓦片攒 K/V，第二相按瓦片算 body）。
-    """
+    """`nch=1`（第 2 步的单链驱动）下一条链走全部瓦片，且每个相里都是瓦片序。"""
     steps = gdn_steps(5, nch=1)
     assert [step.tile for step in steps] == [tile for tile in range(5) for _ in range(7)]
 
     steps = attention_steps(5, nch=1)
-    prep = next(i for i, step in enumerate(steps) if step.work == "prep")
+    prep = next(i for i, step in enumerate(steps) if step.work == "prep_kv")
     assert [step.tile for step in steps[:prep]] == [tile for tile in range(5) for _ in range(3)]
     assert [step.tile for step in steps[prep + 1:]] == [
-        tile for tile in range(5) for _ in range(5)
+        tile for tile in range(5) for _ in range(9)
     ]
 
 
-def test_attention_sequence_is_gathers_then_prep_then_attention():
-    """`prep` 是本层唯一的序列级屏障，且整条链的注意力都排在它后面。"""
+def test_attention_sequence_is_kv_gathers_then_prep_then_attention():
+    """`prep_kv` 是本层唯一的序列级屏障，且整条链的注意力都排在它后面。
+
+    第一相只产 K/V（非因果注意力每个 query 都要读整条 kv），所以 `k` 的归一与 RoPE 必须等
+    所有瓦片的 kv 都搬完；第二相的 q 只活一个瓦片，不需要这道屏障。
+    """
     steps = attention_steps(4, par=0)
-    gathers = [i for i, step in enumerate(steps) if step.work == "gather"]
-    preps = [i for i, step in enumerate(steps) if step.work == "prep"]
+    gathers = [i for i, step in enumerate(steps) if step.work == "gather_kv"]
+    preps = [i for i, step in enumerate(steps) if step.work == "prep_kv"]
     attns = [i for i, step in enumerate(steps) if step.work == "attn"]
     assert len(preps) == 1
     assert preps[0] > max(gathers)
     assert preps[0] < min(attns)
+
+
+def test_the_q_gather_sits_next_to_its_attention():
+    """A1 的全部安全性：`gather_q → prep_q → attn` 同一瓦片、同一条 lane 上连着排。
+
+    这三步挨着，q 的寿命就只有这一个瓦片；环槽位每 `NCH` 个瓦片才被同一条链重写一次，
+    而那时上一次的 `attn` 早已执行完（lane 0 的编码序即执行序）。
+    """
+    for par in (0, 1):
+        steps = attention_steps(6, par=par)
+        works = [step.work for step in steps]
+        for index, work in enumerate(works):
+            if work != "gather_q":
+                continue
+            tile = steps[index].tile
+            assert works[index + 1] == "prep_q"
+            assert works[index + 2] == "attn"
+            assert [steps[index + k].tile for k in (1, 2)] == [tile, tile]
+            assert {steps[index + k].lane for k in (0, 1, 2)} == {LANE_LONG}
 
 
 def test_attention_and_body_stay_interleaved():
@@ -121,29 +148,49 @@ def test_attention_and_body_stay_interleaved():
             assert steps[index + 1].tile == steps[index].tile
 
 
-def test_only_the_first_chain_carries_the_prep():
-    assert not any(step.work == "prep" for step in attention_steps(4, par=1))
+def test_only_the_first_chain_carries_the_prep_kv():
+    assert not any(step.work == "prep_kv" for step in attention_steps(4, par=1))
 
 
-def test_attention_chain_builds_eight_steps_per_owned_tile_plus_one_prep():
+def test_attention_chain_builds_twelve_steps_per_owned_tile_plus_one_prep():
     steps = attention_steps(4, par=0)
-    assert len(steps) == 2 * 8 + 1
-    assert [step.work for step in steps[:6]] == ["norm", "proj1", "gather"] * 2
-    assert steps[6].work == "prep"
-    assert [step.work for step in steps[7:12]] == [
-        "attn",
-        "out",
-        "norm2",
-        "ffn",
-        "tail",
-    ]
+    assert len(steps) == 2 * 12 + 1
+    assert [step.work for step in steps[:6]] == list(KV_PHASE * 2)
+    assert steps[6].work == "prep_kv"
+    assert [step.work for step in steps[7:16]] == list(Q_PHASE)
+
+
+def test_the_ring_slot_is_stable_per_chain():
+    """槽位按奇偶循环：同一条链的每个瓦片落在同一个槽位，两条链各占一个。
+
+    这条就是"环深 ≥ 链条数"在步表上的化身 —— 只要 `NCH` 个槽位，不必整窗。
+    """
+    for tile in range(8):
+        assert ring_slot(tile, 64) == (tile % NCH) * 64
+    for par in (0, 1):
+        slots = {ring_slot(tile, 64) for tile in range(par, 8, NCH)}
+        assert len(slots) == 1, f"par={par} 的瓦片落在多个槽位上"
+    assert ring_slot(0, 64) != ring_slot(1, 64)
+
+
+@pytest.mark.parametrize(
+    "width,bucket,columns",
+    [
+        (1024, 1024, 1024),      # 1k：一片瓦片，一个槽位就够（不成环，一字节也不多花）
+        (256, 64, 128),          # 四片瓦片：两个槽位
+        (16384, 1024, 2048),     # 16k 桶 1024：两条链各 1024 列
+        (16384, 4096, 8192),     # 16k 桶 4096：两条链各 4096 列
+    ],
+)
+def test_ring_columns(width: int, bucket: int, columns: int) -> None:
+    assert ring_columns(width, bucket) == columns
 
 
 @pytest.mark.parametrize("dead", [0, 1, 3])
 def test_dead_tiles_keep_the_first_pass_only(dead):
-    """S3：整段落在前缀里的瓦片只欠 K/V，第二相（注意力与 MLP）整段丢掉。"""
+    """S3：整段落在前缀里的瓦片只欠 K/V，第二相（q 投影与注意力、MLP）整段丢掉。"""
     steps = attention_steps(5, par=0, dead=dead)
-    second_pass = {"attn", "out", "norm2", "ffn", "tail"}
+    second_pass = {"proj_q", "gather_q", "prep_q", "attn", "out", "norm2", "ffn", "tail"}
     for tile in (0, 2, 4):
         kept = {
             step.work
@@ -152,7 +199,7 @@ def test_dead_tiles_keep_the_first_pass_only(dead):
         }
         assert kept == (set() if tile < dead else second_pass)
         # 第一相不受影响：这些瓦片的 K/V 仍要 gather 出来
-        assert {"norm", "proj1", "gather"} <= {
+        assert set(KV_PHASE) <= {
             step.work for step in steps if step.tile == tile
         }
 
@@ -175,10 +222,11 @@ def test_gpu_steps_use_one_of_the_two_lanes():
                 assert step.lane in (LANE_LONG, LANE_SMALL)
 
 
-def test_the_long_lane_carries_the_attention_and_the_gather():
-    """lane 0 只放长任务：gather / prep / attn；lane 1 放小核。"""
+def test_the_long_lane_carries_the_attention_and_the_preps():
+    """lane 0 只放长任务：两条 gather / 两条 prep / attn；lane 1 放小核。"""
     lane = {step.work: step.lane for step in attention_steps(4, par=0)}
-    assert lane["gather"] == lane["prep"] == lane["attn"] == LANE_LONG
+    for work in ("gather_kv", "gather_q", "prep_kv", "prep_q", "attn"):
+        assert lane[work] == LANE_LONG, work
     assert lane["norm"] == lane["tail"] == LANE_SMALL
 
 

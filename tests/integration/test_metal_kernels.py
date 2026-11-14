@@ -116,12 +116,15 @@ def _inputs(store: SafeTensorFile, s: int) -> tuple[np.ndarray, np.ndarray, np.n
 
 def test_argument_structs_match_the_c_header() -> None:
     """CPU-only：结构体字段顺序/宽度就是与 `e8_common.h` 的契约。"""
-    assert kernels._NRM.size == 32
+    assert kernels._NRM.size == 36          # A1（票据 06）在尾部加了 `pos0`
     assert kernels._COPY.size == 32
     assert kernels._ATTN.size == 48
     assert kernels._GDN.size == 28
-    assert kernels._ATTN.unpack(kernels.attn_args(T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8)) == (
-        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 0, 0, 0,
+    args = kernels.nrm_args(stile=8, s0=2, src_stride=64, eps=1e-6, pos0=96)
+    assert kernels._NRM.unpack(args) == (8, 2, 64, pytest.approx(1e-6), 0, 0, 0, 0, 96)
+    assert kernels._ATTN.unpack(kernels.attn_args(T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8,
+                                                  qgT=16)) == (
+        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 16, 0, 0,
     )
     assert kernels._GDN.unpack(kernels.gdn_args(stile=4, s0=0, T=4, first=True, eps=1e-6))[:4] == (
         4, 0, 4, 1,
@@ -287,5 +290,91 @@ def test_attention_matches_numpy(store: SafeTensorFile, runtime: MetalRuntime, f
     assert rel < TOL, f"注意力差得太多：relL2={rel:.3e} cos={cos_sim:.6f}"
     assert cos_sim > 0.999, f"注意力方向不对：cos={cos_sim:.6f}"
     assert np.all(np.isfinite(got)), "注意力输出里有 NaN/inf"
+    for buf in (qg_buf, kv_buf, out_buf, scratch):
+        buf.free()
+
+
+# ---- A1（票据 06）：`qg` 成环之后，列号与 rope 位置是两件事 -----------------------------
+RING = S + 32   # 环的列数：要能同时装下"槽位偏移"与"整窗位置"两个概念
+
+
+def test_q_prep_positions_come_from_pos0_not_the_column(
+    store: SafeTensorFile, runtime: MetalRuntime
+) -> None:
+    """位置 64..95 的 q 摆进槽位 32..63：结果的 rope 位置必须是 64..95（`NormArgs.pos0`）。
+
+    `_inputs` 已经算好位置 0..95 的整窗参考，这里只取它的第 64..95 列 —— 参考列（64）与
+    摆放列（32）故意不同：拿列号当位置的实现会错得很明显，stride 写错则会读到槽位外。
+    """
+    start, slot, width = 64, 32, 32
+    proj, ref_qg, _ = _inputs(store, S)
+    prefix = f"language_model.layers.{LAYER}.self_attn"
+    q_norm = store.read(f"{prefix}.q_norm.weight").astype(np.float32) + 1.0
+    cos, sin = _rope_table(_theta(), S, kernels.ROTARY_DIM)
+
+    qg_buf = runtime.alloc(Q_ROWS * RING * 2)
+    view = qg_buf.array(np.float16, (Q_ROWS, RING))
+    view[...] = 0
+    view[:, slot:slot + width] = proj[:Q_ROWS, start:start + width]
+    qn_buf = runtime.alloc(kernels.HEAD_DIM * 4)
+    qn_buf.array(np.float32, (kernels.HEAD_DIM,))[:] = q_norm
+    cos_buf = runtime.alloc(S * (kernels.ROTARY_DIM // 2) * 4)
+    sin_buf = runtime.alloc(S * (kernels.ROTARY_DIM // 2) * 4)
+    cos_buf.array(np.float32, (S, kernels.ROTARY_DIM // 2))[:] = cos
+    sin_buf.array(np.float32, (S, kernels.ROTARY_DIM // 2))[:] = sin
+
+    kernels.q_prep(runtime, qg_buf, qn_buf, cos_buf, sin_buf,
+                   stile=width, s0=slot, src_stride=RING, eps=1e-6, pos0=start - slot)
+    runtime.commit()
+    runtime.wait()
+
+    got = view[:, slot:slot + width].astype(np.float32)
+    want = ref_qg[:, start:start + width]
+    rel = _rel_l2(got, want)
+    assert rel < TOL, f"环槽位里的 prep 对不上：relL2={rel:.3e}"
+    for buf in (qg_buf, qn_buf, cos_buf, sin_buf):
+        buf.free()
+
+
+def test_attention_reads_q_from_the_ring_slot(
+    store: SafeTensorFile, runtime: MetalRuntime
+) -> None:
+    """注意力从环的第 `slot` 列读 q/gate（`AttnArgs.qgT`），同时仍按整窗读 kv（`AttnArgs.T`）。"""
+    start, slot, width = 64, 32, 32
+    _, ref_qg, ref_kv = _inputs(store, S)
+    qg16, kv16 = ref_qg.astype(np.float16), ref_kv.astype(np.float16)
+    p_q, p_kv = qg16.astype(np.float32), kv16.astype(np.float32)
+    d, qh, kvh = kernels.HEAD_DIM, kernels.Q_HEADS, kernels.KV_HEADS
+    query = np.stack([p_q[h * 2 * d : h * 2 * d + d, start:start + width].T for h in range(qh)],
+                     axis=1)
+    gate = np.stack([p_q[h * 2 * d + d : (h + 1) * 2 * d, start:start + width].T
+                     for h in range(qh)], axis=1)
+    key = np.stack([p_kv[h * d : (h + 1) * d].T for h in range(kvh)], axis=1)
+    value = np.stack([p_kv[kernels.KV_PROJ + h * d : kernels.KV_PROJ + (h + 1) * d].T
+                      for h in range(kvh)], axis=1)
+    repeat = qh // kvh
+    context = attention(query, np.repeat(key, repeat, axis=1), np.repeat(value, repeat, axis=1),
+                        np.ones((width, S), dtype=bool)).reshape(width, kernels.QK_DIM)
+    expected = (context * gate.reshape(width, kernels.QK_DIM)).T
+
+    qg_buf = runtime.alloc(Q_ROWS * RING * 2)
+    kv_buf = runtime.alloc(KV_ROWS * S * 2)
+    out_buf = runtime.alloc(kernels.HID * 2 * width * 2)
+    scratch = runtime.alloc(16)   # 快核不读，但 buffer 必须绑定
+    ring = qg_buf.array(np.float16, (Q_ROWS, RING))
+    ring[...] = 0
+    ring[:, slot:slot + width] = qg16[:, start:start + width]
+    kv_buf.array(np.float16, (KV_ROWS, S))[:] = kv16
+    out_buf.array(np.float16, (kernels.HID * 2, width))[:] = 0
+
+    kernels.attention(runtime, qg_buf, kv_buf, out_buf, scratch,
+                      T=S, stile=width, nk=S, nq=width, s0=slot, qgT=RING,
+                      out_stride=width, out_s0=0, fast=True)
+    runtime.commit()
+    runtime.wait()
+
+    got = out_buf.array(np.float16, (kernels.HID * 2, width))[: kernels.HID].astype(np.float32)
+    rel = _rel_l2(got, expected)
+    assert rel < TOL, f"环槽位里的注意力对不上：relL2={rel:.3e}"
     for buf in (qg_buf, kv_buf, out_buf, scratch):
         buf.free()

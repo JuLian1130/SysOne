@@ -49,10 +49,17 @@ BLOB_NAME = "weights.bin"
 
 # 产物的"版本盐"。MIL 生成、blob 布局或量化规则只要有一处改了，就把这个数 +1：
 # sidecar 里记着它，与当前代码不一致的旧产物会被重算，而不是被悄悄当成最新的那份。
-ARTIFACT_VERSION = 1
+#
+# 2：全注意力层的投影拆成 q/kv 两段（票据 06）—— 同一层目录里的旧 MIL 有 3 个 procedure，
+#    与新的 `PROCS_SPLIT` 对不上，必须重建。
+ARTIFACT_VERSION = 2
 
-# 一层一个 program 时的 procedure 顺序（与旧引擎的 `PROCS` 一致）。
+# 一层的 procedure 序号。两层形态（票据 06）：
+# - 线性层（以及 numpy 逐段对拍）：投影是一整段，序号与旧引擎一致（proj/out/ffn = 0/1/2）；
+# - 全注意力层：投影拆成 q 段 + kv 段，`out`/`ffn` 的序号不动，kv 段排在最后。
+# 两套里 `out`/`ffn` 都是 1/2，所以 `PROCS` 单独留一份给"没拆"的形态。
 PROCS = {"proj": 0, "out": 1, "ffn": 2}
+PROCS_SPLIT = {"proj_q": 0, "out": 1, "ffn": 2, "proj_kv": 3}
 
 # 一个 (program, procedure) 能绑几套面。dylib 把请求按 `proc * 8 + slot` 键起来
 # （`e8_ane.m:386`），所以槽位号只能落在 0..7 —— 写成 8 会撞到下一个 procedure。
@@ -207,14 +214,42 @@ def layer_mil(
     ffn: int,
     s: int,
     entries: Mapping[str, BlobEntry],
+    split: bool = False,
 ) -> str:
-    """一整层的三段 MIL：`main`（投影）、`p1`（输出投影+残差）、`p2`（融合 FFN）。
+    """一整层的 MIL：`main`（投影）、`p1`（输出投影+残差）、`p2`（融合 FFN）。
 
-    `entries` 的键是 `proj`、`o`、`gate`、`up`、`down0`..`down{parts-1}`。三个 func 的
+    `entries` 的键是 `proj`、`o`、`gate`、`up`、`down0`..`down{parts-1}`；三个 func 的
     procedure 序号与旧引擎一致（`PROCS`），`AneLayer` 用它来 `attach` / `eval`。
+
+    `split=True` 时投影拆成两段（票据 06）：`main` 只算 `[q|gate]`（`qg_rows` 行）、`p3`
+    只算 `[k|v]`（`kv_rows` 行），权重键换成 `proj_q` / `proj_kv`。两段权重仍是**同一块
+    投影按行切开的两份**（int8 按行量化，切行不动 scale），所以 blob 与 ANE 常驻权重一分
+    不多 —— 它换到的是 `qg` 可以成环（q 只活一个瓦片，见 `schedule.attention_steps`）。
     """
     if hidden <= 0 or cout <= 0 or s <= 0:
         raise NotReadyError("MIL 形状必须为正", hidden=hidden, cout=cout, s=s)
+    if split:
+        missing = [key for key in ("proj_q", "proj_kv") if key not in entries]
+        if missing:
+            raise NotReadyError("拆投影的整层 MIL 缺少投影权重", missing=missing)
+        q_rows = int(entries["proj_q"].shape[0])
+        kv_rows = int(entries["proj_kv"].shape[0])
+        if q_rows <= 0 or kv_rows <= 0 or q_rows + kv_rows != cout:
+            # 两段加起来必须正好是原来的 cout：少一行会静默丢通道，多的行会盖到别的段。
+            raise NotReadyError("拆投影的两段行数之和不等于 cout",
+                                q=q_rows, kv=kv_rows, cout=cout)
+        return _program([
+            _func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x",
+                  body=_conv("p", cin=hidden, cout=q_rows, s=s, entry=entries["proj_q"],
+                             src="x", out="y")),
+            _func("p1", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
+                  body=_out_body(hidden=hidden, s=s, entry=entries["o"])),
+            _func("p2", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
+                  body=_ffn_body(hidden=hidden, ffn=ffn, s=s, entries=entries)),
+            _func("p3", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x",
+                  body=_conv("kv", cin=hidden, cout=kv_rows, s=s, entry=entries["proj_kv"],
+                             src="x", out="y")),
+        ])
     if "proj" not in entries or "o" not in entries:
         raise NotReadyError("整层 MIL 缺少投影或输出投影权重", keys=sorted(entries))
     return _program([
@@ -356,6 +391,11 @@ def cached_program(directory: str | Path, *, source: dict, s: int) -> ProgramFil
 # 而 `ffn` 发射前又等到了 `norm2` 的命令缓冲（见 `pipeline._issue` / `_step_norm2`）。
 SET_KEYS = {
     "proj": ("proj_in", "proj_out"),
+    # 拆投影（票据 06）：q 段落进 `proj_out`，kv 段落进 `out_in` 的前 `kv_rows` 行。借 `out_in`
+    # 是安全的：它在**第一相**写、`attn` 到**第二相**才覆写同一张面的前 `hidden` 行，而那时
+    # kv 早被 `gather_kv` 搬走了 —— 换成第三张面反而要多花 8 套 × `kv_rows × 桶宽`。
+    "proj_q": ("proj_in", "proj_out"),
+    "proj_kv": ("proj_in", "out_in"),
     "out": ("out_in", "out_out"),
     "ffn": ("out_in", "out_out"),
 }
@@ -443,7 +483,7 @@ class AneProgram:
 
 
 class AneLayer:
-    """一层装成一个 program、三个 procedure：投影 / 输出投影+残差 / 融合 FFN。
+    """一层装成一个 program：投影 / 输出投影+残差 / 融合 FFN（三个 procedure）。
 
     四张 IOSurface 各管一个 stream 边界：ANE 写投影结果 → GPU 读它、写注意力输出 →
     ANE 读 `[attn | residual]` 算 out → GPU 再读 → ANE 读 `[xn | residual]` 算 FFN。
@@ -452,7 +492,11 @@ class AneLayer:
     `out` 与 `ffn` 共用后两张面（`SET_KEYS`），所以 `[attn | residual]` 与 `[xn | residual]`
     是同一块内存的先后两次覆写 —— 与旧引擎的 `io_a` 完全一样。
 
-    `pool` 给定时这四张面是借来的：池里的第 k 套绑到 ANE 槽位 k，调用方按链选槽位
+    `split_rows=(qg_rows, kv_rows)` 时是**四个** procedure：投影拆成 q 段与 kv 段（票据 06），
+    q 段落 `proj_out`、kv 段落 `out_in` 的前 `kv_rows` 行（见 `SET_KEYS`），序号见
+    `PROCS_SPLIT`。`project()` 仍返回拼好的整块 `[cout, s]`，调用方不用知道拆没拆。
+
+    `pool` 给定时这几张面是借来的：池里的第 k 套绑到 ANE 槽位 k，调用方按链选槽位
     （`eval_proc(..., slot=k)`）。不给就自己开一套（M2.1 的逐段对拍与 numpy 链用这个形态）。
     """
 
@@ -467,6 +511,7 @@ class AneLayer:
         ffn: int,
         s: int,
         pool: Sequence[SurfaceSet] | None = None,
+        split_rows: tuple[int, int] | None = None,
     ) -> None:
         self._runtime = runtime
         self.name = name
@@ -476,6 +521,9 @@ class AneLayer:
         self.s = int(s)
         # 产物留着：常驻窗口换窗时按它重装（`reload` 不能走 `__init__`，见那里的注释）。
         self._files = files
+        # 投影拆开时两段的行数（q 段, kv 段）；`None` 是一整段（线性层与 numpy 对拍）。
+        self._split_rows = (int(split_rows[0]), int(split_rows[1])) if split_rows else None
+        self._proc_index = dict(PROCS_SPLIT if self._split_rows else PROCS)
         # 本层还有几次已发射、未回收的 eval。`AneRuntime.pending` 是**进程级**的单槽，
         # 分不出"在飞的是哪一层"，而窗口卸载的判据必须是"这一层自己的请求都回来了"
         # （换窗时下一块常常已经在飞，全局标志一定为真）。
@@ -494,8 +542,9 @@ class AneLayer:
                                   max_slots=MAX_SLOTS)
             self._surfaces = self._sets[0].surfaces
             for slot, st in enumerate(self._sets):
-                for proc, pair in SET_KEYS.items():
-                    runtime.attach_slot(name, PROCS[proc], slot,
+                for proc in self._proc_index:
+                    pair = SET_KEYS[proc]
+                    runtime.attach_slot(name, self._proc_index[proc], slot,
                                         st.surfaces[pair[0]], st.surfaces[pair[1]])
         except BaseException:
             self.close()
@@ -512,15 +561,21 @@ class AneLayer:
         return self._surfaces
 
     def _write(self, key: str, items: int, x: np.ndarray) -> None:
-        view = self._surfaces[key].array(np.float16, (1, items, 1, self.s))
-        view[...] = np.asarray(x, dtype=np.float16).reshape(1, items, 1, self.s)
+        """把 `[items, s]`（通道优先）写进这张面的**前** `items` 行。
+
+        面可以比张量大：拆投影时 kv 段只有 `kv_rows` 行、而它落在 `out_in` 的 2×hidden 行里
+        （`SET_KEYS`）。所以这里按元素个数取前缀，而不是要求整张面等于张量形状。
+        """
+        view = self._surfaces[key].array(np.float16)[: items * self.s]
+        view[...] = np.asarray(x, dtype=np.float16).reshape(-1)
 
     def _read(self, key: str, items: int) -> np.ndarray:
-        view = self._surfaces[key].array(np.float16, (1, items, 1, self.s))
-        return view.reshape(items, self.s).copy()
+        """读回这张面的**前** `items` 行；比面小的时候只读前缀（理由同 `_write`）。"""
+        flat = self._surfaces[key].array(np.float16)[: items * self.s]
+        return flat.reshape(items, self.s).copy()
 
     def _eval(self, proc: str, cout: int) -> tuple[np.ndarray, float]:
-        ms = self._runtime.eval(self.name, PROCS[proc])
+        ms = self._runtime.eval(self.name, self._proc_index[proc])
         if ms < 0:
             raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc,
                                 reason=self._runtime.error())
@@ -528,7 +583,7 @@ class AneLayer:
 
     def eval_proc(self, proc: str, *, slot: int = 0) -> float:
         """只执行一个 procedure，不读回结果（流水线里结果留在面上给 GPU 核用）。"""
-        ms = self._runtime.eval_slot(self.name, PROCS[proc], slot)
+        ms = self._runtime.eval_slot(self.name, self._proc_index[proc], slot)
         if ms < 0:
             raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc, slot=slot,
                                 reason=self._runtime.error())
@@ -545,7 +600,7 @@ class AneLayer:
         发射之后到回收之前，CPU 可以去 GPU 命令缓冲里编码与该 procedure 无关的 kernel ——
         这是旧引擎 `ISSUE_EVAL` 的做法。违反"只有一个 eval 在飞"会抛 `NotReadyError`。
         """
-        self._runtime.issue(self.name, PROCS[proc], slot=slot)
+        self._runtime.issue(self.name, self._proc_index[proc], slot=slot)
         self._inflight += 1
 
     def reap_proc(self) -> float:
@@ -558,9 +613,14 @@ class AneLayer:
         return ms
 
     def project(self, x: np.ndarray) -> tuple[np.ndarray, float]:
-        """`[hidden, s]` → `[cout, s]`。"""
+        """`[hidden, s]` → `[cout, s]`；投影拆开时两段各跑一次、按行拼回整块。"""
         self._write("proj_in", self.hidden, x)
-        return self._eval("proj", self.cout)
+        split = self._split_rows
+        if split is None:
+            return self._eval("proj", self.cout)
+        q, ms_q = self._eval("proj_q", split[0])
+        kv, ms_kv = self._eval("proj_kv", split[1])
+        return np.concatenate([q, kv], axis=0), ms_q + ms_kv
 
     def output(self, attn: np.ndarray, residual: np.ndarray) -> tuple[np.ndarray, float]:
         """`[hidden, s]` 注意力输出 + `[hidden, s]` 残差 → `[hidden, s]`（含残差）。"""
@@ -602,8 +662,9 @@ class AneLayer:
         """
         self._files.load(self._runtime, self.name)
         for slot, surface_set in enumerate(self._sets):
-            for proc, pair in SET_KEYS.items():
-                self._runtime.attach_slot(self.name, PROCS[proc], slot,
+            for proc in self._proc_index:
+                pair = SET_KEYS[proc]
+                self._runtime.attach_slot(self.name, self._proc_index[proc], slot,
                                           surface_set.surfaces[pair[0]],
                                           surface_set.surfaces[pair[1]])
 

@@ -216,7 +216,9 @@ kernel void k_q_prep(device half        *qg     [[buffer(0)]],
     const uint j = tgid.x, h = tgid.y, s = a.s0 + j, D = E8_HEAD_DIM, tid = tid2.x;
     // S6: the rope position of this column.  Outside a batched tail it *is* the column; inside
     // one, the slots' rows are the same requests' rows at their own positions (e8_fold).
-    const uint p = e8_fold(a.nka, a.segw, s);
+    // A1: `qg` may be a K-slot ring, so the column a query lives at is not its position --
+    // `pos0` is how far the ring slot base sits behind the tile's first token.
+    const uint p = a.pos0 + e8_fold(a.nka, a.segw, s);
     threadgroup float qn[E8_HEAD_DIM];
     threadgroup float red[8];
     device half *base = qg + (ulong)(h * 2u * D) * a.src_stride;
@@ -249,7 +251,9 @@ kernel void k_kv_prep(device half        *kv     [[buffer(0)]],
                       uint2 tgid [[threadgroup_position_in_grid]],
                       uint2 tid2 [[thread_position_in_threadgroup]]) {
     const uint t = a.s0 + tgid.x, j = tgid.y, D = E8_HEAD_DIM, tid = tid2.x;
-    const uint p = e8_fold(a.nka, a.segw, t);      // S6: rope position, not the slot column
+    // S6: rope position, not the slot column.  A1：kv 是整窗缓存，`pos0` 恒为 0（留在这里只是
+    // 让两条 prep 核的写法一致）。
+    const uint p = a.pos0 + e8_fold(a.nka, a.segw, t);
     threadgroup float kn[E8_HEAD_DIM];
     threadgroup float red[8];
     device half *base = kv + (ulong)(j * D) * a.src_stride;

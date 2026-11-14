@@ -54,7 +54,7 @@ CONV_DIM = GEOMETRY.conv_dim
 HEAD_SCALE = GEOMETRY.head_scale  # attention 的 1/sqrt(head_dim)
 
 # ---- 参数结构体（与 e8_common.h 一一对应，单位是字节数）-------------------------------
-_NRM = struct.Struct("<IIIfIIII")  # struct NormArgs，32 B
+_NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
 _ATTN = struct.Struct("<IIIfIIIIIIII")  # struct AttnArgs，48 B
 _GDN = struct.Struct("<IIIIfII")  # struct GdnArgs，28 B
@@ -70,9 +70,13 @@ def nrm_args(
     segw: int = 0,
     dst_stride: int = 0,
     dst_s0: int = 0,
+    pos0: int = 0,
 ) -> bytes:
-    """`k_norm_to` / `k_norm_resid` / `k_q_prep` / `k_kv_prep` 共用（`e8_common.h:73`）。"""
-    return _NRM.pack(stile, s0, src_stride, eps, nka, segw, dst_stride, dst_s0)
+    """`k_norm_to` / `k_norm_resid` / `k_q_prep` / `k_kv_prep` 共用（`e8_common.h:73`）。
+
+    `pos0` 只有两条 prep 核读：`qg` 成环之后，列号不再是 rope 位置（见 `e8_common.h`）。
+    """
+    return _NRM.pack(stile, s0, src_stride, eps, nka, segw, dst_stride, dst_s0, pos0)
 
 
 def copy_args(
@@ -293,12 +297,16 @@ def q_prep(
     src_stride: int,
     eps: float,
     s0: int = 0,
+    pos0: int = 0,
     nka: int = 0,
     segw: int = 0,
     geometry: Geometry | None = None,
     lane: int = LANE_LONG,
 ) -> None:
-    """`k_q_prep`（原地）：q 半区做 RMSNorm+部分 RoPE，gate 半区做 sigmoid。"""
+    """`k_q_prep`（原地）：q 半区做 RMSNorm+部分 RoPE，gate 半区做 sigmoid。
+
+    `pos0 + s0 + j` 是第 j 列的 rope 位置：`qg` 成环时列落在槽位里，位置仍按整条序列算。
+    """
     geom = GEOMETRY if geometry is None else geometry
     grid, tg = _prep_grid(stile, geom.q_heads, geom.head_dim)
     runtime.dispatch(
@@ -313,6 +321,7 @@ def q_prep(
             segw=segw,
             dst_stride=0,
             dst_s0=0,
+            pos0=pos0,
         ),
         grid=grid,
         tg=tg,
@@ -331,6 +340,7 @@ def kv_prep(
     src_stride: int,
     eps: float,
     s0: int = 0,
+    pos0: int = 0,
     nka: int = 0,
     segw: int = 0,
     geometry: Geometry | None = None,
@@ -351,6 +361,7 @@ def kv_prep(
             segw=segw,
             dst_stride=0,
             dst_s0=0,
+            pos0=pos0,
         ),
         grid=grid,
         tg=tg,
@@ -370,6 +381,7 @@ def attention(
     nk: int,
     nq: int | None = None,
     s0: int = 0,
+    qgT: int = 0,
     nka: int = 0,
     segw: int = 0,
     nkw: int = 0,
@@ -383,6 +395,9 @@ def attention(
 
     `fast=True` 走寄存器内 score 分块（不需要 scratch）；`fast=False` 走参考核，需要
     `8*Stile*T` 个 float 的 scratch（只为不含快核的机器或对拍留一条路）。
+
+    `T` 是 **kv** 的列数（整窗缓存）；`qgT` 是 **qg** 的列数，0 表示两者同一张缓冲。`qg`
+    成环时 `s0` 是环槽位的起始列（q 与 gate 都从那里读），`nk` 仍是整条序列的可见上界。
     """
     geom = GEOMETRY if geometry is None else geometry
     if scratch is None:
@@ -408,7 +423,7 @@ def attention(
             nka=nka,
             segw=segw,
             nkw=nkw,
-            qgT=0,
+            qgT=qgT,
             out_stride=out_stride,
             out_s0=out_s0,
         ),

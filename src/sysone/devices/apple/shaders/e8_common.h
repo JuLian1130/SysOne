@@ -74,7 +74,7 @@ using namespace metal;
 // Argument blocks.  Field order is part of the ABI: e8_mtl.py packs these with struct.pack
 // using the format string noted next to each struct.  Never reorder a field.
 // ---------------------------------------------------------------------------------------
-struct NormArgs {          // e8_mtl.py: "<IIIfIIII"  -> 32 bytes
+struct NormArgs {          // e8_mtl.py: "<IIIfIIIII" -> 36 bytes
     uint  Stile;           // 0  destination columns
     uint  s0;              // 1  source column offset in the (C, src_stride) source
     uint  src_stride;      // 2  columns per channel in the source (= T)
@@ -91,6 +91,10 @@ struct NormArgs {          // e8_mtl.py: "<IIIfIIII"  -> 32 bytes
     // the old layout (dst_stride = Stile, dst_s0 = 0), which is every pre-pack caller.
     uint  dst_stride;      // 6  columns per channel in dst; 0 = Stile
     uint  dst_s0;          // 7  destination column offset inside dst
+    // A1：`qg` 成环之后，rope 位置不再等于列号。环里的 q 按槽位摆放（列 = `s0 + j`），而它的
+    // 位置是 `pos0 + s0 + j`（槽位 NCH 个一循环，所以 `pos0 = 本瓦片起始位置 - 槽位起始列`）。
+    // 整窗缓存（`qg` 未成环、`kv`）的 `pos0` 恒为 0，加 0 就是原来的行为。
+    uint  pos0;            // 8  rope 位置基准；0 = 列号即位置
 };
 
 // The rope position of data column `c`: inside a slot, the row's position within its own request.

@@ -5,6 +5,7 @@ import pytest
 from sysone.devices.apple.compile import (
     BUILD_INFO,
     ffn_mil,
+    layer_mil,
     out_mil,
     projection_mil,
 )
@@ -116,3 +117,48 @@ def test_ffn_mil_requires_every_down_chunk():
     with pytest.raises(NotReadyError) as excinfo:
         ffn_mil(hidden=8, ffn=24, s=32, entries=entries)
     assert excinfo.value.context["missing"] == ["down2"]
+
+
+# ---- A1（票据 06）：全注意力层的投影拆成 q 段 + kv 段 -----------------------------
+
+
+def _split_entries(hidden: int, ffn: int, q_rows: int, kv_rows: int) -> dict:
+    entries = {
+        "proj_q": _entry(offset=100, shape=(q_rows, hidden)),
+        "proj_kv": _entry(offset=200, shape=(kv_rows, hidden)),
+        "o": _entry(offset=300, shape=(hidden, hidden)),
+        "gate": _entry(offset=400, shape=(ffn, hidden)),
+        "up": _entry(offset=500, shape=(ffn, hidden)),
+    }
+    entries.update({f"down{i}": _entry(offset=600 + i, shape=(hidden, hidden)) for i in range(3)})
+    return entries
+
+
+def test_layer_mil_splits_the_projection_into_two_procedures():
+    """`main` 只算 `[q|gate]`、`p3` 只算 `[k|v]`，两段行数加起来仍是 cout；`p1`/`p2` 不动。"""
+    hidden, ffn, cout, q_rows, kv_rows = 8, 24, 40, 32, 8
+    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=32,
+                    entries=_split_entries(hidden, ffn, q_rows, kv_rows), split=True)
+    assert mil.count("func ") == 4
+    # q 段（proc 0）与 kv 段（proc 3）的入口形状相同，出口行数各自是 q_rows / kv_rows
+    assert mil.count(f"tensor<fp16, [1, {q_rows}, 1, 32]> y = conv(") == 1
+    assert mil.count(f"tensor<fp16, [1, {kv_rows}, 1, 32]> y = conv(") == 1
+    assert "func main<ios18>(tensor<fp16, [1, 8, 1, 32]> x)" in mil
+    assert "func p3<ios18>(tensor<fp16, [1, 8, 1, 32]> x)" in mil
+    # out / ffn 两个 func 与非拆形态逐字一样（序号也仍是 1 / 2）
+    assert 'name = string("y")' in mil and "slice_by_size" in mil and "silu(" in mil
+
+
+def test_split_projection_refuses_row_counts_that_do_not_add_up():
+    entries = _split_entries(8, 24, q_rows=16, kv_rows=8)
+    with pytest.raises(NotReadyError) as excinfo:
+        layer_mil(hidden=8, cout=40, ffn=24, s=32, entries=entries, split=True)
+    assert (excinfo.value.context["q"], excinfo.value.context["kv"]) == (16, 8)
+
+
+def test_split_projection_requires_both_halves():
+    entries = _split_entries(8, 24, q_rows=32, kv_rows=8)
+    del entries["proj_kv"]
+    with pytest.raises(NotReadyError) as excinfo:
+        layer_mil(hidden=8, cout=40, ffn=24, s=32, entries=entries, split=True)
+    assert excinfo.value.context["missing"] == ["proj_kv"]

@@ -131,16 +131,20 @@ def gdn_steps(n: int, par: int = 0, *, nch: int = NCH) -> tuple[Step, ...]:
 def attention_steps(
     n: int, par: int = 0, *, dead: int = 0, nch: int = NCH
 ) -> tuple[Step, ...]:
-    """一个全注意力层的瓦片链，分两相。
+    """一个全注意力层的瓦片链，分两相；投影也拆成两段（票据 06）。
 
-    **第一相**（每个瓦片）：`norm → proj1 → gather`。`gather` 把 `proj_out` 的两段搬进全宽的
-    `qg` / `kv`，走 lane 0。
+    **第一相**（每个瓦片）：`norm → proj_kv → gather_kv`。它只产 K/V，`gather_kv` 把
+    `proj_kv` 的输出搬进整窗的 `kv` 缓存。
 
-    **屏障**：`prep`（全序列的 q/k 归一 + RoPE）只能在本层所有 gather 之后编码，且所有
-    `attn` 都排在它之后。它写在 `par == 0` 的链上；驱动必须把另外那条链的 `attn` 卡在
-    这道屏障后面，否则它会读到没 prep 过的 `qg` / `kv`。
+    **屏障**：`prep_kv`（全序列的 k 归一 + RoPE）只能在本层所有 `gather_kv` 之后编码，
+    且所有 `attn` 都排在它之后。它写在 `par == 0` 的链上；驱动必须把另外那条链的 `attn`
+    卡在这道屏障后面，否则它会读到没 prep 过的 `kv`。
 
-    **第二相**（每个瓦片）：`attn → out → norm2 → ffn → tail`。
+    **第二相**（每个瓦片）：`norm → proj_q → gather_q → prep_q → attn → out → norm2 →
+    ffn → tail`。q 只活一个瓦片：`gather_q` 把它写进 `qg` 的**环槽位**，`prep_q` 就地归一 +
+    RoPE（rope 位置由 `NormArgs.pos0` 给），`attn` 紧接着读同一槽位。槽位按奇偶循环
+    （`ring_slot`），所以它每 `nch` 个瓦片才被同一条链重写一次 —— 那时上一次的 `attn` 早已
+    执行完（lane 0 编码序即执行序）。这就是 `qg` 不必整窗存活的全部理由。
 
     第二相**不能**把整条链的 `attn` 排到 body 之前（试过，2026-11-13 实测两头都更慢）：
     16k / prefix 0 墙 5262 → 6075 ms，出货口径 4907 → 5678 ms。原因是 dylib 的两条 lane 在
@@ -153,24 +157,28 @@ def attention_steps(
     所以保持交错：`attn` 一片接一片地排、body 紧跟其后，`out` 只等自己那一片。
 
     `dead`（S3）：前 `dead` 个瓦片整段落在请求的公共前缀里，而**模型最后一层**在这些瓦片上
-    只欠 K/V —— 它的注意力输出与 MLP 输出没有读者（读出在 query 行上，K/V 出自 `proj1`，
-    不依赖注意力输出）。所以这些瓦片保留第一相、丢掉第二相。`tail` 随之没写，那些列的 `h`
-    也没人读 —— 这就是它安全的原因。
+    只欠 K/V —— 它的注意力输出与 MLP 输出没有读者（读出在 query 行上，K/V 出自第一相，
+    不依赖注意力输出）。所以这些瓦片保留第一相、丢掉第二相（`proj_q` 起的全部）。`tail`
+    随之没写，那些列的 `h` 也没人读 —— 这就是它安全的原因。
     """
     tiles = [s for s in range(n) if s % nch == par]
     out: list[Step] = []
     for s in tiles:
         out += [
             _gpu("norm", s, LANE_SMALL),
-            _ane("proj1", s),
-            _gpu("gather", s, LANE_LONG),
+            _ane("proj_kv", s),
+            _gpu("gather_kv", s, LANE_LONG),
         ]
     if tiles and par == 0:
-        out.append(_gpu("prep", -1, LANE_LONG))
+        out.append(_gpu("prep_kv", -1, LANE_LONG))
     for s in tiles:
         if s < dead:                        # 整段落在前缀里，只欠 K/V（S3）
             continue
         out += [
+            _gpu("norm", s, LANE_SMALL),
+            _ane("proj_q", s),
+            _gpu("gather_q", s, LANE_LONG),
+            _gpu("prep_q", s, LANE_LONG),
             _gpu("attn", s, LANE_LONG),
             _ane("out", s),
             _gpu("norm2", s, LANE_SMALL),
@@ -178,6 +186,25 @@ def attention_steps(
             _gpu("tail", s, LANE_SMALL),
         ]
     return tuple(out)
+
+
+def ring_columns(width: int, bucket: int) -> int:
+    """`qg` 环的列数。
+
+    两条瓦片链各占一个槽位（`NCH` 个），整窗只有一个瓦片时一个槽位就够 —— 1k/4k 那种
+    `width == bucket` 的路不该因为成环而多花内存。
+    """
+    slots = max(1, min(NCH, -(-int(width) // int(bucket))))
+    return slots * int(bucket)
+
+
+def ring_slot(tile: int, bucket: int) -> int:
+    """瓦片 `tile` 在 `qg` 环里的起始列：槽位按奇偶循环，每条链恰好一个。
+
+    用 `NCH` 而不是环的槽数：`ring_columns` 只在整窗只有一片瓦片时退到 1 个槽位，
+    那时只有瓦片 0 会跑，`ring_slot` 也对得上。
+    """
+    return (int(tile) % NCH) * int(bucket)
 
 
 def blocks(

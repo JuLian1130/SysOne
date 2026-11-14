@@ -254,6 +254,8 @@ class MudeChain:
             program_root = scratch / root.name / f"s{s}"
             for index, role in enumerate(roles):
                 cout = geometry.cout_full if role is AttentionRole.FULL else geometry.cout_gdn
+                # 全注意力层把投影拆成 q 段 + kv 段（票据 06）：q 只活一个瓦片，`qg` 才能成环。
+                split = (geometry.qg_rows, geometry.kv_rows) if role is AttentionRole.FULL else None
                 directory = program_root / f"layer{index:02d}"
                 source = _artifact_source(
                     store, layer=index, role=role, cout=cout,
@@ -264,9 +266,11 @@ class MudeChain:
                     files = _build_layer_program(
                         store, directory=directory, index=index, role=role, cout=cout,
                         hidden=hidden, ffn=ffn, s=s, quantize=quantize, source=source,
+                        split=split,
                     )
                 layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
-                                       hidden=hidden, cout=cout, ffn=ffn, s=s, pool=pool))
+                                       hidden=hidden, cout=cout, ffn=ffn, s=s, pool=pool,
+                                       split_rows=split))
             final_norm = normalize_norm(store.read("language_model.norm.weight"))
             readout = _readout(root)
             temperature = float(decision.get("temperature", 1.0))
@@ -509,8 +513,14 @@ def _build_layer_program(
     s: int,
     quantize: bool,
     source: dict,
+    split: tuple[int, int] | None = None,
 ) -> ProgramFiles:
-    """读这一层的 fp16 权重、量化、生成 MIL 并落盘（缓存未命中的那一路）。"""
+    """读这一层的 fp16 权重、量化、生成 MIL 并落盘（缓存未命中的那一路）。
+
+    `split=(q_rows, kv_rows)` 时把整块投影**按行切成两段**（全注意力层，票据 06）：int8 是按
+    输出行量化的，切行不动 scale，所以两段的 codes 与未切时逐字节相同 —— blob 与 ANE 常驻
+    权重一分不多，换到的是 `qg` 可以成环。
+    """
     entries = ane_layer_weights(store.read, layer=index, layer_type=role)
     actual = int(entries["proj"].shape[0])
     if actual != cout:
@@ -519,14 +529,24 @@ def _build_layer_program(
         raise ValueError(
             f"第 {index} 层的 proj 行数 {actual} 与几何给出的 cout={cout} 不一致"
         )
+    if split is not None:
+        q_rows, kv_rows = split
+        if q_rows + kv_rows != actual:
+            raise ValueError(
+                f"第 {index} 层：拆投影的两段行数 {q_rows}+{kv_rows} 与 proj 的 {actual} 不符"
+            )
+        proj = entries["proj"]
+        rest = {key: value for key, value in entries.items() if key != "proj"}
+        entries = {**rest, "proj_q": proj[:q_rows], "proj_kv": proj[q_rows:]}
     blob, blob_entries = build_blob(entries, quantize=quantize)
-    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=blob_entries)
+    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=blob_entries,
+                    split=split is not None)
     return write_program(
         directory,
         mil=mil,
         blob=blob,
         s=s,
-        meta={"layer": index, "type": str(role), "cout": cout},
+        meta={"layer": index, "type": str(role), "cout": cout, "split": split},
         source=source,
     )
 
