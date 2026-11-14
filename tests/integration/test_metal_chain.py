@@ -144,16 +144,15 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
 
     桶宽 S/4、满宽 prompt 正好给 4 个瓦片，`prefix = S/4` 让第 0 个瓦片整段落在前缀里。
 
-    **先空跑一遍再比**：分块链的**第一次** `logits()` 与后面几次不同（实测 pass1 对 numpy 链
-    `relL2 1.47e-1`、pass2/3 `1.31e-3`，与 `_skip_dead` 无关，单进程单链也一样），见
-    `.scratch/m22-chain/issues/02-first-pass-chunked.md`。产品路径不受影响：`Engine.start()`
-    先跑一趟预热，服务与 `sysone run` 的第一笔请求已经是第二趟。跑过一遍之后答案才稳定，
-    这条 A/B 才有意义。
+    这条用例拿**第一次** `logits()` 比，不预热。分块链的首趟曾经与后续不同（对 numpy 链
+    `relL2 1.47e-1`，pass2 起 `1.31e-3`）：`proj` 的 ANE 写不在任何一条 lane 上，而读同一张
+    `proj_out` 的 `gather` 在 lane 0 —— 首趟拷贝冷页慢，写就把上一片的读盖掉了。修法是在
+    `proj` 发射前也等到同一槽位上一片 `gather` 的 CB（见 `pipeline._issue`，票据 02）。
 
     量两件事：**出货形态（双链 + S3 开）与单链全量计算逐位相同**，以及 **S3 真的少发了一片
     注意力**（数 `wait_upto` 的 lane 0 次数，不数的话"答案一致"也可能是因为根本没跳过）。
-    票据 01 原先把 `_skip_dead = False`（双链）那臂记成"坏参照"，现在证据指向"首次 pass"这个
-    共同原因，票据已据此改写。
+    票据 01 原先把 `_skip_dead = False`（双链）那臂记成"坏参照"——那一臂其实是该进程的
+    第一次运行，票据已据此改写。
     """
     from sysone.devices.apple.metal import LANE_LONG
 
@@ -181,7 +180,6 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
             runtime.wait_upto = original          # type: ignore[method-assign]
 
     try:
-        run(original_nch, True)                   # 预热（首次 pass 不算，票据 02）
         shipping = run(original_nch, True)
         full_single = run(1, False)
         assert np.array_equal(shipping, full_single), (

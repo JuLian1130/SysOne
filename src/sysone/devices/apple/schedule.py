@@ -24,7 +24,11 @@
 
 1. 一条链独占一套表面（= ANE 槽位），一次只有一个 ANE eval 在飞；
 2. 瓦片 `s` 的 `h` 只有在它的 `tail` CB 回收后才算写好，下游层读它必须等这条链的 tail；
-3. 共享的 `qg` / `kv` 只留一份：一个 block 里至多一个全注意力层（见 `blocks()`）。
+3. 共享的 `qg` / `kv` 只留一份：一个 block 里至多一个全注意力层（见 `blocks()`）；
+4. **ANE 的写不排在任何一条 lane 上**：同一槽位的下一片 `proj` 写 `proj_out` 之前，必须等上一片
+   `gather`（lane 0）的读结算完 —— 否则首趟冷页慢时，写会把读盖掉（`pipeline._issue` 里的
+   `_wait_for(chain, "gather", tile - nch)`，票据 02）。
+
 """
 
 from __future__ import annotations

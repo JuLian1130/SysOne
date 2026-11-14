@@ -403,6 +403,11 @@ class MudePipeline:
             self._step_norm(chain, entry, tile)
         elif work in ("proj1", "proj"):
             self._wait_for(chain, "norm", tile)
+            # 同一槽位的上一片 `gather` 还在读这张 `proj_out`（lane 0），而 ANE 的写不在任何一条
+            # lane 上：不显式等它，`proj` 的写就会与那一片的读重叠 —— 首趟拷贝冷页慢，实测
+            # 块 1（第一个全注意力层）的输出与后续趟差 2.6e-1。GDN 层没有这个洞：读 `proj_out`
+            # 的 gdn 核在 `core` 那个 CB 里，与后来的 `norm2` 同一条 lane，等 `norm2` 等于等它。
+            self._wait_for(chain, "gather", tile - self._nch)
             entry.ane.issue_proc("proj", slot=chain.slot)
         elif work == "gather":
             self._step_gather(chain, entry, tile)
