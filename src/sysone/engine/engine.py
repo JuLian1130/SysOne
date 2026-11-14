@@ -93,7 +93,11 @@ class Engine:
         started = time.perf_counter()
         if request.media:
             raise UnsupportedMediaError("M0 不支持多模态输入", count=len(request.media))
-        mode = request.attention_mode or self._descriptor.default_mode
+        # 三级回落：请求 → 配置（`--attention-mode`，`SchedulerConfig` 的 docstring 写明
+        # 非 None 就是"用这个"）→ 模型自己的默认。跳过中间一级会让 CLI 的开关只在
+        # `cache_key` 里留痕、在请求上不留痕。
+        mode = (request.attention_mode or self._config.scheduler.attention_mode
+                or self._descriptor.default_mode)
         if mode not in self._descriptor.supported_modes:
             raise UnsupportedModeError(
                 "该模型不支持所选注意力模式",

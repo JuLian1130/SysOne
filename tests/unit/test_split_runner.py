@@ -265,6 +265,29 @@ def test_an_untrained_mode_warns_once_and_says_so_in_provenance(caplog) -> None:
     assert "noncausal_full" in warnings[1].getMessage()
 
 
+def test_the_configured_mode_applies_when_the_request_has_none() -> None:
+    """`--attention-mode` 走 `SchedulerConfig`：请求没带 mode 时它必须生效，而不是被忽略。
+
+    这一条守的是"静默忽略"回归：配置里写着 causal、请求不指定、结果按 `default_mode` 跑了
+    一路，provenance 也报 `prefix_noncausal` —— 开关只在 `cache_key` 里留痕。
+    """
+    chain = FakeChain()
+    engine = _engine(chain, _config(mode=MaskMode.CAUSAL))
+    engine.start()
+    result = engine.run(make_request(questions=1))
+    assert result.provenance.attention_mode is MaskMode.CAUSAL
+    assert chain.calls[-1][3] == 1
+
+
+def test_the_request_mode_beats_the_configured_mode() -> None:
+    chain = FakeChain()
+    engine = _engine(chain, _config(mode=MaskMode.CAUSAL))
+    engine.start()
+    result = engine.run(make_request(mode=MaskMode.PREFIX_NONCAUSAL, questions=1))
+    assert result.provenance.attention_mode is MaskMode.PREFIX_NONCAUSAL
+    assert chain.calls[-1][3] == 0
+
+
 def test_the_trained_mode_does_not_warn(caplog) -> None:
     engine = _engine(FakeChain())
     engine.start()
