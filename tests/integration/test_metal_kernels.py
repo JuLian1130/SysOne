@@ -132,9 +132,10 @@ def test_argument_structs_match_the_c_header() -> None:
         nkw_slots=[60, 63, 66, 69, 72, 75, 80, 90]))[12:] == (
         1024, 60 | (63 << 16), 66 | (69 << 16), 72 | (75 << 16), 80 | (90 << 16),
     )
-    assert kernels._GDN.unpack(kernels.gdn_args(stile=4, s0=0, T=4, first=True, eps=1e-6))[:4] == (
-        4, 0, 4, 1,
-    )
+    # GDN 的 `s0` 是"源表面首列"（票据 10 的逐槽扫描），与 `AttnArgs.s0`（qg 环列）、
+    # `CopyArgs.s0`（目标列偏移）同名不同义 —— 这里用非零值钉住它在索引 1。
+    assert kernels._GDN.unpack(kernels.gdn_args(stile=4, src_s0=7, T=4, first=True,
+                                                eps=1e-6))[:4] == (4, 7, 4, 1)
 
 
 def test_q_and_kv_prep_match_numpy(store: SafeTensorFile, runtime: MetalRuntime) -> None:

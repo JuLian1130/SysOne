@@ -144,8 +144,8 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     const int   St  = int(a.cols ? a.cols : a.Stile);
     const int   t0  = int(tgid.y) * E8G_TB;
     // Ticket 10: a batched tail pass runs one slot per dispatch, so every read of the source
-    // surface is at `a.s0 + <tile-local column>`; 0 is the old single-state call.
-    const uint  so  = a.s0;
+    // surface is at `a.src_s0 + <tile-local column>`; 0 is the old single-state call.
+    const uint  so  = a.src_s0;
     if (t0 >= St) return;
 
     threadgroup float red[2 * E8G_TB][8];      // per-token sumq (rows 0..TB-1), sumk (TB..)
@@ -302,7 +302,7 @@ kernel void k_gdn_tail(device const half  *proj   [[buffer(0)]],
     const uint h   = tgid.x;
     const ulong sp = a.Stile;
     const uint  ncol = a.cols ? a.cols : a.Stile;
-    const uint  so   = a.s0;
+    const uint  so   = a.src_s0;
     if (ncol < 3u || h >= (uint)E8_L_HEADS || tid >= (uint)E8G_D) return;
     const uint cq = h * E8G_D + tid;
     const uint ck = E8_HID + cq;
@@ -358,7 +358,7 @@ kernel void k_gdn(device const half  *proj   [[buffer(0)]],
         S[i + 0] = t.x; S[i + 1] = t.y; S[i + 2] = t.z; S[i + 3] = t.w;
     }
     const int   St    = int(a.cols ? a.cols : a.Stile);
-    const uint  so    = a.s0;                        // ticket 10: first source column
+    const uint  so    = a.src_s0;                        // ticket 10: first source column
     const ulong qbase = E8G_S_QN + h * E8G_D + tq;   // this lane's 32 qn halves within a row
     const ulong kbase = E8G_S_KN + h * E8G_D + tq;
     const ulong vbase = E8G_S_V  + h * E8G_D + dv;
@@ -452,7 +452,7 @@ kernel void k_gdn_norm(device const half  *proj   [[buffer(0)]],
     const uint  dv  = lane * 4u;
     const ulong off = (ulong)(h * E8G_D + dv) * osp + os0 + (ulong)s;
     device half *o = out + off;
-    device const half *z = proj + (ulong)(E8_FFN + h * E8G_D + dv) * sp + (ulong)a.s0
+    device const half *z = proj + (ulong)(E8_FFN + h * E8G_D + dv) * sp + (ulong)a.src_s0
                                 + (ulong)s;
     float y[4];
     float sq = 0.0f;

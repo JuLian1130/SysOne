@@ -282,6 +282,25 @@ def test_batched_tails_with_unequal_lengths(packed) -> None:
     _shared_vs_single(packed, 256, (60, 63, 66, 69))
 
 
+def test_batched_tails_only_need_the_key_block_alignment(packed) -> None:
+    """前缀 192：64 对齐、但不是桶边界（256）——旧闸 `prefix % bucket` 会把它挡掉。
+
+    `prefix % AT_BN == 0` 时槽位自己的 key 与逐题整趟落在同一批 64-key 块里，所以逐位
+    （票据 10 的 1088 实测就是这个条件；`1000` 才差 5e-3）。
+    """
+    prefix, tails = 192, (60, 60, 60, 60)
+    tokens = _ids(prefix + sum(tails))
+    head, bounds = tokens[:prefix], np.cumsum((0, *tails))
+    tail_ids = [tokens[prefix + int(start):prefix + int(end)]
+                for start, end in zip(bounds[:-1], bounds[1:])]
+    assert packed._pipeline._slot_layout(prefix, tails) is not None
+    want = [packed.logits(head + tail, prefix=prefix) for tail in tail_ids]
+    got = packed.logits_shared(head, tail_ids)
+    for index, (row, ref) in enumerate(zip(got, want)):
+        drift = float(np.abs(row - ref).max())
+        assert np.array_equal(row, ref), f"第 {index} 题（prefix=192）不是逐位相同：{drift:.3e}"
+
+
 def test_forward_shared_under_a_resident_window(windowed) -> None:
     """`--W 4`：按块交错的形状要能在换窗里跑完，且与逐题整趟逐位相同。"""
     _shared_vs_single(windowed, 150, (6, 4))

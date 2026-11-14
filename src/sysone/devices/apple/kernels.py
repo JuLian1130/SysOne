@@ -132,7 +132,7 @@ def attn_args(
 
 
 def gdn_args(
-    *, stile: int, s0: int, T: int, first: bool, eps: float, out_stride: int = 0,
+    *, stile: int, src_s0: int, T: int, first: bool, eps: float, out_stride: int = 0,
     out_s0: int = 0, cols: int = 0,
 ) -> bytes:
     """`k_gdn` 家族（`e8_common.h:137`）。`first=True` 表示这是这一层的第一个 tile（卷积尾巴无效）。
@@ -140,7 +140,7 @@ def gdn_args(
     `stile` 是**表面步长**（`proj[c*stile + j]`），`cols` 是本瓦片真实列数（0 = `stile`）。
     两者分开之后，部分瓦片（共享前缀的尾巴、prompt 的最后一段）才能给出正确的卷积尾巴。
     """
-    return _GDN.pack(stile, s0, T, 1 if first else 0, eps, out_stride, out_s0, cols)
+    return _GDN.pack(stile, src_s0, T, 1 if first else 0, eps, out_stride, out_s0, cols)
 
 
 # ---- 网格 -----------------------------------------------------------------------------
@@ -468,7 +468,7 @@ def gdn(
     stile: int,
     eps: float,
     first: bool = True,
-    s0: int = 0,
+    src_s0: int = 0,
     T: int = 0,
     out_stride: int = 0,
     out_s0: int = 0,
@@ -481,12 +481,12 @@ def gdn(
 
     快核是 4 个 dispatch（prep → tail → delta 递推 → gated RMSNorm），参考核是一个。
     两者都把 fp32 的 `state`（16×128×128）与 3 列的 `tail` 原地推进，所以同一序列的多次
-    tile 调用必须按 s0 递增顺序来，`first=True` 只给第一个 tile。`scratch` 是第 9 个缓冲
+    tile 调用必须按 src_s0 递增顺序来，`first=True` 只给第一个 tile。`scratch` 是第 9 个缓冲
     （`8192*stile` 个 fp16，旧引擎 `d.alloc(8192 * tile * 2)`），参考核与快核都会绑它。
     """
     geom = GEOMETRY if geometry is None else geometry
     args = gdn_args(
-        stile=stile, s0=s0, T=T, first=first, eps=eps, out_stride=out_stride, out_s0=out_s0,
+        stile=stile, src_s0=src_s0, T=T, first=first, eps=eps, out_stride=out_stride, out_s0=out_s0,
         cols=cols,
     )
     buffers_list = [proj, state, tail, wconv, a_log, dt_bias, norm, out, scratch]

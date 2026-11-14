@@ -113,10 +113,10 @@ struct CopyArgs {          // e8_mtl.py: "<IIIIIIII" -> 32 bytes
     uint  src_s0;          // 7  source column offset (tile surfaces pass 0)
 };
 
-struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIII" -> 48 bytes
+struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIIIIIIII" -> 68 bytes
     uint  T;               // 0  sequence length (columns of qg / kv)
     uint  Stile;           // 1  queries in this tile
-    uint  s0;              // 2  first query position of this tile
+    uint  s0;              // 2  first *ring* column of the queries (not the position once qg rings)
     float scale;           // 3  HEAD_DIM ** -0.5
     // Appended, never inserted: the offsets above are the ABI.  `nk` is what makes a padded last
     // tile a *correctness* question rather than a cost one -- the zero rows are keys for every
@@ -155,7 +155,7 @@ struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIII" -> 48 bytes
 
 struct GdnArgs {           // e8_mtl.py: "<IIIIfIII" -> 32 bytes
     uint  Stile;           // 0  columns per channel in the surfaces (a *stride*, not a count)
-    uint  s0;              // 1  first token position (for rope-free absolutes / debug)
+    uint  src_s0;          // 1  first source column in `proj`/`out` (ticket 10: one scan per slot)
     uint  T;               // 2  total sequence length (unused by the A1 cores, kept for A2)
     uint  first;           // 3  1 = first tile of the layer (conv tail is invalid)
     float eps;             // 4

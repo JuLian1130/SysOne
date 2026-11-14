@@ -33,11 +33,26 @@ def test_layout_widens_the_slot_for_longer_tails() -> None:
 
 @pytest.mark.parametrize("prefix,lengths", [
     (16384, (60,)),                       # 一题没有可批的东西
-    (16384 + 1, (60, 60)),                # 前缀不在桶边界
+    (16384 + 1, (60, 60)),                # 前缀不在 key 块（64）边界
+    (16384 + 32, (60, 60)),               # 同上：离块边界只差 32 也不行
     (16384, (1025, 60)),                  # 尾巴比一个桶还长
 ])
 def test_layout_declines(prefix: int, lengths: tuple[int, ...]) -> None:
     assert _layout(prefix, lengths) is None
+
+
+def test_layout_only_needs_the_key_block_alignment() -> None:
+    """64 对齐就够（1088 实测逐位）：桶（1024）对齐是更严的旧条件，不是正确性边界。"""
+    layout = _layout(16384 + 64, (60, 60, 60, 60))
+    assert layout is not None
+    assert (layout.slotw, layout.per, layout.ntiles, layout.nt) == (128, 8, 1, 1024)
+    assert layout.starts[0] == 16384 + 64
+
+
+def test_layout_refuses_more_slots_than_the_table_holds() -> None:
+    """`AttnArgs` 的可见行数表是 8 槽 × 16 bit（`kernels.attn_args` 对第 9 槽起丢弃）。"""
+    stub = SimpleNamespace(_bucket=2048, _width=8192)
+    assert MudePipeline._slot_layout(stub, 2048, (128, 128, 128, 128)) is None
 
 
 def test_layout_needs_a_bucket_of_slack() -> None:

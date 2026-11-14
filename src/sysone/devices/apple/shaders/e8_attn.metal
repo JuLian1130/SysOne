@@ -413,9 +413,10 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     // the single bound every pre-S6 caller passes.
     const uint nka  = a.segw ? a.nka : nk;
     // Ticket 10: the slot index needs the *sequence* column.  Once qg is a ring (A1), `s0` is the
-    // ring column and not the position, so a batched tail pass passes `qseq`; every single-buffer
-    // caller leaves it 0 and keeps the old `s0` meaning.
-    const uint qpos = (a.segw && a.qseq ? a.qseq : a.s0) + j0;      // first query column here
+    // ring column and not the position, so a batched tail pass passes `qseq`.  `segw != 0` always
+    // comes with `qseq >= 1` (the shared-prefix path forbids an empty prefix); every single-buffer
+    // caller leaves `segw` 0 and keeps the old `s0` meaning.
+    const uint qpos = (a.segw ? a.qseq : a.s0) + j0;                // first query column here
     const uint slot = (a.segw && qpos >= nka) ? (qpos - nka) / a.segw : 0u;
     const uint nkb  = a.segw ? nka + slot * a.segw : 0u;            // first key of the own slot
     // Ticket 10: per-slot row count.  Equal-length tails could still use the single `nkw`; the
@@ -424,7 +425,7 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     // stays 8 entries wide however many slots the pass has.
     uint cnt = a.nkw;
     if (a.segw && (a.nkw0 | a.nkw1 | a.nkw2 | a.nkw3)) {
-        const uint rel  = min((a.qseq ? qpos - a.qseq : qpos) / a.segw, 7u);
+        const uint rel  = min((qpos - a.qseq) / a.segw, 7u);
         const uint word = rel < 2u ? a.nkw0 : rel < 4u ? a.nkw1 : rel < 6u ? a.nkw2 : a.nkw3;
         cnt = (word >> ((rel & 1u) * 16u)) & 0xFFFFu;
     }

@@ -336,9 +336,9 @@ kernel void k_attn_ref(device const half  *qg      [[buffer(0)]],
 // ---------------------------------------------------------------------------------------
 inline half e8_gdn_raw(device const half *proj, device const half *tail, constant GdnArgs &a,
                        uint c, int t) {
-    if (t >= (int)a.s0) return proj[(ulong)c * a.Stile + (t - (int)a.s0)];
+    if (t >= (int)a.src_s0) return proj[(ulong)c * a.Stile + (t - (int)a.src_s0)];
     if (a.first) return half(0.0f);
-    int idx = t - (int)a.s0 + 3;       // -3..-1 -> 0..2
+    int idx = t - (int)a.src_s0 + 3;       // -3..-1 -> 0..2
     return tail[(ulong)c * 3 + idx];
 }
 
@@ -356,7 +356,7 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
                       uint  ndv [[threads_per_threadgroup]]) {
     const uint D = E8_L_KD;            // == E8_L_VD
     if (ndv != D) return;
-    const int s0 = int(a.s0);
+    const int s0 = int(a.src_s0);
     device float *st = state + (ulong)h * D * D + (ulong)dv * D;
 
     const float inv = rsqrt(float(D));

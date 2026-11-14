@@ -86,6 +86,7 @@ def _float_buffer(runtime: MetalRuntime, array: np.ndarray, dtype) -> MetalBuffe
 
 
 AT_BM = 128   # 注意力的 query 块（`e8_attn.metal`），槽宽必须是它的整数倍
+AT_BN = 64    # 注意力的 key 块（`e8_attn.metal` 的 online softmax 按它分组），批尾巴的逐位条件
 
 
 @dataclass(frozen=True)
@@ -321,7 +322,12 @@ class MudePipeline:
         GDN 的递归状态与卷积尾巴**逐层独立**：前缀相跑完就抄到 host，尾巴相开始前再写回去
         （`first=False`，卷积尾巴继续用前缀的最后 3 行）。跨相传递就这一处。
 
-        `prefix` 不要求是桶宽的整数倍（逐题那条路支持不对齐）；批尾巴要求它落在桶边界。
+        `prefix` 不要求是 64 的整数倍：批尾巴要求 `prefix % AT_BN == 0`（key 块的 64 列分组，
+        见 `_slot_layout` 的注释），不齐时逐题尾巴（实测与整趟差 1.9–5.4e-3，argmax 不变，
+        `.scratch/probe_batch_align.py`）。旧引擎的 `--merge-align floor/pad` 是 tile 粒度
+        （1024）的补救，**在这里没有用**：我们的逐题尾巴相已经对不齐的前缀逐位，而"把末尾行
+        挪进尾巴"会让这些行也看见题面——同一份服务 payload 实测答案移 0.08–0.11（票据 10），
+        比不齐时直接批的 ~5e-3 大 20 倍。
         """
         if not 0 < prefix <= self._width:
             raise ConfigError("共享前缀的长度越界", prefix=prefix, width=self._width)
@@ -390,19 +396,24 @@ class MudePipeline:
 
         条件：每条尾巴装得进一个桶、槽宽整除桶宽（这样槽位边界落在瓦片边界上、一个槽不跨
         瓦片），以及**宽缓冲装得下整个打包区** —— 打包区是整桶的整数倍，调用方要在前缀
-        之后留出这一桶的余量（前缀本身不必桶对齐）。
+        之后留出这一桶的余量。
+
+        **逐位条件只是 `prefix % AT_BN == 0`（64，key 块）**，不是桶：online softmax 按 64
+        个 key 一块分组，前缀落在块边界时槽位自己的 key 与逐题整趟落在同样的分组里。实测
+        `.scratch/probe_prefix_align.py`：`prefix = 1088`（%64=0、%1024=64）逐位相同，
+        `prefix = 1000`（%64=40）槽位 1..3 差 3.8–5.7e-3（票据 10）。
         """
         questions = len(lengths)
         longest = max(lengths)
         slotw = -(-int(longest) // AT_BM) * AT_BM
-        # 现在还要求前缀落在桶边界：尾巴的瓦片从 `prefix` 起切，前缀不齐时槽位 1..3 与逐题
-        # 尾巴差 ~5e-3（argmax 不变，根因没查到，见票据 10）；对齐时**逐位相同**。真实 state
-        # 的长度（10 812）因此还批不了 —— 需要调用方把 state 补到桶边界（旧引擎的 `pad`
-        # 对齐），这一条单独记着。
-        if (questions < 2 or prefix % self._bucket or longest > self._bucket
+        if (questions < 2 or prefix % AT_BN or longest > self._bucket
                 or slotw % AT_BM or self._bucket % slotw):
             return None
         per = self._bucket // slotw
+        # `AttnArgs` 只有 8 槽 × 16 bit 的可见行数表（`kernels.attn_args` 对第 9 槽起静默丢弃），
+        # 而 `per` 是 `bucket // slotw`：bucket 1024/槽宽 128 恰好 8，bucket 2048 就 16。
+        if per > 8:
+            return None
         ntiles = -(-questions // per)
         nt = ntiles * self._bucket
         if prefix + nt > self._width:
@@ -848,7 +859,7 @@ class MudePipeline:
                     entry.weights["conv"], entry.weights["a_log"], entry.weights["dt_bias"],
                     entry.weights["norm"], entry.surface("out_in", chain.slot), self.gscratch,
                     stile=self._bucket, cols=cnt, eps=EPS, first=False,
-                    T=self._bucket, out_stride=self._bucket, s0=lo, out_s0=lo,
+                    T=self._bucket, out_stride=self._bucket, src_s0=lo, out_s0=lo,
                     fast=True, geometry=self._geometry,
                 )
         else:
