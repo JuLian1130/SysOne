@@ -228,26 +228,28 @@ def _ids(count: int, seed: int = 20261114) -> tuple[int, ...]:
 SHARED_TOL = 1e-2
 
 
-def _shared_vs_single(chain, prefix: int, tails: tuple[int, ...], *, options: int = 4) -> None:
+def _shared_vs_single(chain, prefix: int, tails: tuple[int, ...], *, options: int = 4,
+                      causal: bool = False) -> None:
     """共享前缀的 logits 必须与"每题单独整趟"一致（答案逐题相同，数值在 ulp 量级内）。"""
     tokens = _ids(prefix + sum(tails))
     head = tokens[:prefix]
     bounds = np.cumsum((0, *tails))
     tail_ids = [tokens[prefix + int(start):prefix + int(end)]
                 for start, end in zip(bounds[:-1], bounds[1:])]
-    per_question = [chain.logits(head + tail, prefix=prefix) for tail in tail_ids]
-    shared = chain.logits_shared(head, tail_ids)
+    per_question = [chain.logits(head + tail, prefix=prefix, causal=causal) for tail in tail_ids]
+    shared = chain.logits_shared(head, tail_ids, causal=causal)
     assert len(shared) == len(per_question)
     for index, (got, want) in enumerate(zip(shared, per_question)):
         drift = float(np.abs(got - want).max())
         assert drift <= SHARED_TOL, (
             f"共享前缀第 {index} 题与单趟差 {drift:.3e}，超过 {SHARED_TOL}")
         assert int(np.argmax(got)) == int(np.argmax(want)), f"共享前缀第 {index} 题答案变了"
-    probs = chain.forward_shared(head, tail_ids, options=[options] * len(tail_ids))
+    probs = chain.forward_shared(head, tail_ids, options=[options] * len(tail_ids),
+                                 causal=causal)
     for index, row in enumerate(probs):
         assert np.allclose(
             row,
-            chain.forward(head + tail_ids[index], options=options, prefix=prefix),
+            chain.forward(head + tail_ids[index], options=options, prefix=prefix, causal=causal),
             rtol=0, atol=SHARED_TOL,
         ), f"共享前缀第 {index} 题的概率超过 {SHARED_TOL}"
 
@@ -327,3 +329,63 @@ def test_batched_tails_under_an_unaligned_prefix(packed) -> None:
 def test_forward_shared_under_a_resident_window(windowed) -> None:
     """`--W 4`：按块交错的形状要能在换窗里跑完，且与逐题整趟逐位相同。"""
     _shared_vs_single(windowed, 150, (6, 4))
+
+
+# ---- M3：causal 路径 -------------------------------------------------------------------
+
+
+def test_causal_chain_matches_the_numpy_chain(chains) -> None:
+    """`caus=1` 的流水线与 numpy 链的三角掩码对拍（桶 256，一整个 prompt 一段）。"""
+    cpu, gpu = chains
+    lcpu = cpu.logits(TOKENS, causal=True)
+    lgpu = gpu.logits(TOKENS, causal=True)
+    rel = float(np.linalg.norm(lgpu - lcpu) / np.linalg.norm(lcpu))
+    assert rel < TOL, f"causal 下 metal 与 numpy 链的 logits 偏差 {rel:.4e} 超过 {TOL}"
+
+
+def test_causal_covers_a_multi_tile_prompt(chains, chunked) -> None:
+    """桶 64 的链跑同一个 prompt：四段 query、每段的上界是它自己的末列（`nchi` 那条路）。"""
+    _, gpu = chains
+    tokens = TOKENS * (S // len(TOKENS))       # 正好填满 256 列的缓冲
+    assert len(tokens) == S
+    once = gpu.logits(tokens, causal=True)
+    segment = chunked.logits(tokens, causal=True)
+    rel = float(np.linalg.norm(segment - once) / np.linalg.norm(once))
+    assert rel < TOL, f"causal 的四段与单段差 {rel:.4e}，超过 {TOL}"
+
+
+def test_causal_is_systematically_different_from_noncausal(chains) -> None:
+    """计划里的验收项：causal 与双向必须**显著不同**，不能只是"看起来不同"。
+
+    末行在两种掩码下看到的 key 集合一样（都是整条 prompt），但前几行的 hidden 不同 ⇒ 它们
+    的 K/V 不同 ⇒ 末行的注意力也不同。差得少了就说明 causal 根本没生效。
+    """
+    cpu, _ = chains
+    went = cpu.logits(TOKENS, prefix=0)
+    caus = cpu.logits(TOKENS, causal=True)
+    gap = float(np.abs(went - caus).max())
+    assert gap > 1e-2, f"causal 与 noncausal_full 的最大 logits 差只有 {gap:.3e}，掩码像是没生效"
+
+
+def test_causal_shared_prefix_matches_per_question_passes(chains) -> None:
+    """causal 下共享前缀：前缀相自己成三角，尾巴行看 `[0, q]`（含整个前缀）。"""
+    _, gpu = chains
+    _shared_vs_single(gpu, 200, (5, 3), causal=True)
+
+
+def test_causal_batched_tails_keep_the_slot_contract(packed) -> None:
+    """causal 叠在批尾巴上：槽位规则之上再按行收，槽 0 仍与逐题整趟逐位相同。"""
+    prefix, tails = 192, (60, 60, 60, 60)
+    tokens = _ids(prefix + sum(tails))
+    head, bounds = tokens[:prefix], np.cumsum((0, *tails))
+    tail_ids = [tokens[prefix + int(start):prefix + int(end)]
+                for start, end in zip(bounds[:-1], bounds[1:])]
+    assert packed._pipeline._slot_layout(prefix, tails) is not None
+    want = [packed.logits(head + tail, prefix=prefix, causal=True) for tail in tail_ids]
+    got = packed.logits_shared(head, tail_ids, causal=True)
+    assert np.array_equal(got[0], want[0]), (
+        f"causal 槽 0 不再逐位：{float(np.abs(got[0] - want[0]).max()):.3e}")
+    for index, (row, ref) in enumerate(zip(got, want)):
+        drift = float(np.abs(row - ref).max())
+        assert drift <= SHARED_TOL, f"causal 批尾巴第 {index} 题差 {drift:.3e}，超过 {SHARED_TOL}"
+        assert int(np.argmax(row)) == int(np.argmax(ref)), f"causal 批尾巴第 {index} 题的答案变了"

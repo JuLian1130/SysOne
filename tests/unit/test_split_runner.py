@@ -51,8 +51,8 @@ class FakeChain:
         self.closed = False
         self._shares = shares
 
-    def forward(self, tokens, *, options, prefix=0):
-        self.calls.append((tuple(tokens), int(options), int(prefix)))
+    def forward(self, tokens, *, options, prefix=0, causal=False):
+        self.calls.append((tuple(tokens), int(options), int(prefix), int(bool(causal))))
         if self._shares is not None:
             values = list(self._shares[:options])
             return [value / sum(values) for value in values]
@@ -200,8 +200,8 @@ def test_answers_cover_every_question_and_forward_the_prefix() -> None:
     assert result.answers[0].confidence == 0.25
     assert result.answers[0].value == "A"  # 平分时取第一个
     assert result.usage.prefill_calls == 2
-    assert all(options == 4 for _, options, _ in chain.calls[1:])
-    assert all(prefix > 0 for _, _, prefix in chain.calls)
+    assert all(options == 4 for _, options, _, _ in chain.calls[1:])
+    assert all(prefix > 0 for _, _, prefix, _ in chain.calls)
     assert result.timings is not None
 
 
@@ -237,14 +237,52 @@ def test_noul_question_reports_yes_no_in_engine_order() -> None:
     assert chain.calls[-1][1] == 2  # 两道选项: No / Yes
 
 
-def test_causal_mode_is_rejected() -> None:
+def test_causal_reaches_the_chain_as_a_triangular_mask() -> None:
+    """M3：causal 不再是 400 —— 它作为 `causal=True` 传到链上（掩码在链里）。"""
+    chain = FakeChain()
+    engine = _engine(chain)
+    engine.start()
+    result = engine.run(make_request(mode=MaskMode.CAUSAL, questions=1))
+    assert result.provenance.attention_mode is MaskMode.CAUSAL
+    assert chain.calls[-1][3] == 1
+
+
+def test_an_untrained_mode_warns_once_and_says_so_in_provenance(caplog) -> None:
+    """M3：`attention_trained` 逐请求带；日志按 mode 只报一次（服务日志不能被它淹掉）。"""
+    chain = FakeChain()
+    engine = _engine(chain)
+    engine.start()
+    with caplog.at_level("WARNING", logger="sysone.engine.engine"):
+        first = engine.run(make_request(mode=MaskMode.CAUSAL, questions=1))
+        engine.run(make_request(mode=MaskMode.CAUSAL, questions=1))
+        again = engine.run(make_request(mode=MaskMode.NONCAUSAL_FULL, questions=1))
+    assert first.provenance.attention_trained is False
+    assert first.provenance.attention_mode is MaskMode.CAUSAL
+    assert again.provenance.attention_trained is False
+    warnings = [record for record in caplog.records if "attention_mode" in record.getMessage()]
+    assert len(warnings) == 2, f"两个未训练 mode 应该正好两条告警，实测 {len(warnings)}"
+    assert "causal" in warnings[0].getMessage()
+    assert "noncausal_full" in warnings[1].getMessage()
+
+
+def test_the_trained_mode_does_not_warn(caplog) -> None:
     engine = _engine(FakeChain())
     engine.start()
-    with pytest.raises(UnsupportedModeError) as info:
-        engine.run(make_request(mode=MaskMode.CAUSAL))
-    assert info.value.status == 400
-    assert info.value.context["strategy"] == "split"
-    assert info.value.context["mode"] == MaskMode.CAUSAL.value
+    with caplog.at_level("WARNING", logger="sysone.engine.engine"):
+        result = engine.run(make_request(mode=MaskMode.PREFIX_NONCAUSAL, questions=1))
+    assert result.provenance.attention_trained is True
+    assert not [r for r in caplog.records if "attention_mode" in r.getMessage()]
+
+
+def test_causal_shares_the_prefix_and_keeps_the_triangular_mask() -> None:
+    """causal 下前缀照样共享：前缀相自己成三角，尾巴行看 `[0, q]` 已含整个前缀。"""
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2, mode=MaskMode.CAUSAL), MaskMode.CAUSAL)
+    assert len(chain.shared) == 1
+    assert chain.shared[0][3] is True
+    assert chain.calls == []
 
 
 def test_prompt_over_max_len_is_422() -> None:
@@ -266,7 +304,7 @@ def test_prompt_over_max_len_is_422() -> None:
 
 def test_warmup_failure_blocks_start() -> None:
     class UnnormalizedChain(FakeChain):
-        def forward(self, tokens, *, options, prefix=0):
+        def forward(self, tokens, *, options, prefix=0, causal=False):
             self.calls.append((tuple(tokens), int(options), int(prefix)))
             return [0.1] * options  # 和为 0.1，不是归一化的概率
 
@@ -277,7 +315,7 @@ def test_warmup_failure_blocks_start() -> None:
 
 def test_bad_readout_is_reported_not_rounded() -> None:
     class NaNChain(FakeChain):
-        def forward(self, tokens, *, options, prefix=0):
+        def forward(self, tokens, *, options, prefix=0, causal=False):
             self.calls.append((tuple(tokens), int(options), int(prefix)))
             return [float("nan")] + [0.3] * (options - 1)
 
@@ -353,9 +391,10 @@ class SharedChain(FakeChain):
         super().__init__(shares=shares)
         self.shared: list[tuple[tuple[int, ...], list[tuple[int, ...]], tuple[int, ...]]] = []
 
-    def forward_shared(self, prefix, tails, *, options):
+    def forward_shared(self, prefix, tails, *, options, causal=False):
         self.shared.append(
-            (tuple(prefix), [tuple(tail) for tail in tails], tuple(int(value) for value in options))
+            (tuple(prefix), [tuple(tail) for tail in tails], tuple(int(value) for value in options),
+             bool(causal))
         )
         if self._shares is not None:
             rows = []
@@ -391,9 +430,10 @@ def test_two_questions_with_one_state_share_the_prefix() -> None:
     request = make_request(questions=2)
     runner.answers_for(request, MaskMode.PREFIX_NONCAUSAL)
     assert len(chain.shared) == 1, "两题共用一条前缀时只该有一条共享路径"
-    prefix, tails, options = chain.shared[0]
+    prefix, tails, options, causal = chain.shared[0]
     assert len(tails) == 2 and len(prefix) > 0
     assert options == (len(OPTIONS), len(OPTIONS))
+    assert causal is False, "`prefix_noncausal` 的掩码仍是双向" 
     assert chain.calls == [], "共享路径不该再逐题整趟"
     # 每条尾巴都是"整条 prompt 去掉前缀"（两题的题面不同，尾巴也就不同）
     assert tails[0] != tails[1]

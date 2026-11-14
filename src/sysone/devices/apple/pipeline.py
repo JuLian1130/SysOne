@@ -168,6 +168,7 @@ class MudePipeline:
             self._chunks_list: list[tuple[int, int]] = []
             self._length = 0
             self._prefix = 0
+            self._causal = False
             self._dead = 0
             # 只有模型的最后一层能把前缀瓦片的第二相省掉：别层的 `h` 还有读者。
             self._last_is_full = bool(self.buffers) and (
@@ -257,7 +258,8 @@ class MudePipeline:
             block = np.asarray(data[start:start + step], np.float16)
             view[:, s0 + start:s0 + start + block.shape[0]] = block.T
 
-    def run(self, embed: np.ndarray | None, *, length: int, prefix: int = 0) -> None:
+    def run(self, embed: np.ndarray | None, *, length: int, prefix: int = 0,
+            causal: bool = False) -> None:
         """跑完 20 层。`embed` 是 `[length, hidden]` 的 embedding 输出（fp32；`None` = 调用方
         已经用 `run_rows` 把行写进画布了）。
 
@@ -278,7 +280,7 @@ class MudePipeline:
             view[:] = 0
             view[:, :length] = np.asarray(embed, np.float32).T.astype(np.float16)
         self._chunks_list = list(self._chunks(length))
-        self._prepare(length, prefix, fresh=True)
+        self._prepare(length, prefix, fresh=True, causal=causal)
         for index, block_of_layers in enumerate(self._blocks()):
             if self._residency is not None:
                 self._residency.begin(index)
@@ -291,7 +293,8 @@ class MudePipeline:
         if self._residency is not None:
             self._residency.finish()   # 一轮结束落在待命窗口上（服务契约"回到前 W 层"）
 
-    def run_rows(self, rows: np.ndarray, *, length: int, prefix: int = 0) -> None:
+    def run_rows(self, rows: np.ndarray, *, length: int, prefix: int = 0,
+                 causal: bool = False) -> None:
         """与 `run` 同语义，但 embedding 由 `[length, hidden]` 的行逐桶写进画布。
 
         给"不想物化整宽 fp32 画布"的调用方用（`MudeChain.logits_rows`）：临时量是一桶，
@@ -303,10 +306,10 @@ class MudePipeline:
             raise ConfigError("行数与长度不一致", rows=int(np.asarray(rows).shape[0]), length=length)
         view = self.x.array(np.float16, (self._hidden, self._width))
         self._write_rows(view, rows, 0)
-        self.run(None, length=length, prefix=prefix)
+        self.run(None, length=length, prefix=prefix, causal=causal)
 
     def run_shared(self, prefix_rows: np.ndarray, tails: Sequence[np.ndarray], *,
-                   prefix: int) -> list[np.ndarray]:
+                   prefix: int, causal: bool = False) -> list[np.ndarray]:
         """一个请求内多题共享前缀：前缀一遍，每题只跑自己那条尾巴。
 
         `prefix_rows` 是 `[prefix, hidden]` 的 embedding，`tails` 每题一条 `[q_j, hidden]`
@@ -337,14 +340,15 @@ class MudePipeline:
             raise ConfigError("尾巴至少要有一个 token", lengths=lengths)
         layout = self._slot_layout(prefix, lengths)
         if layout is not None:
-            return self._run_shared_batched(prefix_rows, tails, prefix=prefix, layout=layout)
+            return self._run_shared_batched(prefix_rows, tails, prefix=prefix, layout=layout,
+                                            causal=causal)
         if prefix + max(lengths) > self._width:
             raise ConfigError("共享前缀 + 最长尾巴超出缓冲宽度",
                               prefix=prefix, tail=max(lengths), width=self._width)
-        return self._run_shared_serial(prefix_rows, tails, prefix=prefix)
+        return self._run_shared_serial(prefix_rows, tails, prefix=prefix, causal=causal)
 
     def _run_shared_serial(self, prefix_rows: np.ndarray, tails: Sequence[np.ndarray], *,
-                           prefix: int) -> list[np.ndarray]:
+                           prefix: int, causal: bool = False) -> list[np.ndarray]:
         """逐题的尾巴相（批不了时的路径，行为与票据 07 一字不差）。"""
         lengths = [int(np.asarray(tail).shape[0]) for tail in tails]
         longest = max(lengths)
@@ -363,7 +367,7 @@ class MudePipeline:
                 if self._residency is not None:
                     self._residency.begin(index)
                 self._chunks_list = list(prefix_chunks)
-                self._prepare(prefix, prefix, fresh=True)
+                self._prepare(prefix, prefix, fresh=True, causal=causal)
                 self._run_block(block_of_layers)
                 self._wait_all()
                 snapshot = self._snapshot(block_of_layers)
@@ -373,7 +377,7 @@ class MudePipeline:
                     self._restore(block_of_layers, snapshot)
                     view[:, prefix:prefix + q] = hidden[:, base:base + q]
                     self._chunks_list = list(chunks)
-                    self._prepare(prefix + q, prefix, fresh=False)
+                    self._prepare(prefix + q, prefix, fresh=False, causal=causal)
                     self._run_block(block_of_layers)
                     self._wait_all()
                     if last_block:
@@ -424,7 +428,8 @@ class MudePipeline:
                           starts=tuple(prefix + j * slotw for j in range(questions)))
 
     def _run_shared_batched(self, prefix_rows: np.ndarray, tails: Sequence[np.ndarray], *,
-                            prefix: int, layout: SlotLayout) -> list[np.ndarray]:
+                            prefix: int, layout: SlotLayout,
+                            causal: bool = False) -> list[np.ndarray]:
         """批尾巴：N 条尾巴一人一格排进打包区，整条请求只跑一个尾巴相。
 
         尾巴的隐藏态**不用 scratch**：每格占的是自己的列，块与块之间原样留在画布上（逐题
@@ -449,14 +454,14 @@ class MudePipeline:
                 if self._residency is not None:
                     self._residency.begin(index)
                 self._chunks_list = list(prefix_chunks)
-                self._prepare(prefix, prefix, fresh=True)
+                self._prepare(prefix, prefix, fresh=True, causal=causal)
                 self._run_block(block_of_layers)
                 self._wait_all()
                 snapshot = self._snapshot(block_of_layers)
                 self._slot_snapshot = snapshot
                 self._chunks_list = list(tail_chunks)
                 self._prepare(prefix + layout.nt, prefix, fresh=False,
-                              segw=layout.slotw, counts=counts)
+                              segw=layout.slotw, counts=counts, causal=causal)
                 self._run_block(block_of_layers)
                 self._wait_all()
                 self._slot_snapshot = None
@@ -511,7 +516,7 @@ class MudePipeline:
             position += size
 
     def _prepare(self, length: int, prefix: int, *, fresh: bool,
-                 segw: int = 0, counts: Sequence[int] = ()) -> None:
+                 segw: int = 0, counts: Sequence[int] = (), causal: bool = False) -> None:
         """开一个执行相：掩码模型、S3 的死瓦片，以及各条链的游标账。
 
         `fresh=False` 表示这一相接着上一相的状态跑（共享前缀的尾巴相）：GDN 的递归状态与
@@ -520,6 +525,9 @@ class MudePipeline:
         self._length = int(length)
         self._prefix = int(prefix)
         self._fresh = bool(fresh)
+        # M3：这一相的掩码是不是三角。它与 `segw` 正交：批尾巴的槽位规则之上再按行收到自己
+        # 那一列（见 `kernels.attn_args` 的 `caus`）。
+        self._causal = bool(causal)
         # 批尾巴（票据 10）：这一相里每条尾巴占一个槽位，槽宽 `segw`、各槽位行数 `counts`。
         # `segw = 0` 是逐题整趟/前缀相，所有环节按老规则走。
         self._segw = int(segw)
@@ -965,12 +973,17 @@ class MudePipeline:
         rule: dict = {}
         if self._segw:
             rule = dict(nka=self._prefix, segw=self._segw, nkw_slots=self._slot_table(tile))
+        # M3：causal 时这一段的可见上界就是它自己的末列（末行的位置 + 1）。双向时是全长。
+        # `caus` 交给核里按行再收 —— 两件事分开：这个上界省掉整块看不见的 key 块，按行的项
+        # 才给出三角。共享前缀的两刀同理：前一半的上界就是 `prefix`（= `boundary`）。
+        caus = 1 if self._causal else 0
+        top = end if self._causal else self._length
         if self._prefix <= 0 or self._prefix >= self._length:
             kernels.attention(
                 self._runtime, qg, kv, out, self.attn_scratch,
-                T=self._width, stile=n, nk=self._length, nq=n, s0=qslot, qgT=self._ring,
+                T=self._width, stile=n, nk=top, nq=n, s0=qslot, qgT=self._ring,
                 out_stride=self._bucket, out_s0=0, fast=True, geometry=self._geometry,
-                qseq=start, **rule,
+                qseq=start, caus=caus, **rule,
             )
             return
         # 边界钳在本段内：前缀整段落在本段之前时（`prefix <= start`）这整段都是 query 侧，
@@ -981,15 +994,15 @@ class MudePipeline:
                 self._runtime, qg, kv, out, self.attn_scratch,
                 T=self._width, stile=boundary - start, nk=self._prefix, nq=boundary - start,
                 s0=qslot, qgT=self._ring, out_stride=self._bucket, out_s0=0, fast=True,
-                geometry=self._geometry,
+                geometry=self._geometry, qseq=start, caus=caus, **rule,
             )
         if boundary < end:
             kernels.attention(
                 self._runtime, qg, kv, out, self.attn_scratch,
-                T=self._width, stile=end - boundary, nk=self._length, nq=end - boundary,
+                T=self._width, stile=end - boundary, nk=top, nq=end - boundary,
                 s0=qslot + (boundary - start), qgT=self._ring, out_stride=self._bucket,
                 out_s0=boundary - start, fast=True, geometry=self._geometry,
-                qseq=boundary, **rule,
+                qseq=boundary, caus=caus, **rule,
             )
 
     # ------------------------------------------------------------------ 收尾

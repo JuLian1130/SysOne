@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 
@@ -25,6 +26,8 @@ from .runner import ModelRunner
 from .scheduler import Scheduler, SerialScheduler
 from .session import SessionPool
 from .stats import RequestStats, RunStats, StageStats, StartupStats
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,9 @@ class Engine:
         self._tokens = 0
         self._prefill_s = 0.0
         self._readout_s = 0.0
+        # 未训练掩码的告警按 mode 去重：一条请求打一条会把服务日志淹掉，而这个状态是模型的
+        # 属性、不是请求的属性（`Provenance.attention_trained` 逐请求带，日志只报一次）。
+        self._warned_modes: set[MaskMode] = set()
 
     @property
     def descriptor(self) -> ModelDescriptor:
@@ -123,12 +129,21 @@ class Engine:
             tails = sum(plan.seq_len() - plan.prefix_len for plan in plans)
             usage = Usage(input_tokens=prefix_len + tails, prefill_calls=len(plans))
 
+        trained = mode in self._descriptor.trained_modes
+        if not trained and mode not in self._warned_modes:
+            self._warned_modes.add(mode)
+            _LOGGER.warning(
+                "attention_mode %s 不在模型的训练集合里（trained=%s）：结果只能当实验读数，"
+                "不能当精度承诺",
+                mode.value,
+                sorted(item.value for item in self._descriptor.trained_modes),
+            )
         provenance = Provenance(
             family=self._descriptor.family,
             artifact_id=self._config.cache_key(),
             quant=self._descriptor.quant,
             attention_mode=mode,
-            attention_trained=mode in self._descriptor.trained_modes,
+            attention_trained=trained,
             vendor_bridge=vendor_name,
         )
         timings = None

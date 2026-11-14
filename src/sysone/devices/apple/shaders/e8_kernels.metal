@@ -275,7 +275,8 @@ kernel void k_kv_prep(device half        *kv     [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------------------
-// k_attn_ref: noncausal full-attention core, reference implementation.
+// k_attn_ref: full-attention core, reference implementation (M3: also the causal mask -- the
+//   row's cap is a scalar here because a threadgroup handles exactly one query column).
 //   b0 qg prepped (4096, T)   b1 kv prepped (1024, T)   b2 out (2*HID, Stile)
 //   b3 scratch (8*Stile*T) float   -- only the reference needs this
 // One threadgroup per (query, head); thread d owns channel d of that head.
@@ -289,6 +290,10 @@ kernel void k_attn_ref(device const half  *qg      [[buffer(0)]],
                        uint2 tid2 [[thread_position_in_threadgroup]]) {
     const uint j = tgid.x, h = tgid.y, s = a.s0 + j, D = E8_HEAD_DIM, T = a.T, tid = tid2.x;
     const uint nk = min(a.nk, a.T);   // keys that exist; the rest of T is zero padding
+    // M3: one query row per threadgroup here, so the causal cap is a single scalar -- the fast
+    // core's `cap` with its fragment row folded in.  Slots are not implemented in this core
+    // (pre-existing), so a causal batched tail cannot use `fast=False`.
+    const uint nc = (a.caus && a.qseq + j + 1u < nk) ? a.qseq + j + 1u : nk;
     const uint kvh = h / (E8_Q_HEADS / E8_KV_HEADS);
     threadgroup float qn[E8_HEAD_DIM];
     threadgroup float red[8];
@@ -301,7 +306,7 @@ kernel void k_attn_ref(device const half  *qg      [[buffer(0)]],
     device const half *vb = kv + (ulong)(E8_KV_PROJ + kvh * D) * T;
 
     // scores: this thread owns keys t = tid, tid+256, ...
-    for (uint t = tid; t < nk; t += 256u) {
+    for (uint t = tid; t < nc; t += 256u) {
         float acc = 0.0f;
         for (uint d = 0; d < D; d++) acc += qn[d] * float(kb[(ulong)d * T + t]);
         sc[t] = acc * a.scale;
@@ -310,18 +315,18 @@ kernel void k_attn_ref(device const half  *qg      [[buffer(0)]],
 
     // softmax over the whole key axis
     float m = -INFINITY;
-    for (uint t = tid; t < nk; t += 256u) m = max(m, sc[t]);
+    for (uint t = tid; t < nc; t += 256u) m = max(m, sc[t]);
     m = e8_tg_max(m, red, tid, 256u);
 
     float ssum = 0.0f;
-    for (uint t = tid; t < nk; t += 256u) { sc[t] = exp(sc[t] - m); ssum += sc[t]; }
+    for (uint t = tid; t < nc; t += 256u) { sc[t] = exp(sc[t] - m); ssum += sc[t]; }
     ssum = e8_tg_sum(ssum, red, tid, 256u);
     float inv = 1.0f / ssum;
-    for (uint t = tid; t < nk; t += 256u) sc[t] *= inv;
+    for (uint t = tid; t < nc; t += 256u) sc[t] *= inv;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float y = 0.0f;
-    for (uint t = 0; t < nk; t++) y += sc[t] * float(vb[(ulong)tid * T + t]);
+    for (uint t = 0; t < nc; t++) y += sc[t] * float(vb[(ulong)tid * T + t]);
     float g = float(qg[(ulong)(h * 2u * D + D + tid) * T + s]);
     const uint osp = a.out_stride ? a.out_stride : a.Stile;
     out[(ulong)(h * D + tid) * osp + a.out_s0 + j] = half(y * g);

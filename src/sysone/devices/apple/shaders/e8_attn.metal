@@ -10,6 +10,9 @@
 //                                              (S6 batched tails: also nka=, segw=, nkw= --
 //                                               every query row sees [0, nka) plus its own
 //                                               `nkw`-row slot; segw=0 is the plain mask)
+//                                              (M3 causal: caus=1 + qseq= -- every row is
+//                                               capped at its own sequence column; it is a
+//                                               term on top of the slot rule, not a mode)
 //   grid = (8 * ceil(Stile / AT_BM), 1, 1)     tg   = (AT_TG, 1, 1)
 // with AT_BM / AT_TG as configured below.  One threadgroup per (query head, AT_BM-query tile
 // of this call):  tgid -> head = tgid/tiles, tile = tgid % tiles.  Head-major on purpose: all
@@ -285,13 +288,17 @@ static inline uint at_owner_of(uint m) { return ((m & 3u) << 1) | ((m >> 2) << 4
 #define AT_STAGE(P, CHAN, TB) at_stage(&kbuf[((P) == kb0) ? 0u : 1u][0][0], kv, tid, T, (CHAN), (TB));
 // S6: visible keys are [0, nka) plus the query row's own slot [nkb, nkc).  With `segw` = 0 a
 // caller passes nka = nkc = nk and nkb = 0, so this is exactly the pre-S6 `t < nk`.
+// M3: the two bounds are *caller-side*, not mask-side -- a causal pass hands in its own row's
+// bound instead of `nkc` (and `min(nka, that)`), so the triangular term needs no branch here
+// and cannot be forgotten at one call site but not the other.  Both are per-lane values, so the
+// predicate stays a pure function of (key column, visible bounds).
 static inline bool at_visible(uint t, uint nka, uint nkb, uint nkc) {
     return t < nka || (t >= nkb && t < nkc);
 }
 #define AT_SM1(K, S) { const uint tA = t0 + (K) * 8u + col_l;                        \
     float v0 = (S).thread_elements()[0] * K1, v1 = (S).thread_elements()[1] * K1;       \
-    if (!at_visible(tA, nka, nkb, nkc))        v0 = -INFINITY;                          \
-    if (!at_visible(tA + 1u, nka, nkb, nkc))   v1 = -INFINITY;                          \
+    if (!at_visible(tA, nkap, nkb, cap))        v0 = -INFINITY;                         \
+    if (!at_visible(tA + 1u, nkap, nkb, cap))   v1 = -INFINITY;                         \
     sv0[K] = v0; sv1[K] = v1; mx = max(mx, max(v0, v1)); }
 #define AT_SM2(K) { const float p0 = exp2(sv0[K] - m_new), p1 = exp2(sv1[K] - m_new);     \
     sum += p0 + p1;                                                                     \
@@ -416,7 +423,9 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     // ring column and not the position, so a batched tail pass passes `qseq`.  `segw != 0` always
     // comes with `qseq >= 1` (the shared-prefix path forbids an empty prefix); every single-buffer
     // caller leaves `segw` 0 and keeps the old `s0` meaning.
-    const uint qpos = (a.segw ? a.qseq : a.s0) + j0;                // first query column here
+    // M3: a causal pass needs the *sequence* column even without slots, and then `qseq` is
+    // authoritative (a request starts at column 0, so 0 must not mean "use s0").
+    const uint qpos = ((a.segw || a.caus) ? a.qseq : a.s0) + j0;    // first query column here
     const uint slot = (a.segw && qpos >= nka) ? (qpos - nka) / a.segw : 0u;
     const uint nkb  = a.segw ? nka + slot * a.segw : 0u;            // first key of the own slot
     // Ticket 10: per-slot row count.  Equal-length tails could still use the single `nkw`; the
@@ -441,6 +450,13 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     const uint own1  = own0 + 2u;                       // ... and row col_l + 1
     const uint myq   = j0 + sg * 8u;                    // this simdgroup's first query column
     const uint qcol  = myq + col_l;
+    // ---- M3: this lane's key-visibility bounds.  `qrow` is the query row this lane's score
+    // elements belong to, in sequence columns (the fragment's row is the query, its column the
+    // key).  Non-causal callers land on exactly the pre-M3 pair: `cap` = nkc and, since
+    // nka <= nkc always holds, `nkap` = nka.
+    const uint qrow = qpos + sg * 8u + row_l;
+    const uint cap  = a.caus ? min(nkc, qrow + 1u) : nkc;
+    const uint nkap = min(nka, cap);
 
     // ---- K and V staging: two AT_KC x 64 buffers, reused by both phases (they never overlap)
     threadgroup half kbuf[2][AT_KC][AT_LDK];
@@ -545,7 +561,12 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     threadgroup half *const kb1 = &kbuf[1][0][0];
     const uint kbase = kvh * uint(E8_HEAD_DIM);
     const uint vbase = uint(E8_KV_PROJ) + kvh * uint(E8_HEAD_DIM);
-    const uint nb = (nkc + AT_BN - 1u) / AT_BN;   // S6: up to this block's own visible top
+    // S6: up to this block's own visible top.  M3: under a causal mask the last row of this
+    // threadgroup is the one that reaches furthest, so the blocks above it hold nothing but
+    // masked keys -- skipping them is the triangular saving (2.68e8 -> ~1.35e8 half-scores at
+    // 16k) and, because it only drops blocks whose scores are all -inf, it cannot move a value.
+    const uint nchi = a.caus ? min(nkc, qpos + AT_BM) : nkc;
+    const uint nb = (nchi + AT_BN - 1u) / AT_BN;
 
     AT_STAGE(kb0, kbase, 0u);                   // prologue: first K chunk
     threadgroup_barrier(mem_flags::mem_threadgroup);

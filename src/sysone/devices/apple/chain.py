@@ -174,11 +174,9 @@ class MudeChain:
         root = Path(model_dir)
         text = _text_config(root)
         decision = _load_json(root / "decision_config.json")
-        mode = str(decision.get("attention_mode", "prefix_noncausal"))
-        if mode not in ("prefix_noncausal", "noncausal_full"):
-            # 这两个模式下单个问题的 key 掩码就是"prompt 内双向、padding 外不可见"；
-            # causal 需要真三角掩码，这条链还没实现。
-            raise ValueError(f"mude 链只实现了双向掩码，收到 attention_mode={mode!r}")
+        # `decision_config.json` 的 `attention_mode` 只是默认值（`mude.parse_config` 读它），
+        # 掩码在 `forward`/`logits` 的每次调用里给：三种 `MaskMode` 这条链都能表达（M3 之前
+        # causal 不行，因为核里没有三角项）。这里只取温度读出。
 
         hidden = int(text["hidden_size"])
         ffn = int(text["intermediate_size"])
@@ -312,7 +310,8 @@ class MudeChain:
     # ------------------------------------------------------------------ 前向
 
     def logits(self, tokens: Sequence[int], *, trace: list[np.ndarray] | None = None,
-               prefix: int = 0, debug: dict | None = None) -> np.ndarray:
+               prefix: int = 0, causal: bool = False,
+               debug: dict | None = None) -> np.ndarray:
         """整条 prompt 走 20 层，返回 `[CODE_ROWS]` 原始 logits（fp32，未除温度）。
 
         `trace` 非空时把每层输出（最后一条 token 的 `[hidden]`）按顺序追加进去，
@@ -320,6 +319,10 @@ class MudeChain:
         （厂商 `Prepared.prefix()` 给出的那个数）：全注意力层的掩码是
         `(q >= prefix) | (k < prefix)`，额外把 padding 列当不可见。单问题、无 padding 时
         prefix=0 就退化为整段双向。
+
+        `causal=True` 换成三角掩码 `k <= q`。它与 `prefix` 是**两个轴**：causal 下每一行
+        只看自己之前（含自己），所以 `prefix` 不再改变掩码 —— 前缀行本来就是行内三角的一部
+        分，尾巴行看到的 `[0, prefix)` 也在 `k <= q` 之内。
         """
         ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
         length = int(ids.size)
@@ -337,7 +340,8 @@ class MudeChain:
                                  hint="用 metal=False 的 numpy 链做逐层对拍")
             embed = _place(self._store.read_rows(self._embed_name, ids), self._hidden,
                            self._width)
-            self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix)
+            self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix,
+                               causal=causal)
             final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
             return self._readout @ final
         x = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._width)
@@ -350,7 +354,7 @@ class MudeChain:
             params = self._params[index]
             layer_debug = debug if (debug is not None and index == 0) else None
             if self._roles[index] is AttentionRole.FULL:
-                x = self._full_layer(layer, params, x, length, cos, sin, prefix)
+                x = self._full_layer(layer, params, x, length, cos, sin, prefix, causal)
             else:
                 x = self._linear_layer(layer, params, x, length, layer_debug)
             if trace is not None:
@@ -358,12 +362,14 @@ class MudeChain:
         final = rms_norm(x.T, self._final_norm)[length - 1]
         return self._readout @ final
 
-    def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0) -> np.ndarray:
+    def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0,
+                causal: bool = False) -> np.ndarray:
         """前 `options` 个码的 softmax 概率（选项顺序 = `codes` 顺序）。"""
-        return self._probabilities(self.logits(tokens, prefix=prefix), options)
+        return self._probabilities(self.logits(tokens, prefix=prefix, causal=causal), options)
 
     def forward_shared(
-        self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, options: Sequence[int]
+        self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, options: Sequence[int],
+        causal: bool = False,
     ) -> list[np.ndarray]:
         """一个请求内多题共享前缀：前缀只算一遍，每题只跑自己那条尾巴。
 
@@ -376,11 +382,11 @@ class MudeChain:
         """
         if len(options) != len(tails):
             raise ValueError(f"options 与尾巴条数不一致：{len(options)} vs {len(tails)}")
-        logits = self.logits_shared(prefix, tails)
+        logits = self.logits_shared(prefix, tails, causal=causal)
         return [self._probabilities(row, int(count)) for row, count in zip(logits, options)]
 
     def logits_shared(
-        self, prefix: Sequence[int], tails: Sequence[Sequence[int]]
+        self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, causal: bool = False
     ) -> list[np.ndarray]:
         """共享前缀的整条前向：返回每题的 `[CODE_ROWS]` 原始 logits（未除温度）。"""
         if self._pipeline is None:
@@ -405,7 +411,7 @@ class MudeChain:
         hidden = self._pipeline.run_shared(
             self._store.read_rows(self._embed_name, ids),
             [self._store.read_rows(self._embed_name, tail) for tail in rows],
-            prefix=length,
+            prefix=length, causal=causal,
         )
         out: list[np.ndarray] = []
         for row in hidden:
@@ -454,6 +460,7 @@ class MudeChain:
         cos: np.ndarray,
         sin: np.ndarray,
         prefix: int,
+        causal: bool,
     ) -> np.ndarray:
         """全注意力层：q|gate 交错投影 → q/k 各做 head_dim 的 RMSNorm → 半维 RoPE → GQA → 门控。"""
         xn = _rms(x, params["input_norm"])
@@ -475,10 +482,11 @@ class MudeChain:
         key = np.repeat(key, repeat, axis=1)
         value = np.repeat(value, repeat, axis=1)
         # k/v 已裁到真实 `length` 行，padding 列进不了注意力，所以掩码就是厂商
-        # `prefix_noncausal` 的 `(q >= prefix) | (k < prefix)`，形状 `[length, length]`。
+        # `prefix_noncausal` 的 `(q >= prefix) | (k < prefix)`，形状 `[length, length]`；
+        # `causal` 换成 `k <= q`（它已经包含 `k < prefix`，因为前缀行都排在尾巴之前）。
         queries = np.arange(length)[:, None]
         keys = np.arange(length)[None, :]
-        mask = (queries >= prefix) | (keys < prefix)
+        mask = keys <= queries if causal else (queries >= prefix) | (keys < prefix)
         context = attention(query, key, value, mask).reshape(length, heads * head_dim)
         y, _ = layer.output(_place(context * sigmoid(gate), self._hidden, self._s), x)
         xn2 = _rms(y, params["post_norm"])

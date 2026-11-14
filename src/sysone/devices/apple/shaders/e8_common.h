@@ -113,7 +113,7 @@ struct CopyArgs {          // e8_mtl.py: "<IIIIIIII" -> 32 bytes
     uint  src_s0;          // 7  source column offset (tile surfaces pass 0)
 };
 
-struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIIIIIIII" -> 68 bytes
+struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIIIIIIIII" -> 72 bytes
     uint  T;               // 0  sequence length (columns of qg / kv)
     uint  Stile;           // 1  queries in this tile
     uint  s0;              // 2  first *ring* column of the queries (not the position once qg rings)
@@ -151,6 +151,13 @@ struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIIIIIIII" -> 68 bytes
     uint  nkw1;            // 14 slots 2,3
     uint  nkw2;            // 15 slots 4,5
     uint  nkw3;            // 16 slots 6,7
+    // M3 (causal): `caus` != 0 adds the triangular term -- a key `t` is visible to the query at
+    // *sequence* column `q` only when `t <= q`.  It composes with the slot rule instead of
+    // replacing it (a batched tail's row sees [0, nka) plus its own slot, capped at its own
+    // column), which is why it is a term and not another mode.  `qseq` is the sequence column of
+    // the call's first query row, so `caus` = 1 makes it authoritative (0 included); with
+    // `caus` = 0 nothing below index 17 is read and every pre-M3 caller is unchanged.
+    uint  caus;            // 17 1 = cap each row at its own sequence column
 };
 
 struct GdnArgs {           // e8_mtl.py: "<IIIIfIII" -> 32 bytes

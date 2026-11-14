@@ -57,7 +57,7 @@ HEAD_SCALE = GEOMETRY.head_scale  # attention 的 1/sqrt(head_dim)
 # ---- 参数结构体（与 e8_common.h 一一对应，单位是字节数）-------------------------------
 _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
-_ATTN = struct.Struct("<IIIfIIIIIIIIIIIII")  # struct AttnArgs，68 B
+_ATTN = struct.Struct("<IIIfIIIIIIIIIIIIII")  # struct AttnArgs，72 B
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
 
 
@@ -111,11 +111,14 @@ def attn_args(
     qgT: int = 0,
     out_stride: int = 0,
     out_s0: int = 0,
+    caus: int = 0,
 ) -> bytes:
     """`k_attn` / `k_attn_ref`（`e8_common.h:108`）。
 
-    `nk` 是这一窗**可见的 key 上界**——注意力模式就是它，kernel 里没有任何掩码项：
-    causal 传 `s0+j` 对应的位置、`noncausal_full` 传全长、`prefix_noncausal` 的前缀窗传 P。
+    `nk` 是这一窗**可见的 key 上界**：`noncausal_full` 传全长、`prefix_noncausal` 的前缀窗
+    传 P、`causal` 传本段末行的位置（末行自己的那一列，`caus` 再从它往下逐行收）。`caus`
+    是**加在 `nk` 上的一个项**，不是又一种模式：进了槽位规则之后，一行仍看 `[0, nka)` 加自己
+    那一槽，只是槽内也收到自己那一列为止。
     `nka`/`segw`/`nkw` 是"一批 tail 共享一个 prefix"的槽位（S6/S7 的批量形态），单请求传 0。
     """
     # 批尾巴（票据 10）：8 个槽位的可见行数，每项 16 bit。`nkw_slots` 缺省时表全 0，
@@ -127,7 +130,7 @@ def attn_args(
         words[index >> 1] |= (min(int(count), 0xFFFF) & 0xFFFF) << ((index & 1) * 16)
     return _ATTN.pack(
         T, stile, s0, scale, nk, nq, nka, segw, nkw, qgT, out_stride, out_s0,
-        qseq, words[0], words[1], words[2], words[3],
+        qseq, words[0], words[1], words[2], words[3], caus,
     )
 
 
@@ -405,6 +408,7 @@ def attention(
     qseq: int = 0,
     out_stride: int = 0,
     out_s0: int = 0,
+    caus: int = 0,
     fast: bool = True,
     geometry: Geometry | None = None,
     lane: int = LANE_LONG,
@@ -416,6 +420,7 @@ def attention(
 
     `T` 是 **kv** 的列数（整窗缓存）；`qgT` 是 **qg** 的列数，0 表示两者同一张缓冲。`qg`
     成环时 `s0` 是环槽位的起始列（q 与 gate 都从那里读），`nk` 仍是整条序列的可见上界。
+    `caus=1` 时再按行收到自己那一列，行的序列列号取自 `qseq`（见 `attn_args`）。
     """
     geom = GEOMETRY if geometry is None else geometry
     if scratch is None:
@@ -446,6 +451,7 @@ def attention(
             qgT=qgT,
             out_stride=out_stride,
             out_s0=out_s0,
+            caus=caus,
         ),
         grid=grid,
         tg=tg,

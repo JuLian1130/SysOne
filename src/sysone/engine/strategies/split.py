@@ -17,8 +17,10 @@ from ...domain.decision import Answer, DecisionRequest, Question
 from ...domain.work import CompilationTimes
 from ...errors import ConfigError, NotReadyError, ReadoutError, RequestTooLongError, UnsupportedModeError
 
-# 这条链的掩码只有双向：`prefix=None` 时全可见，`prefix=0` 也是全可见。
-_SUPPORTED_MODES = (MaskMode.PREFIX_NONCAUSAL, MaskMode.NONCAUSAL_FULL)
+# 三种模式这条链都能表达：双向（`prefix_noncausal` 的前缀窗 + `noncausal_full` 的全可见）
+# 与三角（`causal`，M3 的核改动）。声明在这里而不在 descriptor 里：descriptor 说模型能跑
+# 什么，这里说这条实现做到了什么。
+_SUPPORTED_MODES = (MaskMode.PREFIX_NONCAUSAL, MaskMode.NONCAUSAL_FULL, MaskMode.CAUSAL)
 
 # 预热用的题：真正的冷启动失败（program 没装上、面没绑好）在第一题就会炸，
 # 这一题让它在 `Engine.start()` 里就炸，而不是让第一道真实请求撞上。
@@ -29,7 +31,8 @@ _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one"
 class ModelChain(Protocol):
     """`MudeChain` 只需要这两件事：一次整链前向与卸载。"""
 
-    def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0) -> object: ...
+    def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0,
+                causal: bool = False) -> object: ...
 
     def close(self) -> None: ...
 
@@ -118,13 +121,16 @@ class SplitRunner:
         chain = self._require_chain()
         if mode not in _SUPPORTED_MODES:
             raise UnsupportedModeError(
-                "mude 链只实现了双向掩码",
+                "mude 链没有这个掩码",
                 mode=mode.value,
                 strategy="split",
                 supported=sorted(item.value for item in _SUPPORTED_MODES),
             )
         # `noncausal_full` 就是把前缀当 0：掩码 `(q >= 0) | (k < 0)` 恒真。
-        use_prefix = mode is MaskMode.PREFIX_NONCAUSAL
+        # `causal` 的共享前缀照样成立：前缀行的掩码在相内自己成三角，尾巴行看 `[0, q]` 包含
+        # 整个前缀 —— 两条路（共享 / 逐题）的可见集合一样，所以批尾巴的槽位规则也不用改。
+        causal = mode is MaskMode.CAUSAL
+        use_prefix = mode is not MaskMode.NONCAUSAL_FULL
         started = time.perf_counter()
         # 先把所有题编码完：共享前缀要先知道每题的尾巴，长度检查也按整条 prompt 做。
         encoded: list[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]] = []
@@ -140,9 +146,9 @@ class SplitRunner:
         shared = _shared_prefix(encoded) if use_prefix else None
         forward_shared = getattr(chain, "forward_shared", None)
         if shared is not None and len(encoded) > 1 and callable(forward_shared):
-            answers = _answer_shared(forward_shared, shared, encoded, request)
+            answers = _answer_shared(forward_shared, shared, encoded, request, causal)
         else:
-            answers = _answer_serial(chain, encoded, use_prefix, request)
+            answers = _answer_serial(chain, encoded, use_prefix, request, causal)
         tokens = sum(len(sequence) for sequence, *_ in encoded)
         return tuple(answers), tokens, time.perf_counter() - started
 
@@ -200,11 +206,12 @@ def _answer_shared(
     prefix: tuple[int, ...],
     encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
     request: DecisionRequest,
+    causal: bool = False,
 ) -> list[Answer]:
     """共享前缀的一条路：`prefix` + 每题的尾巴，一次调用拿到所有题的概率。"""
     tails = [sequence[len(prefix):] for sequence, *_ in encoded]
     options = [len(labels) for _, _, labels, _ in encoded]
-    raw = forward_shared(prefix, tails, options=options)
+    raw = forward_shared(prefix, tails, options=options, causal=causal)
     answers: list[Answer] = []
     for index, (_, _, labels, indexes) in enumerate(encoded):
         probs = SplitRunner._shares(raw[index])
@@ -228,12 +235,14 @@ def _answer_serial(
     encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
     use_prefix: bool,
     request: DecisionRequest,
+    causal: bool = False,
 ) -> list[Answer]:
     """逐题整趟（今天的行为；单题与不可复用时走这条）。"""
     answers: list[Answer] = []
     for index, (sequence, prefix_len, labels, indexes) in enumerate(encoded):
         probs = SplitRunner._shares(
-            chain.forward(sequence, options=len(labels), prefix=prefix_len if use_prefix else 0))
+            chain.forward(sequence, options=len(labels),
+                          prefix=prefix_len if use_prefix else 0, causal=causal))
         values = tuple(probs[item] for item in indexes)
         best = max(range(len(values)), key=values.__getitem__)
         answers.append(

@@ -118,19 +118,22 @@ def test_argument_structs_match_the_c_header() -> None:
     """CPU-only：结构体字段顺序/宽度就是与 `e8_common.h` 的契约。"""
     assert kernels._NRM.size == 36          # A1（票据 06）在尾部加了 `pos0`
     assert kernels._COPY.size == 32
-    assert kernels._ATTN.size == 68         # 批尾巴（票据 10）在尾部加了 qseq + 4 个 16-bit 表
+    assert kernels._ATTN.size == 72         # M3 在尾部加了 `caus`（批尾巴是 qseq + 4 个 16-bit 表）
     assert kernels._GDN.size == 32          # 共享前缀在尾部加了 `cols`（真实列数）
     args = kernels.nrm_args(stile=8, s0=2, src_stride=64, eps=1e-6, pos0=96)
     assert kernels._NRM.unpack(args) == (8, 2, 64, pytest.approx(1e-6), 0, 0, 0, 0, 96)
     assert kernels._ATTN.unpack(kernels.attn_args(T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8,
                                                   qgT=16)) == (
-        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0,
+        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0,
     )
+    # M3：`caus` 在最后一位（索引 17）——插在中间会让 `qseq` 之后整段错位。
+    assert kernels._ATTN.unpack(kernels.attn_args(
+        T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8, qseq=7, caus=1))[12:] == (7, 0, 0, 0, 0, 1)
     # 8 个槽位的表：低槽位在 `nkw0` 的低 16 位
     assert kernels._ATTN.unpack(kernels.attn_args(
         T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8, nka=1024, segw=128, qseq=1024,
         nkw_slots=[60, 63, 66, 69, 72, 75, 80, 90]))[12:] == (
-        1024, 60 | (63 << 16), 66 | (69 << 16), 72 | (75 << 16), 80 | (90 << 16),
+        1024, 60 | (63 << 16), 66 | (69 << 16), 72 | (75 << 16), 80 | (90 << 16), 0,
     )
     # GDN 的 `s0` 是"源表面首列"（票据 10 的逐槽扫描），与 `AttnArgs.s0`（qg 环列）、
     # `CopyArgs.s0`（目标列偏移）同名不同义 —— 这里用非零值钉住它在索引 1。
@@ -297,6 +300,68 @@ def test_attention_matches_numpy(store: SafeTensorFile, runtime: MetalRuntime, f
     assert rel < TOL, f"注意力差得太多：relL2={rel:.3e} cos={cos_sim:.6f}"
     assert cos_sim > 0.999, f"注意力方向不对：cos={cos_sim:.6f}"
     assert np.all(np.isfinite(got)), "注意力输出里有 NaN/inf"
+    for buf in (qg_buf, kv_buf, out_buf, scratch):
+        buf.free()
+
+
+@pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize(("s", "start"), [(96, 0), (96, 16), (256, 16)])
+def test_causal_attention_matches_numpy(
+    store: SafeTensorFile, runtime: MetalRuntime, fast: bool, s: int, start: int
+) -> None:
+    """M3：`caus=1` 的核对上 numpy 的三角注意力（`k <= q`），快核与参考核都测。
+
+    `start` 非 0 时 query 段是整条序列的后半截（`s0 = qseq = start`），这正是 split 路径的
+    形态：一段 query 从序列第 `start` 列起，行的位置不能从 `s0` 反推，只能由 `qseq` 给。
+    `s = 256` 那组把一段切成两个 threadgroup（AT_BM = 128），第二个的词块上界必须由
+    `qseq + j0` 算出来 —— 用 `j0` 代替会少算一两个 key 块（前 16 行的对角线）。
+    """
+    _, ref_qg, ref_kv = _inputs(store, s)
+    qg16 = ref_qg.astype(np.float16)
+    kv16 = ref_kv.astype(np.float16)
+
+    p_q, p_kv = qg16.astype(np.float32), kv16.astype(np.float32)
+    query = np.stack([p_q[h * 2 * kernels.HEAD_DIM : h * 2 * kernels.HEAD_DIM + kernels.HEAD_DIM].T
+                      for h in range(kernels.Q_HEADS)], axis=1)  # [s,8,256]
+    gate = np.stack([p_q[h * 2 * kernels.HEAD_DIM + kernels.HEAD_DIM : (h + 1) * 2 * kernels.HEAD_DIM].T
+                     for h in range(kernels.Q_HEADS)], axis=1)
+    key = np.stack([p_kv[h * kernels.HEAD_DIM : (h + 1) * kernels.HEAD_DIM].T
+                    for h in range(kernels.KV_HEADS)], axis=1)
+    value = np.stack([p_kv[kernels.KV_PROJ + h * kernels.HEAD_DIM : kernels.KV_PROJ + (h + 1) * kernels.HEAD_DIM].T
+                      for h in range(kernels.KV_HEADS)], axis=1)
+    repeat = kernels.Q_HEADS // kernels.KV_HEADS
+
+    rows = np.arange(start, s)[:, None]        # 这一段的 query 行的序列列号
+    cols = np.arange(s)[None, :]
+    context = attention(                       # k <= q，含对角线
+        query[start:], np.repeat(key, repeat, axis=1), np.repeat(value, repeat, axis=1),
+        (cols <= rows),
+    ).reshape(s - start, kernels.QK_DIM)
+    expected = (context * gate[start:].reshape(s - start, kernels.QK_DIM)).T  # [HID, s-start]
+
+    qg_buf = runtime.alloc(Q_ROWS * s * 2)
+    kv_buf = runtime.alloc(KV_ROWS * s * 2)
+    out_buf = runtime.alloc(kernels.HID * 2 * s * 2)
+    scratch = runtime.alloc(64 if fast else 8 * (s - start) * s * 4)
+    qg_buf.array(np.float16, (Q_ROWS, s))[:] = qg16
+    kv_buf.array(np.float16, (KV_ROWS, s))[:] = kv16
+
+    kernels.attention(
+        runtime, qg_buf, kv_buf, out_buf, scratch,
+        T=s, stile=s - start, nk=s, nq=s - start, s0=start, qseq=start, out_s0=start,
+        out_stride=s, caus=1, fast=fast,
+    )
+    runtime.commit()
+    runtime.wait()
+
+    full = out_buf.array(np.float16, (kernels.HID * 2, s))[: kernels.HID].astype(np.float32)
+    got = full[:, start:]
+    rel, cos_sim = _rel_l2(got, expected), _cos(got, expected)
+    assert rel < TOL, (
+        f"causal 注意力对不上 numpy：relL2={rel:.3e} cos={cos_sim:.6f}（fast={fast} start={start}）"
+    )
+    assert cos_sim > 0.999, f"causal 注意力方向不对：cos={cos_sim:.6f}"
+    assert np.all(np.isfinite(got)), "causal 输出里有 NaN/inf"
     for buf in (qg_buf, kv_buf, out_buf, scratch):
         buf.free()
 
