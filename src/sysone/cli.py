@@ -29,6 +29,10 @@ _INPUT_KEYS = {"state", "questions", "attention_mode", "request_id"}
 # split 链的缓冲宽度默认取调度上限：链在装载时就按它分配 GPU 侧的面，
 # 而超过它的 prompt 在 `SplitRunner` 里就是 422。
 _SPLIT_WIDTH = SchedulerConfig().max_len
+# 待命常驻窗口的默认值 = 一个块（4 层）。出货形态（T 16884 / P 16384）上换窗的代价 ≈ +1 %
+# （三轮暖配对 +0.8 / +1.3 / +0.6 %），代价落在短请求上（200 token 2.52×、1k +139 %）；出货形态
+# 是长请求，所以默认取窗口。0 保留给"全装"的对照形态（换算与对账见 docs/sysone/plan.md 第 10/11 片）。
+_RESIDENT_W = 4
 
 
 def _model_flags() -> argparse.ArgumentParser:
@@ -48,8 +52,8 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument("--bucket", type=int, default=0, help="split：ANE program 的列宽（默认 1024）")
     common.add_argument("--width", type=int, default=0, help=f"split：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
     common.add_argument(
-        "--W", type=int, default=0, dest="resident",
-        help="split：待命常驻的层数（0 = 全部；最小 = 一个块的长度，也就是 4）",
+        "--W", type=int, default=_RESIDENT_W, dest="resident",
+        help=f"split：待命常驻的层数（默认 {_RESIDENT_W} = 一个块；0 = 全部 20 层常驻）",
     )
     return common
 

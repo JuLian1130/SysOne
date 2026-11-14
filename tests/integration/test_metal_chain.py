@@ -140,18 +140,20 @@ def test_resident_window_returns_to_standby(windowed) -> None:
 
 
 def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> None:
-    """S3：最后一层里整段落在公共前缀中的瓦片只做第一相，结果必须逐位不变。
+    """S3：最后一层里整段落在公共前缀中的瓦片只做第一相，答案不变、注意力瓦片少一片。
 
     桶宽 S/4、满宽 prompt 正好给 4 个瓦片，`prefix = S/4` 让第 0 个瓦片整段落在前缀里。
-    这里量两件事：**出货形态（双链 + S3 开）的答案 == 单链全量计算的答案**（逐位），以及
-    **S3 真的少发了一片注意力**（数 `wait_upto` 的 lane 0 次数，不数的话"答案一致"也可能是因为
-    根本没跳过）。
 
-    A/B 的那一臂（`_skip_dead = False`）**只能在单链下当参照**：双链 + S3 关 的输出与单链不一致
-    （max|Δ| ≈ 1.0，`max` 相对 14 %），而双链 + S3 开 与单链逐位相同 —— 也就是说出货路径是对的，
-    坏的是那个调试开关在双链下的那一臂。证据与机制见
-    `.scratch/m22-chain/issues/01-two-chain-dead-skip.md`，探针 `.scratch/m22_s3_nch.py`。
-    所以计数那一段也放在单链里跑：那里两臂都可信。
+    **先空跑一遍再比**：分块链的**第一次** `logits()` 与后面几次不同（实测 pass1 对 numpy 链
+    `relL2 1.47e-1`、pass2/3 `1.31e-3`，与 `_skip_dead` 无关，单进程单链也一样），见
+    `.scratch/m22-chain/issues/02-first-pass-chunked.md`。产品路径不受影响：`Engine.start()`
+    先跑一趟预热，服务与 `sysone run` 的第一笔请求已经是第二趟。跑过一遍之后答案才稳定，
+    这条 A/B 才有意义。
+
+    量两件事：**出货形态（双链 + S3 开）与单链全量计算逐位相同**，以及 **S3 真的少发了一片
+    注意力**（数 `wait_upto` 的 lane 0 次数，不数的话"答案一致"也可能是因为根本没跳过）。
+    票据 01 原先把 `_skip_dead = False`（双链）那臂记成"坏参照"，现在证据指向"首次 pass"这个
+    共同原因，票据已据此改写。
     """
     from sysone.devices.apple.metal import LANE_LONG
 
@@ -179,6 +181,7 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
             runtime.wait_upto = original          # type: ignore[method-assign]
 
     try:
+        run(original_nch, True)                   # 预热（首次 pass 不算，票据 02）
         shipping = run(original_nch, True)
         full_single = run(1, False)
         assert np.array_equal(shipping, full_single), (
