@@ -65,6 +65,17 @@ def chunked():
         chain.close()
 
 
+@pytest.fixture(scope="module")
+def windowed():
+    """带待命窗口（`--W 4`）的桶 64 链：共享前缀的按块形状必须能在换窗里跑完。"""
+    MudeChain = _chains()
+    chain = MudeChain.load(MUDE, s=S // 4, width=S, metal=True, resident=4)
+    try:
+        yield chain
+    finally:
+        chain.close()
+
+
 @pytest.mark.parametrize("prefix", PREFIXES)
 def test_metal_chain_matches_the_numpy_chain(chains, prefix: int) -> None:
     cpu, gpu = chains
@@ -190,3 +201,59 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
     finally:
         pipeline._nch = original_nch
         pipeline._skip_dead = True
+
+
+def _ids(count: int, seed: int = 20261114) -> tuple[int, ...]:
+    rng = np.random.default_rng(seed)
+    return tuple(int(value) for value in rng.integers(0, 150_000, size=count))
+
+
+# 共享前缀是"同一批核、同一段算术，只是把列号挪到了尾巴相"，数学上等价；实测尾巴列的差
+# 在 fp16 一个 ulp 的量级（17 token 的短 prompt 上 logits 5.2e-3，长前缀的两个用例是 0），
+# 所以这里按"答案必须一致 + logits 在 ulp 量级内"守，而不是逐位。
+SHARED_TOL = 1e-2
+
+
+def _shared_vs_single(chain, prefix: int, tails: tuple[int, ...], *, options: int = 4) -> None:
+    """共享前缀的 logits 必须与"每题单独整趟"一致（答案逐题相同，数值在 ulp 量级内）。"""
+    tokens = _ids(prefix + sum(tails))
+    head = tokens[:prefix]
+    bounds = np.cumsum((0, *tails))
+    tail_ids = [tokens[prefix + int(start):prefix + int(end)]
+                for start, end in zip(bounds[:-1], bounds[1:])]
+    per_question = [chain.logits(head + tail, prefix=prefix) for tail in tail_ids]
+    shared = chain.logits_shared(head, tail_ids)
+    assert len(shared) == len(per_question)
+    for index, (got, want) in enumerate(zip(shared, per_question)):
+        drift = float(np.abs(got - want).max())
+        assert drift <= SHARED_TOL, (
+            f"共享前缀第 {index} 题与单趟差 {drift:.3e}，超过 {SHARED_TOL}")
+        assert int(np.argmax(got)) == int(np.argmax(want)), f"共享前缀第 {index} 题答案变了"
+    probs = chain.forward_shared(head, tail_ids, options=[options] * len(tail_ids))
+    for index, row in enumerate(probs):
+        assert np.allclose(
+            row,
+            chain.forward(head + tail_ids[index], options=options, prefix=prefix),
+            rtol=0, atol=SHARED_TOL,
+        ), f"共享前缀第 {index} 题的概率超过 {SHARED_TOL}"
+
+
+def test_forward_shared_matches_per_question_passes(chains) -> None:
+    """两题共用一条前缀：答案与逐题整趟逐位相同。"""
+    _, gpu = chains
+    _shared_vs_single(gpu, 200, (5, 3))
+
+
+def test_forward_shared_matches_per_question_passes_on_a_single_tile(chains) -> None:
+    _, gpu = chains
+    _shared_vs_single(gpu, 10, (7,))
+
+
+def test_forward_shared_on_a_chunked_chain(chunked) -> None:
+    """桶 64 的链：前缀跨两段、尾巴从非桶对齐的位置起（`_chunks_from` 的那条路）。"""
+    _shared_vs_single(chunked, 70, (3, 9, 5))
+
+
+def test_forward_shared_under_a_resident_window(windowed) -> None:
+    """`--W 4`：按块交错的形状要能在换窗里跑完，且与逐题整趟逐位相同。"""
+    _shared_vs_single(windowed, 150, (6, 4))

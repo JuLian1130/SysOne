@@ -207,6 +207,11 @@ class MudePipeline:
         self.states = [rt.alloc(4 * geom.state_floats) for _ in self.buffers]
         self.tails = [rt.alloc(2 * geom.conv_dim * 3) for _ in self.buffers]
         self._last: MetalBuffer = self.x
+        # 共享前缀（`run_shared`）里尾巴的隐藏态：题与题共用同一段列，块边界上要按题各存一份。
+        # 它只在一次共享请求期间存在（`run_shared` 结束就 `free`），不常驻。
+        self._tail_hidden: MetalBuffer | None = None
+        self._tail_cols = 0
+        self._fresh = True
 
     # ------------------------------------------------------------------ 执行
 
@@ -216,8 +221,22 @@ class MudePipeline:
         for start in range(0, length, step):
             yield start, min(step, length - start)
 
-    def run(self, embed: np.ndarray, *, length: int, prefix: int = 0) -> None:
-        """跑完 20 层。`embed` 是 `[length, hidden]` 的 embedding 输出（fp32）。
+    def _write_rows(self, view: np.ndarray, rows: np.ndarray, s0: int = 0) -> None:
+        """把 `[n, hidden]` 的行写进 `view` 的 `[s0, s0 + n)` 列（fp16，按桶转置）。
+
+        与 `run` 里那句 `view[:, :length] = ...` 的差别只在这笔账：整宽一次转置要先物化一份
+        `[hidden, length]` 的 fp32（16k 是 134 MB），这里按桶切，临时量是一桶
+        （`bucket × hidden × 4`，1024 桶下 8 MB）。`run_shared` 的前缀列与尾巴列都走它。
+        """
+        data = np.asarray(rows)
+        step = self._bucket
+        for start in range(0, data.shape[0], step):
+            block = np.asarray(data[start:start + step], np.float16)
+            view[:, s0 + start:s0 + start + block.shape[0]] = block.T
+
+    def run(self, embed: np.ndarray | None, *, length: int, prefix: int = 0) -> None:
+        """跑完 20 层。`embed` 是 `[length, hidden]` 的 embedding 输出（fp32；`None` = 调用方
+        已经用 `run_rows` 把行写进画布了）。
 
         **步骤图驱动**：一层被拆成 `schedule.py` 的订单式 `(chain, step)` 序列 ——
         `norm → proj → core/gather → out → norm2 → ffn → tail`，一步一个命令缓冲，
@@ -231,36 +250,13 @@ class MudePipeline:
         """
         if not 0 <= prefix <= length <= self._width:
             raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
-        view = self.x.array(np.float16, (self._hidden, self._width))
-        view[:] = 0
-        view[:, :length] = np.asarray(embed, np.float32).T.astype(np.float16)
+        if embed is not None:
+            view = self.x.array(np.float16, (self._hidden, self._width))
+            view[:] = 0
+            view[:, :length] = np.asarray(embed, np.float32).T.astype(np.float16)
         self._chunks_list = list(self._chunks(length))
-        self._length = int(length)
-        self._prefix = int(prefix)
-        # S3（旧引擎的 `LASTDEAD`，`docs/ANE/anebench/e8_a3.py:291-302`）：模型最后一层里整段落在
-        # 公共前缀中的瓦片只欠 K/V —— 前缀行的注意力输出与 MLP 输出都没有读者（读出在 query
-        # 行上，K/V 出自投影那一步，不依赖注意力）。所以这些瓦片丢掉第二相（`attn` 与它之后的
-        # `out`/`norm2`/`ffn`/`tail`）。
-        #
-        # 最后一个瓦片永远不丢：`prefix == length` 时读出那一行自己也在前缀里，它就变成读者了。
-        dead = 0
-        if self._skip_dead and prefix > 0 and self._last_is_full:
-            dead = sum(1 for start, n in self._chunks_list if start + n <= prefix)
-            dead = min(dead, len(self._chunks_list) - 1)
-        self._dead = dead
-        # 每条 lane 的命令缓冲账：本轮提交了几个、其中前几个已经结算。
-        self._committed = {LANE_LONG: 0, LANE_SMALL: 0}
-        self._completed = {LANE_LONG: 0, LANE_SMALL: 0}
-        # 哪一层哪些瓦片的 `h` 已经写好（= 上一层的 `tail` 编码过）。
-        self._h: dict[int, set[int]] = {index: set() for index in range(len(self.buffers))}
-        self._preps: dict[int, bool] = {}
-        self._prev: dict[int, int | None] = {}
-        # 每层已经编码了几个 gather（两相屏障要的是**两条奇偶链**的合计）。
-        self._gathers: dict[int, int] = {}
-        # 每层最后编码的那个 `core` 瓦片（两条奇偶链共用递归状态与卷积尾巴，只能按序）。
-        self._core_enc: dict[int, int] = {}
-        roles = [entry.role for entry in self.buffers]
-        for index, block_of_layers in enumerate(blocks(roles)):
+        self._prepare(length, prefix, fresh=True)
+        for index, block_of_layers in enumerate(self._blocks()):
             if self._residency is not None:
                 self._residency.begin(index)
             self._run_block(block_of_layers)
@@ -271,6 +267,174 @@ class MudePipeline:
                 self._residency.end(index)
         if self._residency is not None:
             self._residency.finish()   # 一轮结束落在待命窗口上（服务契约"回到前 W 层"）
+
+    def run_rows(self, rows: np.ndarray, *, length: int, prefix: int = 0) -> None:
+        """与 `run` 同语义，但 embedding 由 `[length, hidden]` 的行逐桶写进画布。
+
+        给"不想物化整宽 fp32 画布"的调用方用（`MudeChain.logits_rows`）：临时量是一桶，
+        而不是 `[hidden, length]` 的 fp32。数值上与 `run` 完全一致。
+        """
+        if not 0 <= prefix <= length <= self._width:
+            raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
+        if int(np.asarray(rows).shape[0]) != length:
+            raise ConfigError("行数与长度不一致", rows=int(np.asarray(rows).shape[0]), length=length)
+        view = self.x.array(np.float16, (self._hidden, self._width))
+        self._write_rows(view, rows, 0)
+        self.run(None, length=length, prefix=prefix)
+
+    def run_shared(self, prefix_rows: np.ndarray, tails: Sequence[np.ndarray], *,
+                   prefix: int) -> list[np.ndarray]:
+        """一个请求内多题共享前缀：前缀一遍，每题只跑自己那条尾巴（旧引擎 S7b 的按块形状）。
+
+        `prefix_rows` 是 `[prefix, hidden]` 的 embedding，`tails` 每题一条 `[q_j, hidden]`
+        （`q_j` 是尾巴的 token 数）。返回每题最后一层的 `[hidden]` fp32。
+
+        复用单位是**一个块**：`blocks()` 在每个全注意力层之前切开，一块里至多一个全注意力层，
+        所以一块 `kv` 画布就够 —— 前缀的 K/V 在本块里写完就被本块的尾巴读掉，下一块再覆盖。
+        前缀的**隐藏态**留在 `x` 的前缀列上给下一块的前缀瓦片用；尾巴的隐藏态逐题存进
+        `_tail_hidden`，因为尾巴共用同一段列、题目之间会互相覆盖，而下一块的尾巴相要接上
+        上一块末尾的那一行。
+
+        GDN 的递归状态与卷积尾巴**逐层独立**：前缀相跑完就把本块那几层存到 host，每题的尾巴相
+        开始前再写回去（`first=False`，卷积尾巴继续用前缀的最后 3 行）。跨相传递就这一处。
+
+        `prefix` 不要求是桶宽的整数倍：尾巴的瓦片从 `prefix` 自己起（`_chunks_from`），前缀的
+        最后一段按剩余列数切 —— 两相的列接起来正好是 `[0, prefix + q_j)`，掩码与 rope 位置
+        与单题一整趟跑出来的完全一致。
+        """
+        if not 0 < prefix <= self._width:
+            raise ConfigError("共享前缀的长度越界", prefix=prefix, width=self._width)
+        if not tails:
+            raise ConfigError("共享前缀至少需要一条尾巴")
+        lengths = [int(np.asarray(tail).shape[0]) for tail in tails]
+        if min(lengths) <= 0:
+            raise ConfigError("尾巴至少要有一个 token", lengths=lengths)
+        longest = max(lengths)
+        if prefix + longest > self._width:
+            raise ConfigError("共享前缀 + 最长尾巴超出缓冲宽度",
+                              prefix=prefix, tail=longest, width=self._width)
+        self._ensure_tail_hidden(len(tails), longest)
+        view = self.x.array(np.float16, (self._hidden, self._width))
+        hidden = self._tail_hidden.array(np.float16, (self._hidden, self._tail_cols))
+        self._write_rows(view, prefix_rows, 0)
+        for index, tail in enumerate(tails):
+            self._write_rows(hidden, tail, index * longest)
+        prefix_chunks = list(self._chunks(prefix))
+        tail_chunks = [list(self._chunks_from(prefix, prefix + q)) for q in lengths]
+        result: list[np.ndarray | None] = [None] * len(tails)
+        groups = self._blocks()
+        try:
+            for index, block_of_layers in enumerate(groups):
+                if self._residency is not None:
+                    self._residency.begin(index)
+                # 前缀相：只有前缀的列，S3 的死瓦片照旧
+                self._chunks_list = list(prefix_chunks)
+                self._prepare(prefix, prefix, fresh=True)
+                self._run_block(block_of_layers)
+                self._wait_all()
+                snapshot = self._snapshot(block_of_layers)
+                last_block = index == len(groups) - 1
+                # 尾巴相：每题一趟，只跑尾巴的列；同一块的前缀 K/V 还在 kv 里
+                for question, chunks in enumerate(tail_chunks):
+                    base, q = question * longest, lengths[question]
+                    self._restore(block_of_layers, snapshot)
+                    view[:, prefix:prefix + q] = hidden[:, base:base + q]
+                    self._chunks_list = list(chunks)
+                    self._prepare(prefix + q, prefix, fresh=False)
+                    self._run_block(block_of_layers)
+                    self._wait_all()
+                    if last_block:
+                        # `last_hidden` 收的是**序列长度**，它读 `length - 1` 那一列
+                        result[question] = self.last_hidden(prefix + q)
+                    hidden[:, base:base + q] = view[:, prefix:prefix + q]
+                if self._residency is not None:
+                    self._residency.end(index)
+            if self._residency is not None:
+                self._residency.finish()
+        finally:
+            # 尾巴的隐藏态只服务这一次请求；题数/尾巴长度一变就换一块（不按见过的形状常驻）
+            self._free_tail_hidden()
+        if any(row is None for row in result):
+            raise NotReadyError("共享前缀漏读了某题的读出", questions=len(tails))
+        return [row for row in result if row is not None]
+
+    # ---- 相 / 块 -----------------------------------------------------------
+
+    def _blocks(self) -> tuple[tuple[int, ...], ...]:
+        return blocks([entry.role for entry in self.buffers])
+
+    def _chunks_from(self, start: int, end: int) -> Iterator[tuple[int, int]]:
+        """从 `start` 起把 `[start, end)` 切成不超过桶宽的段：尾巴的列不要求桶对齐。"""
+        position = int(start)
+        while position < int(end):
+            size = min(self._bucket, int(end) - position)
+            yield position, size
+            position += size
+
+    def _prepare(self, length: int, prefix: int, *, fresh: bool) -> None:
+        """开一个执行相：掩码模型、S3 的死瓦片，以及各条链的游标账。
+
+        `fresh=False` 表示这一相接着上一相的状态跑（共享前缀的尾巴相）：GDN 的递归状态与
+        卷积尾巴由调用方先写回，块开头的清零要跳过（见 `_run_block`）。
+        """
+        self._length = int(length)
+        self._prefix = int(prefix)
+        self._fresh = bool(fresh)
+        # S3（旧引擎的 `LASTDEAD`，`docs/ANE/anebench/e8_a3.py:291-302`）：模型最后一层里整段落在
+        # 公共前缀中的瓦片只欠 K/V —— 前缀行的注意力输出与 MLP 输出都没有读者（读出在 query
+        # 行上，K/V 出自投影那一步，不依赖注意力）。所以这些瓦片丢掉第二相（`attn` 与它之后的
+        # `out`/`norm2`/`ffn`/`tail`）。
+        #
+        # 最后一个瓦片永远不丢：`prefix == length` 时读出那一行自己也在前缀里，它就变成读者了。
+        dead = 0
+        if self._skip_dead and self._prefix > 0 and self._last_is_full:
+            dead = sum(1 for start, n in self._chunks_list if start + n <= self._prefix)
+            dead = min(dead, len(self._chunks_list) - 1)
+        self._dead = dead
+        # 每条 lane 的命令缓冲账：本相提交了几个、其中前几个已经结算。
+        self._committed = {LANE_LONG: 0, LANE_SMALL: 0}
+        self._completed = {LANE_LONG: 0, LANE_SMALL: 0}
+        # 哪一层哪些瓦片的 `h` 已经写好（= 上一层的 `tail` 编码过）。相的边界上清空：
+        # 尾巴相的 `norm` 只认本相写过的 `h`，前缀相的瓦片号不能替它作证。
+        self._h: dict[int, set[int]] = {index: set() for index in range(len(self.buffers))}
+        self._preps: dict[int, bool] = {}
+        self._prev: dict[int, int | None] = {}
+        # 每层本相已经编码了几个 gather（两相屏障要的是**两条奇偶链**的合计）。
+        self._gathers: dict[int, int] = {}
+        # 每层最后编码的那个 `core` 瓦片（两条奇偶链共用递归状态与卷积尾巴，只能按序）。
+        self._core_enc: dict[int, int] = {}
+
+    def _snapshot(self, block: Sequence[int]) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+        """把本块各 GDN 层的前缀末状态抄到 host（尾巴相要按题回放）。"""
+        snapshot: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for index in block:
+            if self.buffers[index].role is AttentionRole.FULL:
+                continue
+            snapshot[index] = (np.array(self.states[index].array(np.uint8)),
+                               np.array(self.tails[index].array(np.uint8)))
+        return snapshot
+
+    def _restore(self, block: Sequence[int], snapshot: dict[int, tuple[np.ndarray, np.ndarray]]) -> None:
+        """尾巴相开始前把前缀末状态写回；只在块排空之后调用（不会与在飞的工作抢内存）。"""
+        for index in block:
+            state, tail = snapshot.get(index, (None, None))
+            if state is None:
+                continue
+            self.states[index].array(np.uint8)[:] = state
+            self.tails[index].array(np.uint8)[:] = tail
+
+    def _ensure_tail_hidden(self, questions: int, longest: int) -> None:
+        """按 (题数, 最长尾巴) 备一块尾巴隐藏态的 scratch（不复用别的形状）。"""
+        columns = int(questions) * int(longest)
+        self._free_tail_hidden()
+        self._tail_hidden = self._runtime.alloc(2 * self._hidden * columns)
+        self._tail_cols = columns
+
+    def _free_tail_hidden(self) -> None:
+        if self._tail_hidden is not None:
+            self._tail_hidden.free()
+            self._tail_hidden = None
+        self._tail_cols = 0
 
     # ---- 命令缓冲账 ---------------------------------------------------------
 
@@ -351,6 +515,9 @@ class MudePipeline:
             self._prev[index] = block[position - 1] if position else None
             entry = self.buffers[index]
             if entry.role is AttentionRole.FULL:
+                continue
+            if not self._fresh:
+                # 共享前缀的尾巴相：状态是 `_restore` 写回的前缀末状态，不能清
                 continue
             self.states[index].array(
                 np.float32,
@@ -543,8 +710,10 @@ class MudePipeline:
             entry.weights["norm"], entry.surface("out_in", chain.slot), self.gscratch,
             # GDN 核里的 `Stile` 既是列界也是**通道步长**（`proj[c*Stile + j]`），所以必须
             # 传桶宽而不是本段的有效列数；`T` 是它不看的多余字段。
-            stile=self._bucket, eps=EPS, first=tile == 0, T=self._bucket,
-            out_stride=self._bucket, fast=True, geometry=self._geometry,
+            # `first` 只在"新序列的第一个瓦片"上为真：共享前缀的尾巴相沿用前缀的卷积尾巴。
+            # `cols=n`：部分瓦片的卷积尾巴要取自最后 3 个**真实**列，而不是桶尾的 padding。
+            stile=self._bucket, cols=n, eps=EPS, first=(tile == 0 and self._fresh),
+            T=self._bucket, out_stride=self._bucket, fast=True, geometry=self._geometry,
         )
         self._commit(chain, LANE_SMALL, "core", tile)
         self._core_enc[chain.layer] = tile
@@ -579,14 +748,21 @@ class MudePipeline:
         self._h[chain.layer].add(tile)
 
     def _prep_kv(self, entry: LayerBuffers) -> None:
-        """全宽的 k 归一 + 部分 RoPE（旧引擎 `prep` 的 k 半，序列级屏障之后才做）。
+        """本相窗口的 k 归一 + 部分 RoPE（旧引擎 `prep` 的 k 半，序列级屏障之后才做）。
 
         q 不在这里：投影拆开之后 q 只活一个瓦片，归一与 RoPE 挪进了每个瓦片的 `prep_q`
         （见 `_step_prep_q`）—— 这也是 `qg` 能成环的原因（票据 06）。
+
+        窗口是本相的 `_chunks_list` 从第一段首列到末段末列。共享前缀的尾巴相只归一自己那几
+        列：前缀列在前缀相已经 prep 过，再来一遍会把 RoPE 叠两次。`kv` 是整窗缓存，列号就是
+        位置，所以 `pos0` 恒为 0（`s0` 已经是绝对列号）。
         """
+        chunks = self._chunks_list
+        start = chunks[0][0]
+        end = chunks[-1][0] + chunks[-1][1]
         kernels.kv_prep(self._runtime, self.kv, entry.weights["k_norm"],
-                        self._cos, self._sin, stile=self._width, src_stride=self._width,
-                        eps=EPS, geometry=self._geometry)
+                        self._cos, self._sin, stile=end - start, s0=start,
+                        src_stride=self._width, eps=EPS, geometry=self._geometry)
 
     def _step_prep_q(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
         """`prep_q`：环槽位里的 q 做 RMSNorm+半维 RoPE、gate 做 sigmoid（`k_q_prep`，原地）。
@@ -667,6 +843,7 @@ class MudePipeline:
                 buffer.free()
             wrapped.clear()
         self._wrapped.clear()
+        self._free_tail_hidden()
         for name in ("x", "qg", "kv", "gscratch", "attn_scratch", "_cos", "_sin"):
             buffer = getattr(self, name, None)
             if buffer is not None:

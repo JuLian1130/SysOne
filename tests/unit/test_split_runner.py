@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
-from helpers import load_tiny_descriptor, make_request
+from helpers import OPTIONS, load_tiny_descriptor, make_request
 
 from sysone.config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig
 from sysone.domain.attention import MaskMode
@@ -341,3 +341,104 @@ def test_read_codes_rejects_a_short_table(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as info:
         mude.read_codes(root)
     assert info.value.context["rows"] == mude.CODE_ROWS
+
+
+# ---------------------------------------------------------------------- 共享前缀
+
+
+class SharedChain(FakeChain):
+    """多一条 `forward_shared`；返回均匀概率，和 `forward` 的默认行为一致。"""
+
+    def __init__(self, *, shares: tuple[float, ...] | None = None) -> None:
+        super().__init__(shares=shares)
+        self.shared: list[tuple[tuple[int, ...], list[tuple[int, ...]], tuple[int, ...]]] = []
+
+    def forward_shared(self, prefix, tails, *, options):
+        self.shared.append(
+            (tuple(prefix), [tuple(tail) for tail in tails], tuple(int(value) for value in options))
+        )
+        if self._shares is not None:
+            rows = []
+            for count in options:
+                values = list(self._shares[: int(count)])
+                rows.append([value / sum(values) for value in values])
+            return rows
+        return [[1.0 / int(count)] * int(count) for count in options]
+
+
+class ScriptedPrompter:
+    """按调用次序给固定 `(sequence, prefix_len, labels, indexes)`：用来造"前缀不同"的请求。"""
+
+    def __init__(self, plans) -> None:
+        self.plans = list(plans)
+        self.calls = 0
+
+    def encode(self, state, question):
+        plan = self.plans[self.calls]
+        self.calls += 1
+        return plan
+
+
+def _forced_runner(plans, chain: FakeChain, *, max_len: int = 4096) -> SplitRunner:
+    return SplitRunner(lambda: chain, ScriptedPrompter(plans), max_len=max_len)
+
+
+def test_two_questions_with_one_state_share_the_prefix() -> None:
+    """两题一次请求：前缀只跑一遍，每题只跑自己的尾巴。"""
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    request = make_request(questions=2)
+    runner.answers_for(request, MaskMode.PREFIX_NONCAUSAL)
+    assert len(chain.shared) == 1, "两题共用一条前缀时只该有一条共享路径"
+    prefix, tails, options = chain.shared[0]
+    assert len(tails) == 2 and len(prefix) > 0
+    assert options == (len(OPTIONS), len(OPTIONS))
+    assert chain.calls == [], "共享路径不该再逐题整趟"
+    # 每条尾巴都是"整条 prompt 去掉前缀"（两题的题面不同，尾巴也就不同）
+    assert tails[0] != tails[1]
+
+
+def test_a_lone_question_runs_one_full_pass() -> None:
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=1), MaskMode.PREFIX_NONCAUSAL)
+    assert chain.shared == [], "只有一题时不建前缀缓存"
+    assert len(chain.calls) == 1
+
+
+def test_a_different_prefix_per_question_falls_back() -> None:
+    """分词边界把某题的前缀和别的题错开时，不共用前缀（复用会改那一题的数值）。"""
+    chain = SharedChain()
+    labels = ("甲", "乙")
+    plans = [((10, 11, 12, 13), 2, labels, (0, 1)), ((10, 99, 12, 13), 2, labels, (0, 1))]
+    runner = _forced_runner(plans, chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2), MaskMode.PREFIX_NONCAUSAL)
+    assert chain.shared == []
+    assert len(chain.calls) == 2
+
+
+def test_noncausal_full_never_shares() -> None:
+    """`noncausal_full` 把前缀当 0：掩码不同，不能复用前缀那一段。"""
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2, mode=MaskMode.NONCAUSAL_FULL), MaskMode.NONCAUSAL_FULL)
+    assert chain.shared == []
+    assert len(chain.calls) == 2
+
+
+def test_the_shared_path_gives_the_same_answers_and_usage() -> None:
+    """共享前缀只是省算力：答案与 `input_tokens` 与逐题整趟一致。"""
+    shared_chain = SharedChain()
+    serial_chain = FakeChain()
+    request = make_request(questions=3)
+    shared_runner, serial_runner = _runner(shared_chain), _runner(serial_chain)
+    shared_runner.load_weights()
+    serial_runner.load_weights()
+    shared = shared_runner.answers_for(request, MaskMode.PREFIX_NONCAUSAL)
+    serial = serial_runner.answers_for(request, MaskMode.PREFIX_NONCAUSAL)
+    assert shared[0] == serial[0]
+    assert shared[1] == serial[1]

@@ -57,7 +57,7 @@ HEAD_SCALE = GEOMETRY.head_scale  # attention 的 1/sqrt(head_dim)
 _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
 _ATTN = struct.Struct("<IIIfIIIIIIII")  # struct AttnArgs，48 B
-_GDN = struct.Struct("<IIIIfII")  # struct GdnArgs，28 B
+_GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
 
 
 def nrm_args(
@@ -121,10 +121,15 @@ def attn_args(
 
 
 def gdn_args(
-    *, stile: int, s0: int, T: int, first: bool, eps: float, out_stride: int = 0, out_s0: int = 0
+    *, stile: int, s0: int, T: int, first: bool, eps: float, out_stride: int = 0,
+    out_s0: int = 0, cols: int = 0,
 ) -> bytes:
-    """`k_gdn` 家族（`e8_common.h:137`）。`first=True` 表示这是这一层的第一个 tile（卷积尾巴无效）。"""
-    return _GDN.pack(stile, s0, T, 1 if first else 0, eps, out_stride, out_s0)
+    """`k_gdn` 家族（`e8_common.h:137`）。`first=True` 表示这是这一层的第一个 tile（卷积尾巴无效）。
+
+    `stile` 是**表面步长**（`proj[c*stile + j]`），`cols` 是本瓦片真实列数（0 = `stile`）。
+    两者分开之后，部分瓦片（共享前缀的尾巴、prompt 的最后一段）才能给出正确的卷积尾巴。
+    """
+    return _GDN.pack(stile, s0, T, 1 if first else 0, eps, out_stride, out_s0, cols)
 
 
 # ---- 网格 -----------------------------------------------------------------------------
@@ -452,6 +457,7 @@ def gdn(
     T: int = 0,
     out_stride: int = 0,
     out_s0: int = 0,
+    cols: int = 0,
     fast: bool = True,
     geometry: Geometry | None = None,
     lane: int = LANE_SMALL,
@@ -465,7 +471,8 @@ def gdn(
     """
     geom = GEOMETRY if geometry is None else geometry
     args = gdn_args(
-        stile=stile, s0=s0, T=T, first=first, eps=eps, out_stride=out_stride, out_s0=out_s0
+        stile=stile, s0=s0, T=T, first=first, eps=eps, out_stride=out_stride, out_s0=out_s0,
+        cols=cols,
     )
     buffers_list = [proj, state, tail, wconv, a_log, dt_bias, norm, out, scratch]
     if not fast:

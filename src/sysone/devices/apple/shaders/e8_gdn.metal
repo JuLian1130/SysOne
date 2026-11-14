@@ -141,7 +141,7 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     const uint  tid = tid2.x;
     const uint  h   = tgid.x;
     const ulong sp  = a.Stile;
-    const int   St  = int(a.Stile);
+    const int   St  = int(a.cols ? a.cols : a.Stile);
     const int   t0  = int(tgid.y) * E8G_TB;
     if (t0 >= St) return;
 
@@ -293,11 +293,12 @@ kernel void k_gdn_tail(device const half  *proj   [[buffer(0)]],
     const uint tid = tid2.x;
     const uint h   = tgid.x;
     const ulong sp = a.Stile;
-    if (a.Stile < 3u || h >= (uint)E8_L_HEADS || tid >= (uint)E8G_D) return;
+    const uint  ncol = a.cols ? a.cols : a.Stile;
+    if (ncol < 3u || h >= (uint)E8_L_HEADS || tid >= (uint)E8G_D) return;
     const uint cq = h * E8G_D + tid;
     const uint ck = E8_HID + cq;
     const uint cv = 2u * E8_HID + cq;
-    const ulong c0 = (ulong)(a.Stile - 3u);
+    const ulong c0 = (ulong)(ncol - 3u);
     #pragma unroll
     for (int k = 0; k < 3; k++) {
         tail[(ulong)cq * 3u + (uint)k] = proj[(ulong)cq * sp + c0 + (ulong)k];
@@ -347,7 +348,7 @@ kernel void k_gdn(device const half  *proj   [[buffer(0)]],
         float4 t = *(device const float4 *)(srow + i);
         S[i + 0] = t.x; S[i + 1] = t.y; S[i + 2] = t.z; S[i + 3] = t.w;
     }
-    const int   St    = int(a.Stile);
+    const int   St    = int(a.cols ? a.cols : a.Stile);
     const ulong qbase = E8G_S_QN + h * E8G_D + tq;   // this lane's 32 qn halves within a row
     const ulong kbase = E8G_S_KN + h * E8G_D + tq;
     const ulong vbase = E8G_S_V  + h * E8G_D + dv;
@@ -436,7 +437,7 @@ kernel void k_gdn_norm(device const half  *proj   [[buffer(0)]],
     const uint  warp = tid >> 5;
     const uint  lane = tid & 31u;
     const int   s    = int(tgid.x) * int(ntg2.x >> 5) + int(warp);   // one token per warp
-    if (s >= int(a.Stile) || h >= (uint)E8_L_HEADS) return;
+    if (s >= int(a.cols ? a.cols : a.Stile) || h >= (uint)E8_L_HEADS) return;
 
     const uint  dv  = lane * 4u;
     const ulong off = (ulong)(h * E8G_D + dv) * osp + os0 + (ulong)s;

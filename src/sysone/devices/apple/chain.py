@@ -359,6 +359,83 @@ class MudeChain:
         return self._readout @ final
 
     def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0) -> np.ndarray:
+        """前 `options` 个码的 softmax 概率（选项顺序 = `codes` 顺序）。"""
+        return self._probabilities(self.logits(tokens, prefix=prefix), options)
+
+    def forward_shared(
+        self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, options: Sequence[int]
+    ) -> list[np.ndarray]:
+        """一个请求内多题共享前缀：前缀只算一遍，每题只跑自己那条尾巴。
+
+        与 `forward` 同一个约定（第 k 题取前 `options[k]` 个码的 softmax）。`tails[k]` 是第 k 题
+        的**续写** token（不含前缀）。这条路径只有 Metal 链提供：numpy 链没有零拷贝流水线，
+        前缀的 K/V 与隐藏态没有落脚点。
+
+        一个请求里所有题的前缀都相同（`state` 只有一个），所以复用单位是"这个请求"，请求返回
+        就释放 —— 不做跨请求缓存。
+        """
+        if len(options) != len(tails):
+            raise ValueError(f"options 与尾巴条数不一致：{len(options)} vs {len(tails)}")
+        logits = self.logits_shared(prefix, tails)
+        return [self._probabilities(row, int(count)) for row, count in zip(logits, options)]
+
+    def logits_shared(
+        self, prefix: Sequence[int], tails: Sequence[Sequence[int]]
+    ) -> list[np.ndarray]:
+        """共享前缀的整条前向：返回每题的 `[CODE_ROWS]` 原始 logits（未除温度）。"""
+        if self._pipeline is None:
+            raise ValueError("共享前缀只有 Metal 链提供（load 时用 metal=True）")
+        ids = np.asarray(prefix, dtype=np.int64).reshape(-1)
+        length = int(ids.size)
+        if length == 0:
+            raise ValueError("共享前缀至少要有一个 token")
+        if length > self._width:
+            raise ValueError(
+                f"共享前缀 {length} 超过链的缓冲宽度 width={self._width}；用更大的 width 重新 load")
+        rows: list[np.ndarray] = []
+        for tail in tails:
+            tail_ids = np.asarray(tail, dtype=np.int64).reshape(-1)
+            if tail_ids.size == 0:
+                raise ValueError("尾巴至少要有一个 token")
+            if length + int(tail_ids.size) > self._width:
+                raise ValueError(
+                    f"前缀 + 尾巴 {length + int(tail_ids.size)} 超过链的缓冲宽度 "
+                    f"width={self._width}；用更大的 width 重新 load")
+            rows.append(tail_ids)
+        hidden = self._pipeline.run_shared(
+            self._store.read_rows(self._embed_name, ids),
+            [self._store.read_rows(self._embed_name, tail) for tail in rows],
+            prefix=length,
+        )
+        out: list[np.ndarray] = []
+        for row in hidden:
+            final = rms_norm(row[None, :], self._final_norm)[0]
+            out.append(self._readout @ final)
+        return out
+
+    def logits_rows(self, tokens: Sequence[int], *, prefix: int = 0) -> np.ndarray:
+        """与 `logits` 同语义，但 embedding 按桶逐块写进画布，不物化整宽 fp32 画布。
+
+        探针 `.scratch/probe_place.py` 拿它量"整宽画布"那笔内存值多少；两条路径的 logits
+        必须逐位相同（`logits` 仍是默认路径，没换）。
+        """
+        if self._pipeline is None:
+            raise ValueError("按行写画布只有 Metal 链提供（load 时用 metal=True）")
+        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
+        length = int(ids.size)
+        if length == 0:
+            raise ValueError("prompt 至少要有一个 token")
+        if length > self._width:
+            raise ValueError(
+                f"prompt 长度 {length} 超过链的缓冲宽度 width={self._width}；用更大的 width 重新 load")
+        if not 0 <= prefix <= length:
+            raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
+        self._pipeline.run_rows(
+            self._store.read_rows(self._embed_name, ids), length=length, prefix=prefix)
+        final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
+        return self._readout @ final
+
+    def _probabilities(self, logits: np.ndarray, options: int) -> np.ndarray:
         """前 `options` 个码的 softmax 概率（选项顺序 = `codes` 顺序）。
 
         与厂商 `D3.probabilities` 的约定一致：越界码行在 softmax 前置 -inf（exp 为 0），
@@ -366,7 +443,7 @@ class MudeChain:
         """
         if not 1 <= options <= CODE_ROWS:
             raise ValueError(f"options 必须在 1..{CODE_ROWS}，收到 {options}")
-        return softmax(self.logits(tokens, prefix=prefix)[:options] / self._temperature)
+        return softmax(logits[:options] / self._temperature)
 
     def _full_layer(
         self,

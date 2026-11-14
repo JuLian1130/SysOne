@@ -119,7 +119,7 @@ def test_argument_structs_match_the_c_header() -> None:
     assert kernels._NRM.size == 36          # A1（票据 06）在尾部加了 `pos0`
     assert kernels._COPY.size == 32
     assert kernels._ATTN.size == 48
-    assert kernels._GDN.size == 28
+    assert kernels._GDN.size == 32          # 共享前缀在尾部加了 `cols`（真实列数）
     args = kernels.nrm_args(stile=8, s0=2, src_stride=64, eps=1e-6, pos0=96)
     assert kernels._NRM.unpack(args) == (8, 2, 64, pytest.approx(1e-6), 0, 0, 0, 0, 96)
     assert kernels._ATTN.unpack(kernels.attn_args(T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8,

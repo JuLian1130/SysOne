@@ -142,8 +142,8 @@ struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIII" -> 48 bytes
     uint  out_s0;          // 11 output column offset inside out
 };
 
-struct GdnArgs {           // e8_mtl.py: "<IIIIfII" -> 28 bytes
-    uint  Stile;           // 0  tokens in this tile
+struct GdnArgs {           // e8_mtl.py: "<IIIIfIII" -> 32 bytes
+    uint  Stile;           // 0  columns per channel in the surfaces (a *stride*, not a count)
     uint  s0;              // 1  first token position (for rope-free absolutes / debug)
     uint  T;               // 2  total sequence length (unused by the A1 cores, kept for A2)
     uint  first;           // 3  1 = first tile of the layer (conv tail is invalid)
@@ -152,6 +152,12 @@ struct GdnArgs {           // e8_mtl.py: "<IIIIfII" -> 28 bytes
     // surface at this request's slot.  0 / 0 is the old layout (stride = Stile, offset = 0).
     uint  out_stride;      // 5  columns per channel in out; 0 = Stile
     uint  out_s0;          // 6  output column offset inside out
+    // The real column count of this tile (<= Stile).  `Stile` has to stay the surface stride
+    // (`proj[c*Stile + j]`), so a partial tile (the shared-prefix tail, the last prompt tile)
+    // cannot express "how many columns exist" through it -- and the GDN kernels need it in
+    // four places: the prep loop bound, the conv-tail write (`cols - 3`), the delta loop,
+    // and the norm's guard.  0 = Stile (every caller before the shared-prefix path).
+    uint  cols;            // 7  real columns in this tile; 0 = Stile
 };
 
 // ---------------------------------------------------------------------------------------

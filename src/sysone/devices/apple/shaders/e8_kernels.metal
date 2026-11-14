@@ -361,7 +361,8 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
     threadgroup float red[8];      // the 128 dv of one head ARE the threadgroup, so the
                                    // gated RMSNorm's mean over dv is a threadgroup reduction
 
-    for (uint j = 0; j < a.Stile; j++) {
+    const uint ncol = a.cols ? a.cols : a.Stile;
+    for (uint j = 0; j < ncol; j++) {
         int t = s0 + int(j);
         // ---- conv1d(K=4) + SiLU for this head's q, k, v rows
         float qv[E8_L_KD], kv[E8_L_KD], vv = 0.0f;
@@ -427,9 +428,9 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
     }
 
     // ---- carry the last 3 raw qkv columns to the next tile
-    if (a.Stile >= 3u) {
+    if (ncol >= 3u) {
         for (uint k = 0; k < 3u; k++) {
-            int t = s0 + int(a.Stile) - 3 + int(k);
+            int t = s0 + int(ncol) - 3 + int(k);
             if (t < 0) continue;
             uint cq = h * D + dv;
             tail[(ulong)cq * 3 + k]              = e8_gdn_raw(proj, tail, a, cq, t);
