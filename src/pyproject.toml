@@ -7,12 +7,14 @@ name = "sysone"
 version = "0.1.0"
 description = "SysOne：本地决策推理引擎（System-1 速度的边缘 AI）"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.24"]
+# 文本侧（分词 + 聊天模板）由 tokenizers / jinja2 直接提供：出货路径不 import transformers。
+dependencies = ["numpy>=1.24", "tokenizers>=0.20", "jinja2>=3.1"]
 
 [project.optional-dependencies]
 # Apple（ANE / Metal）运行时与厂商代码桥，M1/M2 起启用。
 apple = []
-vendor = ["torch>=2.6", "safetensors>=0.4"]
+# 厂商参考实现（h2o / torchcast）：要 torch 与 transformers 才能构造它们自己的结构。
+vendor = ["torch>=2.6", "safetensors>=0.4", "transformers"]
 dev = ["pytest>=8"]
 
 [project.scripts]

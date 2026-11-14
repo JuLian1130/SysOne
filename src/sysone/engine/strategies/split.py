@@ -222,16 +222,17 @@ def mude_runner(
 
 
 def _load_tokenizer(model_dir: str | Path) -> object:
-    """模型目录的分词器；只在装了 transformers 的环境可用，缺了按未就绪报。"""
+    """模型目录的分词器：`tokenizers` 直连 + `jinja2` 模板，不 import transformers。"""
+    from ...models.tokenizer import ChatTokenizer
+
     try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:
+        return ChatTokenizer.load(model_dir)
+    except ImportError as exc:  # 装了模型但没装这层的依赖：环境未就绪，不是模型问题
         raise NotReadyError(
-            "split 策略需要 transformers 的分词器",
+            "split 策略需要 tokenizers 与 jinja2 的分词器",
             strategy="split",
             reason=str(exc),
         ) from exc
-    return AutoTokenizer.from_pretrained(str(model_dir))
 
 
 __all__ = ["ModelChain", "Prompter", "SplitRunner", "mude_runner"]
