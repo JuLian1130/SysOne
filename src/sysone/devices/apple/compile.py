@@ -266,6 +266,15 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _recorded_hashes(payload: dict) -> tuple[str, str, str] | None:
+    """sidecar 里记的三段身份哈希（`e8_load_fast` 用）；格式不对就当没记。"""
+    recorded = payload.get("descriptor_hashes")
+    if isinstance(recorded, list) and len(recorded) == 3 and all(
+            isinstance(item, str) and item for item in recorded):
+        return tuple(recorded)                      # type: ignore[return-value]
+    return None
+
+
 @dataclass(frozen=True)
 class ProgramFiles:
     """一份落在磁盘上的编译产物。`reused` 表示 sidecar 与当前 MIL/blob 一致。"""
@@ -277,13 +286,48 @@ class ProgramFiles:
     mil: str
     s: int
     reused: bool
+    descriptor_hashes: tuple[str, str, str] | None = None
 
     def load(self, runtime: AneRuntime, name: str) -> None:
-        """装载。产物已是最新就尽量走 `load_warm`（aned 缓存命中时省掉 lowering）。"""
+        """装载。身份哈希记过就走 `load_fast`（~1 ms，免掉 ~28 ms 的权重内容哈希），
+        否则先 `load_warm`/`load`，再把 dylib 自己算的三段哈希记进 sidecar。
+
+        快路失败（aned 缓存被驱逐、dylib 没这条入口）只回落，不抛异常 —— 与改之前的行为
+        一字不差，只是慢一次。
+        """
+        if self.descriptor_hashes and runtime.load_fast(
+                name, self.mil, self.blob_path, self.descriptor_hashes):
+            return
         if self.reused:
             runtime.load_warm(name, self.mil, self.blob_path)
         else:
             runtime.load(name, self.mil, self.blob_path)
+        if not self.descriptor_hashes:
+            try:
+                hashes = runtime.descriptor_hashes(self.mil, self.blob_path)
+            except NotReadyError:
+                return          # 记不下来就当没有快路：以后每一次都走 load_warm
+            # frozen 只挡"外面改身份"；这一格是派生缓存（aned 给的身份哈希）。记下来就地
+            # 更新，否则同一进程里每一次换窗重装都要再算一次 ~26 ms。
+            object.__setattr__(self, "descriptor_hashes", hashes)
+            self._record_hashes(hashes)
+
+    def _record_hashes(self, hashes: tuple[str, str, str]) -> None:
+        """把三段身份哈希写回 sidecar（产物内容没变，所以其余字段原样保留）。
+
+        sidecar 的 `mil_sha256` 就是这份 MIL 的身份：对不上说明文件被换过，不写。
+        """
+        try:
+            payload = json.loads(self.sidecar_path.read_text())
+        except (OSError, ValueError):
+            return
+        if payload.get("mil_sha256") != _sha256(self.mil.encode()):
+            return
+        payload["descriptor_hashes"] = list(hashes)
+        try:
+            self.sidecar_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        except OSError:
+            return
 
 
 def write_program(
@@ -309,15 +353,6 @@ def write_program(
 
     mil_hash = _sha256(mil.encode())
     blob_hash = _sha256(blob)
-    payload = {
-        "version": ARTIFACT_VERSION,
-        "s": int(s),
-        "mil_sha256": mil_hash,
-        "blob_sha256": blob_hash,
-        "meta": meta or {},
-        "source": source,
-    }
-
     previous: dict = {}
     try:
         previous = json.loads(sidecar_path.read_text())
@@ -330,6 +365,16 @@ def write_program(
         and previous.get("blob_sha256") == blob_hash
         and previous.get("s") == int(s)
     )
+    # 身份哈希（`load_fast` 用）只在内容没变时继承：blob 一换，aned 给的那三段就不认了。
+    payload = {
+        "version": ARTIFACT_VERSION,
+        "s": int(s),
+        "mil_sha256": mil_hash,
+        "blob_sha256": blob_hash,
+        "meta": meta or {},
+        "source": source,
+        "descriptor_hashes": previous.get("descriptor_hashes") if reused else None,
+    }
     # sidecar 与这一份记录不等（比如多了一个 `source` 字段）时也要重写：缓存靠它认身份，
     # 只在内容变化时写会让"内容没变、身份刚补上"的那一次永远错过。
     stale = previous != payload
@@ -343,6 +388,7 @@ def write_program(
         mil_path=mil_path,
         blob_path=blob_path,
         sidecar_path=sidecar_path,
+        descriptor_hashes=_recorded_hashes(payload),
         mil=mil,
         s=int(s),
         reused=reused,
@@ -379,6 +425,7 @@ def cached_program(directory: str | Path, *, source: dict, s: int) -> ProgramFil
         mil=mil_path.read_text(),
         s=int(s),
         reused=True,
+        descriptor_hashes=_recorded_hashes(payload),
     )
 
 

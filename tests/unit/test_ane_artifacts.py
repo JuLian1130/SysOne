@@ -14,9 +14,39 @@ from sysone.devices.apple.compile import (
     BLOB_NAME,
     MIL_NAME,
     SIDECAR_NAME,
+    ProgramFiles,
     cached_program,
     write_program,
 )
+
+HASHES = ("a" * 64, "b" * 64, "c" * 64)
+
+
+class FakeRuntime:
+    """只记调用序，不碰 ANE：装载路径要能被单测钉住，真装载在集成测试里守。"""
+
+    def __init__(self, *, fast: bool = False, hashes: tuple | None = HASHES) -> None:
+        self.calls: list[str] = []
+        self.fast = fast
+        self.hashes = hashes
+
+    def load(self, name, mil, blob_path) -> None:
+        self.calls.append("load")
+
+    def load_warm(self, name, mil, blob_path) -> None:
+        self.calls.append("load_warm")
+
+    def load_fast(self, name, mil, blob_path, hashes) -> bool:
+        self.calls.append("load_fast")
+        return self.fast
+
+    def descriptor_hashes(self, mil, blob_path) -> tuple:
+        self.calls.append("descriptor_hashes")
+        if self.hashes is None:
+            from sysone.errors import NotReadyError
+
+            raise NotReadyError("dylib 没有 e8_descriptor_hashes")
+        return self.hashes
 
 MIL = "program(1.3)\nfunc main<ios18>(tensor<fp16, [1, 8, 1, 32]> x) {\n    return x;\n}\n"
 SOURCE = {
@@ -107,3 +137,69 @@ def test_sidecar_is_rewritten_when_only_the_identity_is_new(tmp_path: Path) -> N
     files = write_program(directory, mil=MIL, blob=b"abc", s=32, meta={"cout": 16}, source=SOURCE)
     assert files.reused is True  # MIL 与 blob 都没变，不重写它们
     assert cached_program(directory, source=SOURCE, s=32) is not None
+
+
+def _files(directory: Path) -> ProgramFiles:
+    files = cached_program(directory, source=SOURCE, s=32)
+    assert files is not None
+    return files
+
+
+def test_load_goes_fast_when_the_hashes_are_known(tmp_path: Path) -> None:
+    """identity 已记过：一次 `load_fast` 装完，不碰 `load_warm`。"""
+    _write(tmp_path / "layer0")
+    files = _files(tmp_path / "layer0")
+    files = ProgramFiles(
+        directory=files.directory, mil_path=files.mil_path, blob_path=files.blob_path,
+        sidecar_path=files.sidecar_path, mil=files.mil, s=files.s, reused=True,
+        descriptor_hashes=HASHES,
+    )
+    runtime = FakeRuntime(fast=True)
+    files.load(runtime, "layer")
+    assert runtime.calls == ["load_fast"]
+
+
+def test_load_falls_back_when_the_fast_path_refuses(tmp_path: Path) -> None:
+    """aned 缓存被驱逐（rc≠0）：回落 `load_warm`，不抛异常。"""
+    _write(tmp_path / "layer0")
+    files = _files(tmp_path / "layer0")
+    runtime = FakeRuntime(fast=False)
+    ProgramFiles(
+        directory=files.directory, mil_path=files.mil_path, blob_path=files.blob_path,
+        sidecar_path=files.sidecar_path, mil=files.mil, s=files.s, reused=True,
+        descriptor_hashes=HASHES,
+    ).load(runtime, "layer")
+    assert runtime.calls == ["load_fast", "load_warm"]
+
+
+def test_first_load_records_the_hashes_and_the_next_one_goes_fast(tmp_path: Path) -> None:
+    """第一次装载算一次哈希写进 sidecar；同内容再装载就是快路。"""
+    _write(tmp_path / "layer0")
+    files = _files(tmp_path / "layer0")
+    runtime = FakeRuntime(fast=False)
+    files.load(runtime, "layer")
+    assert runtime.calls == ["load_warm", "descriptor_hashes"]
+    again = _files(tmp_path / "layer0")
+    assert again.descriptor_hashes == HASHES
+    fast = FakeRuntime(fast=True)
+    again.load(fast, "layer")
+    assert fast.calls == ["load_fast"]
+
+
+def test_write_program_keeps_a_recorded_identity(tmp_path: Path) -> None:
+    """内容没变就继承哈希：下一次构建不会把它抹掉。"""
+    _write(tmp_path / "layer0")
+    files = _files(tmp_path / "layer0")
+    files._record_hashes(HASHES)
+    _write(tmp_path / "layer0")
+    assert _files(tmp_path / "layer0").descriptor_hashes == HASHES
+
+
+def test_write_program_drops_the_identity_when_the_blob_changes(tmp_path: Path) -> None:
+    """blob 换了：aned 给的三段哈希就不认了。"""
+    _write(tmp_path / "layer0")
+    files = _files(tmp_path / "layer0")
+    files._record_hashes(HASHES)
+    write_program(tmp_path / "layer0", mil=MIL, blob=b"abd", s=32, meta={"cout": 16},
+                  source=SOURCE)
+    assert _files(tmp_path / "layer0").descriptor_hashes is None

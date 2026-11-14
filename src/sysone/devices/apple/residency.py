@@ -9,12 +9,13 @@
 - 权重在 `load` 时就落地：20 层 = **1472 MB wired**，首次 eval 只再涨 14 MB；
 - `e8_unload` 把它**全部**还回来（1546 MB）；`e8_suspend`（只 `unloadWithQoS:`）只还
   340 MB（23%），而且挂起后 eval 仍然成功 —— 它不给正确性设闸，所以不用它；
-- aned 的 lowering 缓存**跨 unload 存活**（卸载后 `compiled_exists` 仍为 1），所以重装是
-  「47 ms 内容哈希 + loadWithQoS」= **66 ms/层**，不是 600-860 ms 的重新编译。
+- aned 的 lowering 缓存**跨 unload 存活**（卸载后 `compiled_exists` 仍为 1），所以重装不是
+  600-860 ms 的重新编译。票据 09 实测：`loadWithQoS` 本身亚毫秒，28.1 ms/层几乎全是那次
+  **权重内容哈希**（读 56 MB + sha256 = 28.4 ms）；身份哈希记过之后 `e8_load_fast` 0.9–1 ms。
 
-于是换窗 = 卸载（块排空后、后台线程上，~4 ms/层）+ 重装（预取线程，66 ms/层）。旧引擎靠
-`load_fast`（身份哈希预存，0.26 ms/层）把重装压到 2.65 ms；`e8_load_fast` 在本机不可用
-（`e8_descriptor_hashes` 给回的是空串哈希，身份对不上，rc=7），所以这里按 66 ms 做预算。
+于是换窗 = 卸载（块排空后、后台线程上，~4 ms/层）+ 重装（预取线程，30 ms/层；身份哈希
+记过之后 ~1 ms，见 `compile.py` 的 `ProgramFiles.load`）。旧记录"`e8_load_fast` 在本机不可用
+（rc=7）"已过时：`e8_descriptor_hashes` rc=0、三个 64 字符哈希、`e8_load_fast` rc=0。
 """
 
 from __future__ import annotations

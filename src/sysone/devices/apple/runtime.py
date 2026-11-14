@@ -119,6 +119,24 @@ class AneRuntime:
         lib.e8_load.restype = ctypes.c_int
         lib.e8_load_warm.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         lib.e8_load_warm.restype = ctypes.c_int
+        # 免内容哈希重装的快路（票据 09）。**可选**：老 dylib 没有这两个符号时保持
+        # `load_warm` 的行为，而不是让整台设备起不来。
+        self._descriptor_hashes = getattr(lib, "e8_descriptor_hashes", None)
+        if self._descriptor_hashes is not None:
+            self._descriptor_hashes.argtypes = [
+                ctypes.c_char_p, ctypes.c_char_p,
+                ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
+            ]
+            self._descriptor_hashes.restype = ctypes.c_int
+        self._load_fast = getattr(lib, "e8_load_fast", None)
+        if self._load_fast is not None:
+            self._load_fast.argtypes = [
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_double),
+            ]
+            self._load_fast.restype = ctypes.c_int
         lib.e8_surface_new.argtypes = [ctypes.c_uint64]
         lib.e8_surface_new.restype = ctypes.c_uint64
         lib.e8_surface_base.argtypes = [ctypes.c_uint64]
@@ -200,6 +218,42 @@ class AneRuntime:
             self.lib.e8_load_warm(name.encode(), mil.encode(), str(blob_path).encode()),
             f"load_warm({name})",
         )
+
+    def descriptor_hashes(self, mil: str, blob_path: str | os.PathLike) -> tuple[str, str, str]:
+        """aned 认这一份 (MIL, 权重) 的三段身份哈希 —— `load_fast` 的前半。
+
+        段一次 ~25 ms（票据 09 实测 24.8 ms），所以只在一份产物**第一次**装上之后算一次、
+        记进 sidecar；之后的重装都拿它走快路。dylib 没有这条入口、rc≠0、或给出空哈希，都抛
+        `NotReadyError`：调用方把"记不下来"当正常情形，装载照旧走 `load_warm`。
+        """
+        fn = getattr(self, "_descriptor_hashes", None)
+        if fn is None:
+            raise NotReadyError("dylib 没有 e8_descriptor_hashes")
+        ms = ctypes.c_double(0.0)
+        buffers = [ctypes.create_string_buffer(256) for _ in range(3)]
+        rc = fn(mil.encode(), str(blob_path).encode(),
+                buffers[0], 256, buffers[1], 256, buffers[2], 256, ctypes.byref(ms))
+        if rc != 0:
+            raise NotReadyError("descriptor_hashes 失败", rc=int(rc), reason=self.error())
+        texts = tuple(buffer.value.decode() for buffer in buffers)
+        if len(texts) != 3 or not all(texts):
+            raise NotReadyError("descriptor_hashes 给了空哈希", rc=int(rc))
+        return texts                     # type: ignore[return-value]
+
+    def load_fast(self, name: str, mil: str, blob_path: str | os.PathLike,
+                  hashes: tuple[str, str, str]) -> bool:
+        """用现成身份哈希装载，返回是否装上（rc≠0 = aned 那边没有这条 lowering）。
+
+        不抛异常：缓存被驱逐、dylib 没有这条入口都只是"快路不可用"，由调用方回落 `load_warm`。
+        段 0.9–1 ms（票据 09 实测），省掉的是那一次 ~28 ms 的权重内容哈希。
+        """
+        fn = getattr(self, "_load_fast", None)
+        if fn is None:
+            return False
+        ms = ctypes.c_double(0.0)
+        rc = fn(name.encode(), mil.encode(), str(blob_path).encode(),
+                hashes[0].encode(), hashes[1].encode(), hashes[2].encode(), ctypes.byref(ms))
+        return rc == 0
 
     def eval(self, name: str, procedure: int = 0) -> float:
         """同步执行一次，返回 dylib 记录的毫秒数（M2.0 只用它做对拍，不做吞吐）。"""
