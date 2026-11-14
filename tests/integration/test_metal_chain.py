@@ -282,11 +282,11 @@ def test_batched_tails_with_unequal_lengths(packed) -> None:
     _shared_vs_single(packed, 256, (60, 63, 66, 69))
 
 
-def test_batched_tails_only_need_the_key_block_alignment(packed) -> None:
-    """前缀 192：64 对齐、但不是桶边界（256）——旧闸 `prefix % bucket` 会把它挡掉。
+def test_batched_tails_are_bit_exact_on_a_key_block_boundary(packed) -> None:
+    """前缀 192：64 对齐、但不是桶边界（256）。
 
-    `prefix % AT_BN == 0` 时槽位自己的 key 与逐题整趟落在同一批 64-key 块里，所以逐位
-    （票据 10 的 1088 实测就是这个条件；`1000` 才差 5e-3）。
+    对齐时参考里没有"末尾半块前缀 key 与本题开头同块"这回事，四个槽位自己的 key 与逐题
+    整趟落在同一批 64-key 块里，所以逐位（票据 10 的 1088 实测）。
     """
     prefix, tails = 192, (60, 60, 60, 60)
     tokens = _ids(prefix + sum(tails))
@@ -299,6 +299,29 @@ def test_batched_tails_only_need_the_key_block_alignment(packed) -> None:
     for index, (row, ref) in enumerate(zip(got, want)):
         drift = float(np.abs(row - ref).max())
         assert np.array_equal(row, ref), f"第 {index} 题（prefix=192）不是逐位相同：{drift:.3e}"
+
+
+def test_batched_tails_under_an_unaligned_prefix(packed) -> None:
+    """前缀 200（%64=8）：闸门对它也开（票据 10 第 3 轮），槽 0 仍逐位。
+
+    槽 1..3 的 key 从 `prefix + j*slotw` 起，与参考的 64-key 块分组不同，差末位级；
+    真实 payload 上实测 4.8e-3 logits / 5.4e-4 选项概率，argmax 不变
+    （`.scratch/probe_batch_align.py`）。
+    """
+    prefix, tails = 200, (60, 60, 60, 60)
+    tokens = _ids(prefix + sum(tails))
+    head, bounds = tokens[:prefix], np.cumsum((0, *tails))
+    tail_ids = [tokens[prefix + int(start):prefix + int(end)]
+                for start, end in zip(bounds[:-1], bounds[1:])]
+    assert packed._pipeline._slot_layout(prefix, tails) is not None
+    want = [packed.logits(head + tail, prefix=prefix) for tail in tail_ids]
+    got = packed.logits_shared(head, tail_ids)
+    assert np.array_equal(got[0], want[0]), (
+        f"槽 0（prefix=200）不再逐位：{float(np.abs(got[0] - want[0]).max()):.3e}")
+    for index, (row, ref) in enumerate(zip(got, want)):
+        drift = float(np.abs(row - ref).max())
+        assert drift <= SHARED_TOL, f"第 {index} 题差 {drift:.3e}，超过 {SHARED_TOL}"
+        assert int(np.argmax(row)) == int(np.argmax(ref)), f"第 {index} 题的答案变了"
 
 
 def test_forward_shared_under_a_resident_window(windowed) -> None:

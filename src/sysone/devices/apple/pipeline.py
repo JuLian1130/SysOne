@@ -86,7 +86,6 @@ def _float_buffer(runtime: MetalRuntime, array: np.ndarray, dtype) -> MetalBuffe
 
 
 AT_BM = 128   # 注意力的 query 块（`e8_attn.metal`），槽宽必须是它的整数倍
-AT_BN = 64    # 注意力的 key 块（`e8_attn.metal` 的 online softmax 按它分组），批尾巴的逐位条件
 
 
 @dataclass(frozen=True)
@@ -322,12 +321,12 @@ class MudePipeline:
         GDN 的递归状态与卷积尾巴**逐层独立**：前缀相跑完就抄到 host，尾巴相开始前再写回去
         （`first=False`，卷积尾巴继续用前缀的最后 3 行）。跨相传递就这一处。
 
-        `prefix` 不要求是 64 的整数倍：批尾巴要求 `prefix % AT_BN == 0`（key 块的 64 列分组，
-        见 `_slot_layout` 的注释），不齐时逐题尾巴（实测与整趟差 1.9–5.4e-3，argmax 不变，
-        `.scratch/probe_batch_align.py`）。旧引擎的 `--merge-align floor/pad` 是 tile 粒度
-        （1024）的补救，**在这里没有用**：我们的逐题尾巴相已经对不齐的前缀逐位，而"把末尾行
-        挪进尾巴"会让这些行也看见题面——同一份服务 payload 实测答案移 0.08–0.11（票据 10），
-        比不齐时直接批的 ~5e-3 大 20 倍。
+        `prefix` 不限长度：批尾巴对任何前缀都开（槽 0 逐位、槽 1..N 差 ≤5e-3 logits，见
+        `_slot_layout` 的数值契约），只有打包区装不下时才退回逐题。旧引擎的
+        `--merge-align floor/pad` 在这里没有用：floor 把末尾 `prefix % 64` 行挪进每条尾巴后，
+        那些行在尾巴相里是 query 行（旧引擎的尾巴相同样如此：它传 `prefix=Pc`、`nk=T_in`，
+        `docs/ANE/anebench/e8_service.py:1251,1284`），实测答案移 0.08–0.11 logits —— 比"不齐
+        直接批"的 ≤5e-3 大一个量级以上（票据 10 第 3 轮）；pad 在 mude 的双向前缀下也全可见。
         """
         if not 0 < prefix <= self._width:
             raise ConfigError("共享前缀的长度越界", prefix=prefix, width=self._width)
@@ -395,18 +394,21 @@ class MudePipeline:
         """批尾巴的槽位布局；批不了就 None（调用方原样逐题）。
 
         条件：每条尾巴装得进一个桶、槽宽整除桶宽（这样槽位边界落在瓦片边界上、一个槽不跨
-        瓦片），以及**宽缓冲装得下整个打包区** —— 打包区是整桶的整数倍，调用方要在前缀
-        之后留出这一桶的余量。
+        瓦片）、`per <= 8`（可见行数表只有 8 槽），以及**宽缓冲装得下整个打包区** —— 打包区
+        是整桶的整数倍，调用方要在前缀之后留出这一桶的余量。**前缀长度不设条件**：打包区从
+        `prefix` 自己起切，`prefix` 不必是 64 或桶的整数倍。
 
-        **逐位条件只是 `prefix % AT_BN == 0`（64，key 块）**，不是桶：online softmax 按 64
-        个 key 一块分组，前缀落在块边界时槽位自己的 key 与逐题整趟落在同样的分组里。实测
-        `.scratch/probe_prefix_align.py`：`prefix = 1088`（%64=0、%1024=64）逐位相同，
-        `prefix = 1000`（%64=40）槽位 1..3 差 3.8–5.7e-3（票据 10）。
+        数值契约（票据 10 第 3 轮）：槽 0 的 key 与逐题整趟落在同样的绝对列上，**逐位相同**；
+        槽 1..N 的 key 从 `prefix + j*slotw` 起，而 online softmax 按**绝对列号的 64 列块**分组
+        （`e8_attn.metal` 的 `AT_BN`）—— 只有槽 0 能复现参考里"末尾 `prefix % 64` 个前缀 key
+        与本题开头几个 key 同块"的分组（`prefix` 对齐时没有这个半块，所以四个槽都逐位）。
+        实测（真实 payload、4 题）：槽 1..N 差 4.8e-3 logits / 5.4e-4 选项概率，argmax 不变，
+        见 `.scratch/probe_batch_align.py`。
         """
         questions = len(lengths)
         longest = max(lengths)
         slotw = -(-int(longest) // AT_BM) * AT_BM
-        if (questions < 2 or prefix % AT_BN or longest > self._bucket
+        if (questions < 2 or longest > self._bucket
                 or slotw % AT_BM or self._bucket % slotw):
             return None
         per = self._bucket // slotw

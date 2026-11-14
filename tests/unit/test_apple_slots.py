@@ -33,20 +33,23 @@ def test_layout_widens_the_slot_for_longer_tails() -> None:
 
 @pytest.mark.parametrize("prefix,lengths", [
     (16384, (60,)),                       # 一题没有可批的东西
-    (16384 + 1, (60, 60)),                # 前缀不在 key 块（64）边界
-    (16384 + 32, (60, 60)),               # 同上：离块边界只差 32 也不行
     (16384, (1025, 60)),                  # 尾巴比一个桶还长
 ])
 def test_layout_declines(prefix: int, lengths: tuple[int, ...]) -> None:
     assert _layout(prefix, lengths) is None
 
 
-def test_layout_only_needs_the_key_block_alignment() -> None:
-    """64 对齐就够（1088 实测逐位）：桶（1024）对齐是更严的旧条件，不是正确性边界。"""
-    layout = _layout(16384 + 64, (60, 60, 60, 60))
-    assert layout is not None
-    assert (layout.slotw, layout.per, layout.ntiles, layout.nt) == (128, 8, 1, 1024)
-    assert layout.starts[0] == 16384 + 64
+def test_layout_takes_any_prefix() -> None:
+    """前缀不必落在 64 或桶边界：打包区从 `prefix` 自己起切。
+
+    对不齐的前缀，槽 0 与逐题整趟同列（逐位），槽 1..N 的 key 从 `prefix + j*slotw` 起，
+    差在 64-key 块的分组（见 `_slot_layout` 的数值契约与 `.scratch/probe_batch_align.py`）。
+    """
+    for prefix in (16384 + 1, 16384 + 32, 16384 + 64):
+        layout = _layout(prefix, (60, 60, 60, 60))
+        assert layout is not None, f"prefix={prefix} 被挡掉了"
+        assert (layout.slotw, layout.per, layout.ntiles, layout.nt) == (128, 8, 1, 1024)
+        assert layout.starts == tuple(prefix + j * 128 for j in range(4))
 
 
 def test_layout_refuses_more_slots_than_the_table_holds() -> None:
