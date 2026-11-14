@@ -28,6 +28,9 @@
 4. **ANE 的写不排在任何一条 lane 上**：同一槽位的下一片 `proj` 写 `proj_out` 之前，必须等上一片
    `gather`（lane 0）的读结算完 —— 否则首趟冷页慢时，写会把读盖掉（`pipeline._issue` 里的
    `_wait_for(chain, "gather", tile - nch)`，票据 02）。
+5. **`out` 与 `ffn` 共用同一对 io 面**（`compile.SET_KEYS`，旧引擎的 `io_a`/`io_b` 形状）：`norm2`
+   覆写 `out_in` 之前那次 `reap_proc()` 因此有两个作用 —— 看得见 `out` 刚写进 `out_out` 的结果，
+   以及**确保 `out` 那一次 eval 已经把 `out_in` 读完**（不然归一化的写会撕掉它的输入）。
 
 """
 

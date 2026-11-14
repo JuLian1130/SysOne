@@ -348,15 +348,21 @@ def cached_program(directory: str | Path, *, source: dict, s: int) -> ProgramFil
 
 
 # 每个 procedure 用哪两张面：`(输入, 输出)`，键都进 `SurfaceSet.surfaces`。
+#
+# `ffn` 与 `out` 共用同一对 io 面，是旧引擎的形状（`docs/ANE/anebench/e8_a3.py:590-610`
+# 的 4 张面：`io_a` 先装 `[v|x]` 喂 `out`，再被 `k_norm_resid` 覆写成 `[xn|y]` 喂 `ffn`）。
+# 两段的入口都是 `2*hidden` 行、出口都是 `hidden` 行，形状本来就一样，共用省掉每套 6144 行。
+# 复用是安全的：`norm2` 覆写 `out_in` 之前已经 `reap_proc()` 等到 `out` 那一次 eval 回收，
+# 而 `ffn` 发射前又等到了 `norm2` 的命令缓冲（见 `pipeline._issue` / `_step_norm2`）。
 SET_KEYS = {
     "proj": ("proj_in", "proj_out"),
     "out": ("out_in", "out_out"),
-    "ffn": ("ffn_in", "ffn_out"),
+    "ffn": ("out_in", "out_out"),
 }
 
 
 class SurfaceSet:
-    """一层三段计算要的六张 IOSurface，绑成一套。
+    """一层三段计算要的四张 IOSurface，绑成一套。
 
     这套面**不归某个 program 所有**，因为所有权换来的东西没有用：ANE 只有一条固件队列、
     一次只有一个 eval 在飞，所以 20 层可以轮流用同一套面。旧引擎正是这么做的
@@ -376,7 +382,6 @@ class SurfaceSet:
         for key, items in (
             ("proj_in", self.hidden), ("proj_out", self.cout),
             ("out_in", 2 * self.hidden), ("out_out", self.hidden),
-            ("ffn_in", 2 * self.hidden), ("ffn_out", self.hidden),
         ):
             try:
                 self.surfaces[key] = runtime.surface(items * self.s * 2)
@@ -440,11 +445,14 @@ class AneProgram:
 class AneLayer:
     """一层装成一个 program、三个 procedure：投影 / 输出投影+残差 / 融合 FFN。
 
-    六张 IOSurface 各管一个 stream 边界：ANE 写投影结果 → GPU 读它、写注意力输出 →
+    四张 IOSurface 各管一个 stream 边界：ANE 写投影结果 → GPU 读它、写注意力输出 →
     ANE 读 `[attn | residual]` 算 out → GPU 再读 → ANE 读 `[xn | residual]` 算 FFN。
     与 `AneProgram` 相比省掉两次 `load` 与两次 program 切换（旧引擎也是这个形态）。
 
-    `pool` 给定时这六张面是借来的：池里的第 k 套绑到 ANE 槽位 k，调用方按链选槽位
+    `out` 与 `ffn` 共用后两张面（`SET_KEYS`），所以 `[attn | residual]` 与 `[xn | residual]`
+    是同一块内存的先后两次覆写 —— 与旧引擎的 `io_a` 完全一样。
+
+    `pool` 给定时这四张面是借来的：池里的第 k 套绑到 ANE 槽位 k，调用方按链选槽位
     （`eval_proc(..., slot=k)`）。不给就自己开一套（M2.1 的逐段对拍与 numpy 链用这个形态）。
     """
 
@@ -495,7 +503,7 @@ class AneLayer:
 
     @property
     def surfaces(self) -> dict[str, Surface]:
-        """六张 IOSurface（`proj_in` / `proj_out` / `out_in` / `out_out` / `ffn_in` / `ffn_out`）。
+        """四张 IOSurface（`proj_in` / `proj_out` / `out_in` / `out_out`）。
 
         Metal 侧要直接 wrap 这几张面做零拷贝：GPU 读 ANE 刚写过的面、写 ANE 下一步要读的
         面，中间不该经过 numpy。给出去的是**同一批对象**，调用方不许释放；借用池的时候它
@@ -516,8 +524,7 @@ class AneLayer:
         if ms < 0:
             raise NotReadyError("ANE 执行失败", program=self.name, procedure=proc,
                                 reason=self._runtime.error())
-        out_key = f"{proc}_out"
-        return self._read(out_key, cout), ms
+        return self._read(SET_KEYS[proc][1], cout), ms
 
     def eval_proc(self, proc: str, *, slot: int = 0) -> float:
         """只执行一个 procedure，不读回结果（流水线里结果留在面上给 GPU 核用）。"""
@@ -562,8 +569,12 @@ class AneLayer:
         return self._eval("out", self.hidden)
 
     def feed_forward(self, xn: np.ndarray, residual: np.ndarray) -> tuple[np.ndarray, float]:
-        """`[hidden, s]` 归一化输入 + `[hidden, s]` 残差 → `[hidden, s]`（含残差）。"""
-        self._write("ffn_in", 2 * self.hidden,
+        """`[hidden, s]` 归一化输入 + `[hidden, s]` 残差 → `[hidden, s]`（含残差）。
+
+        写的是 `out` 那一步的入口面（`SET_KEYS` 的复用）：调用方要留上一次 `output()` 的
+        结果就得先读走 —— `output()` 返回的是拷贝，所以逐段对拍那条路不受影响。
+        """
+        self._write("out_in", 2 * self.hidden,
                     np.concatenate([xn, residual], axis=0))
         return self._eval("ffn", self.hidden)
 
