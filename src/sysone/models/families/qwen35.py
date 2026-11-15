@@ -76,6 +76,25 @@ def geometry(text: Mapping[str, object]) -> dict[str, int]:
     }
 
 
+def _opt_int(value: object) -> int | None:
+    """缺项留 `None`，不要拿 `int(value or 0)` 压成一个"看起来合理"的数。
+
+    设备层（`Geometry.from_descriptor`）靠 `None` 认出缺项并报错；在这里压成 0 只是把
+    错误推迟到分配缓冲那一步。
+    """
+    return None if value is None else int(value)  # type: ignore[arg-type]
+
+
+def partial_rotary(text: Mapping[str, object]) -> float:
+    """`partial_rotary_factor`：Qwen3.5 写在 `rope_parameters` 里（0.25），也有顶层再抄一份
+    的 config；都没写就是全旋转。设备层用它算 `rotary_dim = head_dim × factor`。"""
+    rope = text.get("rope_parameters")
+    value = rope.get("partial_rotary_factor") if isinstance(rope, Mapping) else None
+    if value is None:
+        value = text.get("partial_rotary_factor")
+    return 1.0 if value is None else float(value)  # type: ignore[arg-type]
+
+
 def vision_spec(config: Mapping[str, object]) -> VisionSpec | None:
     """视觉塔几何；M0 只记录，不加载。"""
     nested = config.get("vision_config")
@@ -113,6 +132,14 @@ def descriptor_from(
         heads=numbers["heads"],
         kv_heads=numbers["kv_heads"],
         head_dim=numbers["head_dim"],
+        # 线性层的 k/v 几何分开填：4B 的 v 头数是 k 的两倍。config 没写就留 `None`，
+        # 由 `validate()` 报错——不要拿 k 的四个数顶替 v（那正是 4B 会算错的地方）。
+        linear_key_heads=_opt_int(text.get("linear_num_key_heads")),
+        linear_key_dim=_opt_int(text.get("linear_key_head_dim")),
+        linear_value_heads=_opt_int(text.get("linear_num_value_heads")),
+        linear_value_dim=_opt_int(text.get("linear_value_head_dim")),
+        conv_kernel=int(text.get("linear_conv_kernel_dim") or 4),
+        partial_rotary_factor=partial_rotary(text),
         ffn=numbers["ffn"],
         vocab=numbers["vocab"],
         max_position=numbers["max_position"],

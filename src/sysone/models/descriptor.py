@@ -89,6 +89,17 @@ class ModelDescriptor:
     supported_modes: frozenset[MaskMode]
     trained_modes: frozenset[MaskMode]
     default_mode: MaskMode
+    # 线性注意力层（GDN）的几何。**v 与 k 分开记**：4B 的 `linear_value_heads` 是
+    # `linear_key_heads` 的两倍（32 对 16），于是 `value_dim = 4096 ≠ hidden 2560`。在这些
+    # 数字上做"v 就是 k 的副本"的假设会把缓冲大小算错。没有线性层的模型（reference tiny）
+    # 留 `None`；有线性层却留 `None` 在 `validate()` 里报错，不猜。
+    linear_key_heads: int | None = None
+    linear_key_dim: int | None = None
+    linear_value_heads: int | None = None
+    linear_value_dim: int | None = None
+    conv_kernel: int = 4
+    # 旋转只覆盖每个头的这一部分通道（Qwen3.5 是 0.25），设备层据此算 `rotary_dim`。
+    partial_rotary_factor: float = 1.0
     quant: QuantSpec = field(default_factory=QuantSpec)
     tied_embeddings: bool = True
     mtp_layers: int = 0
@@ -117,6 +128,24 @@ class ModelDescriptor:
             raise ConfigError("hidden/ffn/head_dim/vocab 必须为正")
         if self.kv_heads < 1 or self.kv_heads > self.heads:
             raise ConfigError("kv_heads 必须在 [1, heads]", kv_heads=self.kv_heads, heads=self.heads)
+        if AttentionRole.LINEAR in self.layer_types:
+            missing = [
+                name
+                for name in (
+                    "linear_key_heads",
+                    "linear_key_dim",
+                    "linear_value_heads",
+                    "linear_value_dim",
+                )
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ConfigError(
+                    "模型有线性注意力层，descriptor 却没带线性层几何",
+                    missing=missing,
+                    hint="家族 parser 要从 config 的 linear_num_key_heads / linear_key_head_dim / "
+                         "linear_num_value_heads / linear_value_head_dim 填这四项",
+                )
         if not self.supported_modes:
             raise ConfigError("supported_modes 不能为空")
         if self.default_mode not in self.supported_modes:
@@ -139,6 +168,12 @@ class ModelDescriptor:
             "heads": self.heads,
             "kv_heads": self.kv_heads,
             "head_dim": self.head_dim,
+            "linear_key_heads": self.linear_key_heads,
+            "linear_key_dim": self.linear_key_dim,
+            "linear_value_heads": self.linear_value_heads,
+            "linear_value_dim": self.linear_value_dim,
+            "conv_kernel": self.conv_kernel,
+            "partial_rotary_factor": self.partial_rotary_factor,
             "ffn": self.ffn,
             "vocab": self.vocab,
             "max_position": self.max_position,
@@ -228,6 +263,12 @@ class ModelDescriptor:
             heads=int(data["heads"]),  # type: ignore[arg-type]
             kv_heads=int(data["kv_heads"]),  # type: ignore[arg-type]
             head_dim=int(data["head_dim"]),  # type: ignore[arg-type]
+            linear_key_heads=_opt_int(data.get("linear_key_heads")),
+            linear_key_dim=_opt_int(data.get("linear_key_dim")),
+            linear_value_heads=_opt_int(data.get("linear_value_heads")),
+            linear_value_dim=_opt_int(data.get("linear_value_dim")),
+            conv_kernel=int(data.get("conv_kernel", 4)),  # type: ignore[arg-type]
+            partial_rotary_factor=float(data.get("partial_rotary_factor", 1.0)),  # type: ignore[arg-type]
             ffn=int(data["ffn"]),  # type: ignore[arg-type]
             vocab=int(data["vocab"]),  # type: ignore[arg-type]
             max_position=int(data["max_position"]),  # type: ignore[arg-type]
