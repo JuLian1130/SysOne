@@ -1,8 +1,9 @@
 """M2.1 一层三段 ANE 计算的对拍（真 ANE + mude 真权重）。
 
-一层在 ANE 上分三段：投影（`hidden → cout`）、输出投影 + 残差（`2×hidden → hidden`）、
+一层在 ANE 上分三段：投影（`hidden → cout`）、输出投影 + 残差（`core_out + hidden → hidden`）、
 融合 FFN（`2×hidden → hidden`，gate/up 在 ANE 内做 silu×up，down 的 K 维按 `ffn/hidden`
-切段后求和）。判据比 docs 的端到端阈值（2.5e-2）严，因为这里只测一段、且参考用的是
+切段后求和）。`core_out` 是 `o_proj` 的输入行数：2B 恰好等于 `hidden`（所以看起来像
+`2×hidden`），4B 是 4096 ≠ 2560。判据比 docs 的端到端阈值（2.5e-2）严，因为这里只测一段、且参考用的是
 **ANE 实际读到的同一份反量化权重** —— 量化误差不混进来，留到 M2.2 的 20 层链。
 """
 
@@ -109,19 +110,19 @@ def test_projection_matches_numpy(tmp_path: Path) -> None:
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
 def test_out_projection_matches_numpy(tmp_path: Path) -> None:
     weight = _load([OUT])[OUT]
-    hidden = weight.shape[1]
+    hidden, core_out = weight.shape[0], weight.shape[1]
     rng = np.random.default_rng(11)
-    v = rng.standard_normal((hidden, S)).astype(np.float16)   # 注意力输出
-    r = rng.standard_normal((hidden, S)).astype(np.float16)   # 残差
+    v = rng.standard_normal((core_out, S)).astype(np.float16)   # 核心输出
+    r = rng.standard_normal((hidden, S)).astype(np.float16)     # 残差
 
     blob, entries = ane_blob.build([("o", weight)], quantize=True)
-    mil = out_mil(hidden=hidden, s=S, entry=entries["o"])
+    mil = out_mil(hidden=hidden, core_out=core_out, s=S, entry=entries["o"])
     files = write_program(tmp_path / "out", mil=mil, blob=blob, s=S, meta={"tensor": OUT})
 
     runtime = AneRuntime()
     try:
-        y, _ = _run(files, name="m21_out", runtime=runtime, cin=2 * hidden, cout=hidden,
-                    x=np.concatenate([v, r], axis=0))
+        y, _ = _run(files, name="m21_out", runtime=runtime, cin=core_out + hidden,
+                    cout=hidden, x=np.concatenate([v, r], axis=0))
     finally:
         runtime.close()
 
@@ -129,6 +130,39 @@ def test_out_projection_matches_numpy(tmp_path: Path) -> None:
     reference = (w @ v.astype(np.float32) + r.astype(np.float32)).astype(np.float16)
     rel = _rel_l2(y, reference)
     assert rel < OUT_BUDGET, f"relL2 {rel:.2e} 超过 {OUT_BUDGET}"
+
+
+@pytest.mark.skipif(not available(), reason="ANE dylib 不可用（先跑 tools/build_ane.sh）")
+def test_out_projection_at_the_4b_width_matches_numpy(tmp_path: Path) -> None:
+    """4B 宽度的 out program（`[4096 | 2560] → 2560`）在 ANE 上真算一遍。
+
+    权重是**合成的**：h2o 的 checkpoint 还是 row-int8（G4 未做），读不成 ANE blob。所以这条
+    只钉**program 形状与切片语义**，不钉那份模型。参考口径与 mude 那条一样 —— 用 ANE 实际
+    读到的那份反量化权重，量化误差不混进来。
+    """
+    hidden, core_out = 2560, 4096
+    rng = np.random.default_rng(29)
+    weight = (rng.standard_normal((hidden, core_out)) * 0.05).astype(np.float16)
+    v = rng.standard_normal((core_out, S)).astype(np.float16)   # 核心输出（比 hidden 宽）
+    r = rng.standard_normal((hidden, S)).astype(np.float16)     # 残差
+
+    blob, entries = ane_blob.build([("o", weight)], quantize=True)
+    mil = out_mil(hidden=hidden, core_out=core_out, s=S, entry=entries["o"])
+    files = write_program(tmp_path / "out_4b", mil=mil, blob=blob, s=S,
+                          meta={"case": "m21-out-4b"})
+
+    runtime = AneRuntime()
+    try:
+        y, ms = _run(files, name="m21_out_4b", runtime=runtime,
+                    cin=core_out + hidden, cout=hidden,
+                    x=np.concatenate([v, r], axis=0))
+    finally:
+        runtime.close()
+
+    w = ane_blob.quant_per_channel(weight).dequant.astype(np.float32)
+    reference = (w @ v.astype(np.float32) + r.astype(np.float32)).astype(np.float16)
+    rel = _rel_l2(y, reference)
+    assert rel < OUT_BUDGET, f"relL2 {rel:.2e} 超过 {OUT_BUDGET}（4B 宽度的 out 投影）"
 
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
@@ -210,7 +244,7 @@ def test_split_projection_matches_numpy(tmp_path: Path) -> None:
                     for i in range(ffn_parts(hidden, ffn))})
 
     blob, blob_entries = ane_blob.build(entries, quantize=True)
-    mil = layer_mil(hidden=hidden, cout=q_rows + kv_rows, ffn=ffn, s=S,
+    mil = layer_mil(hidden=hidden, core_out=hidden, cout=q_rows + kv_rows, ffn=ffn, s=S,
                     entries=blob_entries, split=True)
     assert mil.count("func ") == 4
     files = write_program(tmp_path / "layer3_split", mil=mil, blob=blob, s=S)
@@ -219,7 +253,8 @@ def test_split_projection_matches_numpy(tmp_path: Path) -> None:
     x = rng.standard_normal((hidden, S)).astype(np.float16)
     runtime = AneRuntime()
     layer = AneLayer(runtime, files, name="m22_layer3_split", hidden=hidden,
-                     cout=q_rows + kv_rows, ffn=ffn, s=S, split_rows=(q_rows, kv_rows))
+                     core_out=hidden, cout=q_rows + kv_rows, ffn=ffn, s=S,
+                     split_rows=(q_rows, kv_rows))
     try:
         y, ms = layer.project(x)
         # 两段各自读回来：q 段落在 proj_out，kv 段落在 out_in 的前 kv_rows 行
@@ -272,7 +307,7 @@ def test_fused_layer_program_runs_three_procedures(tmp_path: Path) -> None:
     items = {"proj": proj, "o": w[OUT], "gate": w[GATE], "up": w[UP]}
     items.update({f"down{i}": c for i, c in enumerate(chunks)})
     blob, entries = ane_blob.build(items, quantize=True)
-    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=S, entries=entries)
+    mil = layer_mil(hidden=hidden, core_out=hidden, cout=cout, ffn=ffn, s=S, entries=entries)
     assert mil.count("func ") == 3
     assert "func main<ios18>" in mil and "func p1<ios18>" in mil and "func p2<ios18>" in mil
 
@@ -283,7 +318,8 @@ def test_fused_layer_program_runs_three_procedures(tmp_path: Path) -> None:
     r = rng.standard_normal((hidden, S)).astype(np.float16)
 
     runtime = AneRuntime()
-    layer = AneLayer(runtime, files, name="m22_layer0", hidden=hidden, cout=cout, ffn=ffn, s=S)
+    layer = AneLayer(runtime, files, name="m22_layer0", hidden=hidden, core_out=hidden,
+                     cout=cout, ffn=ffn, s=S)
     try:
         y_proj, ms0 = layer.project(x)
         y_out, ms1 = layer.output(v, r)
@@ -356,13 +392,15 @@ def test_pool_slots_and_async_eval(tmp_path: Path) -> None:
            for i in range(ffn_parts(hidden, ffn))},
     }
     blob, entries = ane_blob.build(items, quantize=False)
-    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=entries)
+    mil = layer_mil(hidden=hidden, core_out=hidden, cout=cout, ffn=ffn, s=s,
+                    entries=entries)
     files = write_program(tmp_path / "slots", mil=mil, blob=blob, s=s)
 
     runtime = AneRuntime()
-    pool = [SurfaceSet(runtime, hidden=hidden, cout=cout, s=s) for _ in range(2)]
-    layer = AneLayer(runtime, files, name="m22_slots", hidden=hidden, cout=cout, ffn=ffn, s=s,
-                     pool=pool)
+    pool = [SurfaceSet(runtime, hidden=hidden, core_out=hidden, cout=cout, s=s)
+            for _ in range(2)]
+    layer = AneLayer(runtime, files, name="m22_slots", hidden=hidden, core_out=hidden,
+                     cout=cout, ffn=ffn, s=s, pool=pool)
     try:
         x = rng.standard_normal((hidden, s)).astype(np.float16)
         layer._write("proj_in", hidden, x)

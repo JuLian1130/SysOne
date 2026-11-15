@@ -96,6 +96,7 @@ class MudeChain:
         cos: np.ndarray,
         sin: np.ndarray,
         hidden: int,
+        core_out: int,
         s: int,
         width: int,
         heads: int,
@@ -127,6 +128,7 @@ class MudeChain:
         self._cos = cos
         self._sin = sin
         self._hidden = int(hidden)
+        self._core_out = int(core_out)
         self._s = int(s)
         # GPU 侧缓冲的列数（= 一轮要算的 token 总数）；numpy 链把它当画布宽度用。
         self._width = int(width)
@@ -248,7 +250,7 @@ class MudeChain:
         # `close()` 里必须在卸载 program **之后**才 `free()`：每次 `attach` 都给面加了引用。
         pool: list[SurfaceSet] | None = None
         if metal:
-            pool = [SurfaceSet(runtime, hidden=hidden,
+            pool = [SurfaceSet(runtime, hidden=hidden, core_out=geometry.core_out,
                                cout=max(geometry.cout_full, geometry.cout_gdn), s=s)
                     for _ in range(pool_slots(roles))]
         try:
@@ -263,18 +265,19 @@ class MudeChain:
                 split = (geometry.qg_rows, geometry.kv_rows) if role is AttentionRole.FULL else None
                 directory = program_root / f"layer{index:02d}"
                 source = _artifact_source(
-                    store, layer=index, role=role, cout=cout,
+                    store, layer=index, role=role, cout=cout, core_out=geometry.core_out,
                     hidden=hidden, ffn=ffn, s=s, quantize=quantize,
                 )
                 files = cached_program(directory, source=source, s=s)
                 if files is None:
                     files = _build_layer_program(
                         store, directory=directory, index=index, role=role, cout=cout,
-                        hidden=hidden, ffn=ffn, s=s, quantize=quantize, source=source,
-                        split=split,
+                        core_out=geometry.core_out, hidden=hidden, ffn=ffn, s=s,
+                        quantize=quantize, source=source, split=split,
                     )
                 layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
-                                       hidden=hidden, cout=cout, ffn=ffn, s=s, pool=pool,
+                                       hidden=hidden, core_out=geometry.core_out,
+                                       cout=cout, ffn=ffn, s=s, pool=pool,
                                        split_rows=split))
             final_norm = _norm(store.read("language_model.norm.weight"), norm_offset)
             readout = _readout(root)
@@ -308,7 +311,8 @@ class MudeChain:
             runtime=runtime, layers=layers, params=params, roles=roles, store=store,
             embed_name="language_model.embed_tokens.weight", final_norm=final_norm,
             readout=readout, temperature=temperature, cos=cos, sin=sin,
-            hidden=hidden, s=s, width=width, heads=heads, kv_heads=kv_heads, head_dim=head_dim,
+            hidden=hidden, core_out=geometry.core_out, s=s, width=width,
+            heads=heads, kv_heads=kv_heads, head_dim=head_dim,
             rotary_dim=rotary_dim, linear_heads=linear_heads, linear_dim=linear_dim,
             own_runtime=own_runtime, pipeline=pipeline, pool=pool,
             own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
@@ -495,7 +499,7 @@ class MudeChain:
         keys = np.arange(length)[None, :]
         mask = keys <= queries if causal else (queries >= prefix) | (keys < prefix)
         context = attention(query, key, value, mask).reshape(length, heads * head_dim)
-        y, _ = layer.output(_place(context * sigmoid(gate), self._hidden, self._s), x)
+        y, _ = layer.output(_place(context * sigmoid(gate), self._core_out, self._s), x)
         xn2 = _rms(y, params["post_norm"])
         return layer.feed_forward(xn2, y)[0]
 
@@ -527,7 +531,7 @@ class MudeChain:
         # 门控 norm 是按头做的：参考实现在 [S*heads, dim] 上归一化，不能摊平成 [S, hidden]。
         gated = rms_norm_gated(core.reshape(length * heads, dim), z.reshape(length * heads, dim),
                                params["norm"]).reshape(length, heads * dim)
-        y, _ = layer.output(_place(gated, self._hidden, self._s), x)
+        y, _ = layer.output(_place(gated, self._core_out, self._s), x)
         xn2 = _rms(y, params["post_norm"])
         if debug is not None:
             debug.update(xn=xn, projected=p, mixed=mixed, z=p[:length, conv_rows:conv_rows + self._hidden],
@@ -568,6 +572,7 @@ def _artifact_source(
     layer: int,
     role: AttentionRole,
     cout: int,
+    core_out: int,
     hidden: int,
     ffn: int,
     s: int,
@@ -586,6 +591,7 @@ def _artifact_source(
         "layer": int(layer),
         "type": str(role),
         "cout": int(cout),
+        "core_out": int(core_out),
         "hidden": int(hidden),
         "ffn": int(ffn),
         "s": int(s),
@@ -600,6 +606,7 @@ def _build_layer_program(
     index: int,
     role: AttentionRole,
     cout: int,
+    core_out: int,
     hidden: int,
     ffn: int,
     s: int,
@@ -621,6 +628,15 @@ def _build_layer_program(
         raise ValueError(
             f"第 {index} 层的 proj 行数 {actual} 与几何给出的 cout={cout} 不一致"
         )
+    out_shape = tuple(int(n) for n in entries["o"].shape)
+    if out_shape != (hidden, core_out):
+        # `o` 的行是 hidden（输出），列是 core_out（输入）。列数对不上说明几何与这份
+        # checkpoint 不是一套的 —— 继续下去 ANE 会按 core_out 行去读一个更窄的矩阵，
+        # 得到的是"形状合法、语义错"的答案。
+        raise ValueError(
+            f"第 {index} 层的 o 形状 {out_shape} 与几何的 (hidden, core_out)="
+            f"({hidden}, {core_out}) 不一致"
+        )
     if split is not None:
         q_rows, kv_rows = split
         if q_rows + kv_rows != actual:
@@ -631,8 +647,8 @@ def _build_layer_program(
         rest = {key: value for key, value in entries.items() if key != "proj"}
         entries = {**rest, "proj_q": proj[:q_rows], "proj_kv": proj[q_rows:]}
     blob, blob_entries = build_blob(entries, quantize=quantize)
-    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=s, entries=blob_entries,
-                    split=split is not None)
+    mil = layer_mil(hidden=hidden, core_out=core_out, cout=cout, ffn=ffn, s=s,
+                    entries=blob_entries, split=split is not None)
     return write_program(
         directory,
         mil=mil,

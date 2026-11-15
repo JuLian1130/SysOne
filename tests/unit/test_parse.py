@@ -81,6 +81,31 @@ def test_h2o_linear_geometry_keeps_v_apart_from_k() -> None:
     assert descriptor.partial_rotary_factor == pytest.approx(0.25)
 
 
+def test_core_out_is_the_out_projection_input_width() -> None:
+    """`core_out` = `o_proj` 的输入行数：2B 恰好等于 hidden，4B 是 4096 ≠ 2560。
+
+    两种层共用**同一套** out program，所以它必须同时等于注意力上下文（`q_heads × head_dim`）
+    与 GDN 的 `value_dim`；`Geometry.validate()` 在两者不等时报错。
+    """
+    mude_geom = Geometry.from_descriptor(mude.parse_config(FIXTURES / "mude"))
+    h2o_geom = Geometry.from_descriptor(h2o.parse_config(FIXTURES / "h2o"))
+    assert mude_geom.core_out == 2048 == mude_geom.hid
+    assert h2o_geom.core_out == 4096 and h2o_geom.hid == 2560
+    for geom in (mude_geom, h2o_geom):
+        assert geom.core_out == geom.value_dim == geom.q_heads * geom.head_dim
+
+
+def test_geometry_refuses_two_layer_kinds_with_different_core_widths() -> None:
+    """注意力上下文与 GDN 的 value_dim 不等时不能猜：那需要按层类型各编一套 out program。"""
+    geometry = Geometry(hid=2560, ffn=9216, q_heads=16, kv_heads=4, head_dim=256,
+                        rotary_dim=64, l_k_heads=16, l_k_dim=128, l_v_heads=32,
+                        l_v_dim=64, conv_k=4)          # value_dim = 2048
+    with pytest.raises(ConfigError) as excinfo:
+        geometry.validate()
+    assert excinfo.value.context["core_out"] == 4096
+    assert excinfo.value.context["value_dim"] == 2048
+
+
 def test_geometry_projection_matches_mude_hardcoding() -> None:
     """`Geometry.from_descriptor` 投影出的几何要与 `mude_geometry()` 逐项相同。
 

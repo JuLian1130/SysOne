@@ -66,7 +66,7 @@ def test_bad_shapes_are_rejected(kwargs):
 
 def test_out_mil_slices_input_and_adds_residual():
     """out 投影的输入是 [attn_out | residual] 两段拼接，输出要再加回残差。"""
-    mil = out_mil(hidden=8, s=32, entry=_entry(offset=64, shape=(8, 8)))
+    mil = out_mil(hidden=8, core_out=8, s=32, entry=_entry(offset=64, shape=(8, 8)))
     assert "func main<ios18>(tensor<fp16, [1, 16, 1, 32]> x)" in mil
     assert "tensor<fp16, [1, 8, 1, 32]> v = slice_by_size(" in mil
     assert "tensor<fp16, [1, 8, 1, 32]> r = slice_by_size(" in mil
@@ -76,6 +76,29 @@ def test_out_mil_slices_input_and_adds_residual():
     assert "tensor<fp16, [1, 8, 1, 32]> y = add(x = ov, y = r)" in mil
     assert mil.count("conv(") == 1
     assert mil.count("func ") == 1
+
+
+def test_out_mil_slices_v_by_core_out_not_by_half_of_the_input():
+    """4B 的 out 入口是 `[v(4096) | r(2560)]`：v 的宽度来自 `core_out`，不是输入的一半。
+
+    2B 上 `core_out == hidden`，按 `2*hidden` 写死碰巧对；4B 照抄会把残差的前 1536 行当成
+    v 的尾巴 —— 形状合法、语义错的 program。
+    """
+    hidden, core_out = 2560, 4096
+    mil = out_mil(hidden=hidden, core_out=core_out, s=1024,
+                  entry=_entry(offset=64, shape=(hidden, core_out)))
+    assert f"func main<ios18>(tensor<fp16, [1, {core_out + hidden}, 1, 1024]> x)" in mil
+    assert f"tensor<fp16, [1, {core_out}, 1, 1024]> v = slice_by_size(" in mil
+    assert f"tensor<fp16, [1, {hidden}, 1, 1024]> r = slice_by_size(" in mil
+    # r 从 core_out 行起（2B 上它恰好是 8 = hidden，4B 上不是）
+    assert f"val = tensor<int32, [4]>([0, {core_out}, 0, 0])" in mil
+    assert f"tensor<fp16, [{hidden}, {core_out}, 1, 1]> o_w = const()" in mil
+    assert f"tensor<fp16, [1, {hidden}, 1, 1024]> y = add(x = ov, y = r)" in mil
+
+
+def test_out_mil_rejects_a_non_positive_core_out():
+    with pytest.raises(NotReadyError):
+        out_mil(hidden=8, core_out=0, s=32, entry=_entry(shape=(8, 8)))
 
 
 def test_ffn_mil_splits_k_axis_and_fuses_activation():
@@ -137,7 +160,7 @@ def _split_entries(hidden: int, ffn: int, q_rows: int, kv_rows: int) -> dict:
 def test_layer_mil_splits_the_projection_into_two_procedures():
     """`main` 只算 `[q|gate]`、`p3` 只算 `[k|v]`，两段行数加起来仍是 cout；`p1`/`p2` 不动。"""
     hidden, ffn, cout, q_rows, kv_rows = 8, 24, 40, 32, 8
-    mil = layer_mil(hidden=hidden, cout=cout, ffn=ffn, s=32,
+    mil = layer_mil(hidden=hidden, core_out=hidden, cout=cout, ffn=ffn, s=32,
                     entries=_split_entries(hidden, ffn, q_rows, kv_rows), split=True)
     assert mil.count("func ") == 4
     # q 段（proc 0）与 kv 段（proc 3）的入口形状相同，出口行数各自是 q_rows / kv_rows
@@ -152,7 +175,7 @@ def test_layer_mil_splits_the_projection_into_two_procedures():
 def test_split_projection_refuses_row_counts_that_do_not_add_up():
     entries = _split_entries(8, 24, q_rows=16, kv_rows=8)
     with pytest.raises(NotReadyError) as excinfo:
-        layer_mil(hidden=8, cout=40, ffn=24, s=32, entries=entries, split=True)
+        layer_mil(hidden=8, core_out=8, cout=40, ffn=24, s=32, entries=entries, split=True)
     assert (excinfo.value.context["q"], excinfo.value.context["kv"]) == (16, 8)
 
 
@@ -160,5 +183,5 @@ def test_split_projection_requires_both_halves():
     entries = _split_entries(8, 24, q_rows=32, kv_rows=8)
     del entries["proj_kv"]
     with pytest.raises(NotReadyError) as excinfo:
-        layer_mil(hidden=8, cout=40, ffn=24, s=32, entries=entries, split=True)
+        layer_mil(hidden=8, core_out=8, cout=40, ffn=24, s=32, entries=entries, split=True)
     assert excinfo.value.context["missing"] == ["proj_kv"]

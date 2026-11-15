@@ -61,6 +61,17 @@ class Geometry:
         return self.value_dim
 
     @property
+    def core_out(self) -> int:
+        """核心输出的宽度（`o_proj` 的输入行数，也就是 `out_in` 面里 `[v | x]` 的 v 半）。
+
+        全注意力层是 `q_heads × head_dim`（注意力上下文），线性层是 `value_dim`（`in_proj_z`）。
+        **两种层共用同一套 out program**，所以两者必须相等：`validate()` 不等就报错。
+        2B 两者都等于 `hid`（2048），所以旧代码按 `2*hidden` 定形状碰巧是对的；4B 两者都是
+        **4096 ≠ 2560**，按 `2*hidden` 算会把 out 的输入面少 1536 行。
+        """
+        return self.q_heads * self.head_dim
+
+    @property
     def kv_proj(self) -> int:
         return self.kv_heads * self.head_dim
 
@@ -153,6 +164,19 @@ class Geometry:
         if self.kv_heads > self.q_heads:
             raise ConfigError("kv_heads 不能超过 q_heads",
                               kv_heads=self.kv_heads, q_heads=self.q_heads)
+        if self.core_out != self.value_dim:
+            # 两层用同一套 out program（`out_mil` 的输入宽度、`out_in` 面的 v 半），
+            # 所以注意力上下文与 GDN 的价值维度必须一致。不一致时就得按层类型各编一套，
+            # 那是另一件事 —— 不在这套几何里猜。
+            raise ConfigError(
+                "核心输出宽度与 GDN 的 value_dim 不一致：两种层共用一套 out program",
+                core_out=self.core_out,
+                value_dim=self.value_dim,
+                q_heads=self.q_heads,
+                head_dim=self.head_dim,
+                l_v_heads=self.l_v_heads,
+                l_v_dim=self.l_v_dim,
+            )
 
     # ---- 构造 -----------------------------------------------------------
 

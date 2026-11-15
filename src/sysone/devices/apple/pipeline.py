@@ -124,6 +124,8 @@ class MudePipeline:
         self._geometry = mude_geometry() if geometry is None else geometry
         self._geometry.validate()
         self._hidden = self._geometry.hid
+        # 核心输出宽度（`o_proj` 的输入行数）：2B 恰好等于 hidden，4B 是 4096 ≠ 2560。
+        self._core_out = self._geometry.core_out
         self._bucket = int(bucket)
         self._width = int(width)
         if self._width < self._bucket:
@@ -131,13 +133,14 @@ class MudePipeline:
         # `qg` 的环：每条瓦片链一个槽位（票据 06）。整窗只有一片瓦片时一个槽位就够，
         # 所以 1k/4k 那种 `width == bucket` 的路不会因为成环多花内存。
         self._ring = ring_columns(self._width, self._bucket)
-        if self._geometry.kv_rows > 2 * self._hidden:
+        if not pool:
+            raise ConfigError("表面池至少要有一套面")
+        if self._geometry.kv_rows > pool[0].out_in_rows:
             # 拆投影之后 kv 段借 `out_in` 的前 kv_rows 行（`compile.SET_KEYS`），借不出落脚点
             # 就别装作能拆 —— 否则 ANE 会写过界，那是坏答案不是慢答案。
             raise ConfigError("kv 行数超过 out_in 面，拆投影没有落脚点",
-                              kv_rows=self._geometry.kv_rows, out_in_rows=2 * self._hidden)
-        if not pool:
-            raise ConfigError("表面池至少要有一套面")
+                              kv_rows=self._geometry.kv_rows,
+                              out_in_rows=pool[0].out_in_rows)
         need = pool_slots(roles)
         if len(pool) < need:
             raise ConfigError("表面池不够：一条 (层, 瓦片奇偶) 链要独占一套",
@@ -205,8 +208,9 @@ class MudePipeline:
         # 它同时是第 0 层的输入：embedding 直接写进来（旧引擎的 `w_h` 也只有一张，embedding
         # 就写在它上面）。同一瓦片里 `norm` 读它在先、`tail` 写它在后，同一条 lane 上有序。
         self.x = rt.alloc(2 * hidden * width)
-        # 注意力输出**没有**单独的缓冲：那一片直接写进本槽位的 `out_in` 前半（旧引擎的
-        # `ia = w_io_a[k]`），后半由残差搬运填上（`_step_out_in` / `_step_core`）。
+        # 注意力输出**没有**单独的缓冲：那一片直接写进本槽位 `out_in` 的前 `core_out` 行
+        # （旧引擎的 `ia = w_io_a[k]`），从 `core_out` 起的 x 半由残差搬运填上
+        # （`_step_out_in` / `_step_core`）。
         # **一份** qg / 一份 kv 就够：`blocks()` 在每个全注意力层之前切开、`run` 在块之间整段
         # 排空，所以同一时刻只有一个全注意力层碰这两张画布（16k 的活性账：同时"开着"的层恒为
         # 1）。两套是 27c6250 的"列波前"留下的 —— 那一版块间不排空，相邻两个全注意力层真的
@@ -824,7 +828,8 @@ class MudePipeline:
         self._commit(chain, LANE_LONG, "gather_q", tile)
 
     def _step_attn(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
-        """`attn`：这一段 query 的注意力，**直写**进本槽位 `out_in` 的前半（旧引擎的 `ia`）。
+        """`attn`：这一段 query 的注意力，**直写**进本槽位 `out_in` 的前 `core_out` 行
+        （旧引擎的 `ia`）。
 
         直写省掉"先落一条全宽的注意力结果、再搬进面里"那一次搬运 —— 那半区本来就是 `out`
         那一段 ANE 要读的 `[v|x]` 的 v 半，搬到别处再搬回来是白搬（16k 每瓦片 16 MB）。
@@ -835,7 +840,8 @@ class MudePipeline:
         self._commit(chain, LANE_LONG, "attn", tile)
 
     def _step_out_in(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
-        """注意力层的 `out` 入口：只搬**后半**（这一层的输入残差），前半是注意力直写进去的。
+        """注意力层的 `out` 入口：只搬 **x 半**（这一层的输入残差，从 `core_out` 行起），
+        v 半是注意力直写进去的。
 
         必须在注意力的命令缓冲结算之后才能**编码**（同一张面里读它刚写的东西不安全，
         见 `schedule.py` 的头注释）；两半在互不相干的通道带上，所以这片搬运与注意力之间
@@ -843,13 +849,13 @@ class MudePipeline:
         """
         start, n = self._chunks_list[tile]
         self._copy(self.x, entry.surface("out_in", chain.slot), nchan=self._hidden,
-                   dst_c0=self._hidden, n=n, s0=0, src_s0=start,
+                   dst_c0=self._core_out, n=n, s0=0, src_s0=start,
                    src_stride=self._width, dst_stride=self._bucket)
         self._commit(chain, LANE_SMALL, "out_in", tile)
         self._wait_for(chain, "out_in", tile)      # ANE 从面上读，必须已经结算
 
     def _step_core(self, chain: Chain, entry: LayerBuffers, tile: int) -> None:
-        """`core`：GDN 的四段快核，加上这一瓦片的残差搬运（写进 `out_in` 的后半）。
+        """`core`：GDN 的四段快核，加上这一瓦片的残差搬运（写进 `out_in` 的 x 半）。
 
         `first` 只对瓦片 0 为真：递归状态与卷积尾巴在这个块开头已经清零，瓦片 0 没有前驱列。
         """
@@ -857,7 +863,7 @@ class MudePipeline:
         state, tail = self.states[chain.layer], self.tails[chain.layer]
         entry.ane.reap_proc()                    # 投影的输出就在 proj_out 上
         self._copy(self.x, entry.surface("out_in", chain.slot), nchan=self._hidden,
-                   dst_c0=self._hidden, n=n, s0=0, src_s0=start,
+                   dst_c0=self._core_out, n=n, s0=0, src_s0=start,
                    src_stride=self._width, dst_stride=self._bucket)
         if self._segw:
             # 批尾巴（票据 10）：一个瓦片里有好几个槽位，每槽一段列、一份递归状态、一份
@@ -963,7 +969,8 @@ class MudePipeline:
         两套列号是分开的：`qg` 按环槽位读（`s0 = qslot`、`qgT = self._ring`），`kv` 仍按整窗
         缓存读（`T = self._width`、`nk` 是可见上界）。`k_attn` 早就把这两件事拆成了两个字段。
 
-        输出写进本槽位 `out_in` 的前半：面里只有桶宽列，所以 `out_s0` 是**段内**偏移（拆成
+        输出写进本槽位 `out_in` 的前 `core_out` 行：面里只有桶宽列，所以 `out_s0` 是**段内**
+        偏移（拆成
         两次时第二次从 `boundary - start` 列接着写），`out_stride` 必须显式传桶宽
         （传 0 的话核会退回 `Stile`，而那时 `Stile` 只是这一段的有效列数）。
         """

@@ -139,11 +139,16 @@ def _proj_body(*, hidden: int, cout: int, s: int, entry: BlobEntry) -> list[str]
     return _conv("p", cin=hidden, cout=cout, s=s, entry=entry, src="x", out="y")
 
 
-def _out_body(*, hidden: int, s: int, entry: BlobEntry) -> list[str]:
+def _out_body(*, hidden: int, core_out: int, s: int, entry: BlobEntry) -> list[str]:
+    """入口是 `[v(core_out) | r(hidden)]`：**只有 v** 过 1×1 conv，r 直接加回去。
+
+    2B 上 `core_out == hidden`，入口看起来像"两段等宽"；4B 是 `4096 + 2560`。
+    切片的第二个字段是**宽度**（不是"另一半的起点"），所以 v 的宽度必须传 `core_out`。
+    """
     return (
-        _slice("sv", begin=0, size=hidden, s=s, src="x", out="v")
-        + _slice("sr", begin=hidden, size=hidden, s=s, src="x", out="r")
-        + _conv("o", cin=hidden, cout=hidden, s=s, entry=entry, src="v", out="ov")
+        _slice("sv", begin=0, size=core_out, s=s, src="x", out="v")
+        + _slice("sr", begin=core_out, size=hidden, s=s, src="x", out="r")
+        + _conv("o", cin=core_out, cout=hidden, s=s, entry=entry, src="v", out="ov")
         + [f'        tensor<fp16, [1, {hidden}, 1, {s}]> y = '
            f'add(x = ov, y = r)[name = string("y")];']
     )
@@ -188,12 +193,14 @@ def projection_mil(*, hidden: int, cout: int, s: int, entry: BlobEntry) -> str:
                            body=_proj_body(hidden=hidden, cout=cout, s=s, entry=entry))])
 
 
-def out_mil(*, hidden: int, s: int, entry: BlobEntry) -> str:
-    """输出投影 + 残差（旧引擎 proc 1）：输入是 `[attn_out | residual]` 两段拼接。"""
-    if hidden <= 0 or s <= 0:
-        raise NotReadyError("MIL 形状必须为正", hidden=hidden, s=s)
-    return _program([_func("main", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
-                           body=_out_body(hidden=hidden, s=s, entry=entry))])
+def out_mil(*, hidden: int, core_out: int, s: int, entry: BlobEntry) -> str:
+    """输出投影 + 残差（旧引擎 proc 1）：输入是 `[core_out | hidden]` 两段拼接。"""
+    if hidden <= 0 or core_out <= 0 or s <= 0:
+        raise NotReadyError("MIL 形状必须为正", hidden=hidden, core_out=core_out, s=s)
+    return _program([_func(
+        "main", func_input=f"tensor<fp16, [1, {core_out + hidden}, 1, {s}]> x",
+        body=_out_body(hidden=hidden, core_out=core_out, s=s, entry=entry),
+    )])
 
 
 def ffn_mil(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) -> str:
@@ -210,6 +217,7 @@ def ffn_mil(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) 
 def layer_mil(
     *,
     hidden: int,
+    core_out: int,
     cout: int,
     ffn: int,
     s: int,
@@ -219,15 +227,18 @@ def layer_mil(
     """一整层的 MIL：`main`（投影）、`p1`（输出投影+残差）、`p2`（融合 FFN）。
 
     `entries` 的键是 `proj`、`o`、`gate`、`up`、`down0`..`down{parts-1}`；三个 func 的
-    procedure 序号与旧引擎一致（`PROCS`），`AneLayer` 用它来 `attach` / `eval`。
+    procedure 序号与旧引擎一致（`PROCS`），`AneLayer` 用它来 `attach` / `eval`。`core_out`
+    是 `o` 的输入行数（2B 恰等于 `hidden`、4B 是 4096），也是 `p1` 入口 `[v | residual]`
+    里 v 的宽度。
 
     `split=True` 时投影拆成两段（票据 06）：`main` 只算 `[q|gate]`（`qg_rows` 行）、`p3`
     只算 `[k|v]`（`kv_rows` 行），权重键换成 `proj_q` / `proj_kv`。两段权重仍是**同一块
     投影按行切开的两份**（int8 按行量化，切行不动 scale），所以 blob 与 ANE 常驻权重一分
     不多 —— 它换到的是 `qg` 可以成环（q 只活一个瓦片，见 `schedule.attention_steps`）。
     """
-    if hidden <= 0 or cout <= 0 or s <= 0:
-        raise NotReadyError("MIL 形状必须为正", hidden=hidden, cout=cout, s=s)
+    if hidden <= 0 or core_out <= 0 or cout <= 0 or s <= 0:
+        raise NotReadyError("MIL 形状必须为正", hidden=hidden, core_out=core_out,
+                            cout=cout, s=s)
     if split:
         missing = [key for key in ("proj_q", "proj_kv") if key not in entries]
         if missing:
@@ -242,8 +253,9 @@ def layer_mil(
             _func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x",
                   body=_conv("p", cin=hidden, cout=q_rows, s=s, entry=entries["proj_q"],
                              src="x", out="y")),
-            _func("p1", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
-                  body=_out_body(hidden=hidden, s=s, entry=entries["o"])),
+            _func("p1", func_input=f"tensor<fp16, [1, {core_out + hidden}, 1, {s}]> x",
+                  body=_out_body(hidden=hidden, core_out=core_out, s=s,
+                                 entry=entries["o"])),
             _func("p2", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
                   body=_ffn_body(hidden=hidden, ffn=ffn, s=s, entries=entries)),
             _func("p3", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x",
@@ -255,8 +267,8 @@ def layer_mil(
     return _program([
         _func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x",
               body=_proj_body(hidden=hidden, cout=cout, s=s, entry=entries["proj"])),
-        _func("p1", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
-              body=_out_body(hidden=hidden, s=s, entry=entries["o"])),
+        _func("p1", func_input=f"tensor<fp16, [1, {core_out + hidden}, 1, {s}]> x",
+              body=_out_body(hidden=hidden, core_out=core_out, s=s, entry=entries["o"])),
         _func("p2", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x",
               body=_ffn_body(hidden=hidden, ffn=ffn, s=s, entries=entries)),
     ])
@@ -461,14 +473,21 @@ class SurfaceSet:
     （卸载会 CFRelease 掉每次 `attach` 时给面加的引用，面才真的回收）。
     """
 
-    def __init__(self, runtime: AneRuntime, *, hidden: int, cout: int, s: int) -> None:
+    def __init__(
+        self, runtime: AneRuntime, *, hidden: int, core_out: int, cout: int, s: int
+    ) -> None:
         self.hidden = int(hidden)
+        self.core_out = int(core_out)
         self.cout = int(cout)
         self.s = int(s)
+        # `out_in` 有两种写入形态：`[v(core_out) | x(hidden)]` 喂 out、`[xn | y]`（`2×hidden`）
+        # 喂 ffn，同一块内存先后覆写 —— 所以行数取两者较大。2B 上两者都是 4096；
+        # 4B 是 `4096 + 2560 = 6656` 对 `5120`，按旧的 `2*hidden` 会少 1536 行。
+        self.out_in_rows = max(self.core_out + self.hidden, 2 * self.hidden)
         self.surfaces: dict[str, Surface] = {}
         for key, items in (
             ("proj_in", self.hidden), ("proj_out", self.cout),
-            ("out_in", 2 * self.hidden), ("out_out", self.hidden),
+            ("out_in", self.out_in_rows), ("out_out", self.hidden),
         ):
             try:
                 self.surfaces[key] = runtime.surface(items * self.s * 2)
@@ -554,6 +573,7 @@ class AneLayer:
         *,
         name: str,
         hidden: int,
+        core_out: int,
         cout: int,
         ffn: int,
         s: int,
@@ -563,6 +583,7 @@ class AneLayer:
         self._runtime = runtime
         self.name = name
         self.hidden = int(hidden)
+        self.core_out = int(core_out)
         self.cout = int(cout)
         self.ffn = int(ffn)
         self.s = int(s)
@@ -581,7 +602,8 @@ class AneLayer:
         try:
             files.load(runtime, name)
             self._owned = None if pool else SurfaceSet(
-                runtime, hidden=self.hidden, cout=self.cout, s=self.s
+                runtime, hidden=self.hidden, core_out=self.core_out,
+                cout=self.cout, s=self.s,
             )
             self._sets = [self._owned] if self._owned is not None else list(pool or ())
             if len(self._sets) > MAX_SLOTS:
@@ -610,8 +632,9 @@ class AneLayer:
     def _write(self, key: str, items: int, x: np.ndarray) -> None:
         """把 `[items, s]`（通道优先）写进这张面的**前** `items` 行。
 
-        面可以比张量大：拆投影时 kv 段只有 `kv_rows` 行、而它落在 `out_in` 的 2×hidden 行里
-        （`SET_KEYS`）。所以这里按元素个数取前缀，而不是要求整张面等于张量形状。
+        面可以比张量大：拆投影时 kv 段只有 `kv_rows` 行、而它落在 `out_in` 的 `out_in_rows`
+        行里（`SET_KEYS`）；`out_in` 同时还要装得下 `[xn | y]` 的 `2×hidden`。所以这里按元素
+        个数取前缀，而不是要求整张面等于张量形状。
         """
         view = self._surfaces[key].array(np.float16)[: items * self.s]
         view[...] = np.asarray(x, dtype=np.float16).reshape(-1)
@@ -670,8 +693,8 @@ class AneLayer:
         return np.concatenate([q, kv], axis=0), ms_q + ms_kv
 
     def output(self, attn: np.ndarray, residual: np.ndarray) -> tuple[np.ndarray, float]:
-        """`[hidden, s]` 注意力输出 + `[hidden, s]` 残差 → `[hidden, s]`（含残差）。"""
-        self._write("out_in", 2 * self.hidden,
+        """`[core_out, s]` 核心输出 + `[hidden, s]` 残差 → `[hidden, s]`（含残差）。"""
+        self._write("out_in", self.core_out + self.hidden,
                     np.concatenate([attn, residual], axis=0))
         return self._eval("out", self.hidden)
 
