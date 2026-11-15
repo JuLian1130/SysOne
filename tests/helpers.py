@@ -11,7 +11,8 @@ import numpy as np
 from sysone.domain.attention import MaskMode
 from sysone.domain.decision import DecisionRequest, Question
 from sysone.models.descriptor import ModelDescriptor
-from sysone.weights.store import TensorStore
+from sysone.weights.packing import pack_tensors
+from sysone.weights.store import TensorStore, write_file
 
 FIXTURES = Path(__file__).parent / "fixtures"
 OPTIONS = ("A", "B", "C", "D")
@@ -43,6 +44,29 @@ def write_safetensors(path: Path, tensors: dict[str, np.ndarray]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(chunks))
     return path
+
+
+
+def write_row_int8_checkpoint(
+    directory: Path, tensors: dict[str, np.ndarray], *, min_elems: int = 1
+) -> Path:
+    """把一组张量按 row-int8 容器写到目录：`__q` / `__s` 分片加 `int8_manifest.json`。
+
+    `min_elems` 决定哪些二维张量被量化；默认全量化，因为测试里的张量都远小于真实检查点
+    的 1<<20 门限，否则一条 int8 通路都走不到。
+    """
+    packed, manifest = pack_tensors(tensors, min_elems=min_elems)
+    write_file(directory / "model.safetensors", packed)
+    payload = {
+        "tensors": {
+            name: {"kind": entry.kind, "shape": list(entry.shape)}
+            for name, entry in manifest.entries.items()
+        },
+        "source_bf16_bytes": manifest.source_bf16_bytes,
+        "int8_bytes": manifest.int8_bytes,
+    }
+    (directory / "int8_manifest.json").write_text(json.dumps(payload), "utf-8")
+    return directory
 
 
 def tiny_weights(descriptor: ModelDescriptor, seed: int = 0) -> dict[str, np.ndarray]:

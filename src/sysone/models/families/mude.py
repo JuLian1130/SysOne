@@ -12,6 +12,7 @@ from ...domain.attention import AttentionRole, MaskMode
 from ...domain.decision import Question
 from ...domain.work import ffn_parts
 from ...errors import ConfigError
+from ...weights.packing import ane_blob
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan
 from ..registry import register_family
@@ -201,14 +202,20 @@ class MudePrompter:
         return self._prefix_value
 
 
-def ane_layer_weights(
-    read: Callable[[str], np.ndarray],
+# 一个 blob 条目由哪些张量按行拼成：`(张量名, 列切片)`，`slice(None)` 表示整块。
+Segments = dict[str, tuple[tuple[str, slice], ...]]
+_ALL = slice(None)
+
+
+def ane_layer_segments(
     *,
     layer: int,
     layer_type: AttentionRole,
+    hidden: int,
+    ffn: int,
     prefix: str = "language_model",
-) -> dict[str, np.ndarray]:
-    """一层的 ANE 权重（`layer_mil` 的 `entries`）：三段计算各自的权重。
+) -> Segments:
+    """一层要装进 blob 的条目表（键与 `layer_mil` 的 `entries` 同名）。
 
     投影是**整块行拼接**，这是旧引擎 `COUT` 的来历，也是 20 层链要复用的同一事实：
     - 全注意力层 5120 = `q_proj` 4096（前 2048 是 q、后 2048 是门控）+ `k_proj` 512 + `v_proj` 512；
@@ -217,36 +224,94 @@ def ane_layer_weights(
     线性层的 `b` 在 `a` 之前，是 Metal 核的约定（`k_gdn` 从 `COUT_GDN-32` 起读 `b`、从
     `COUT_GDN-16` 起读 `a`，见 `docs/ANE/anebench/e8_common.h:29`）；numpy 链按同一顺序读。
 
-    FFN 的 `down_proj` 是 `[hidden, ffn]`，按 `hidden` 切 `ffn_parts()` 段；`out` 是
-    `out_proj` / `o_proj`（`[hidden, hidden]`，与 `layer_mil` 的 p1 一致 —— 残差在 program 里加）。
+    FFN 的 `down_proj` 是 `[hidden, ffn]`，按 `hidden` 切 `ffn_parts()` 段，所以 `down{i}` 切的是
+    **输入**维；`out` 是 `out_proj` / `o_proj`（`[hidden, core_out]`，残差在 program 里加）。
+
+    行拼与列切都不动 int8 的标度（量化按输出行），所以这张表对"现量化"和"容器自带码"
+    两条路是同一份 —— 两个物化函数都从它出发。
     """
     base = f"{prefix}.layers.{layer}"
     if layer_type is AttentionRole.FULL:
         attn = f"{base}.self_attn"
-        proj = np.concatenate(
-            [read(f"{attn}.q_proj.weight"), read(f"{attn}.k_proj.weight"),
-             read(f"{attn}.v_proj.weight")],
-            axis=0,
-        )
-        out = read(f"{attn}.o_proj.weight")
+        proj = ((f"{attn}.q_proj.weight", _ALL), (f"{attn}.k_proj.weight", _ALL),
+                (f"{attn}.v_proj.weight", _ALL))
+        out = (f"{attn}.o_proj.weight", _ALL)
     else:
         attn = f"{base}.linear_attn"
-        proj = np.concatenate(
-            [read(f"{attn}.in_proj_qkv.weight"), read(f"{attn}.in_proj_z.weight"),
-             read(f"{attn}.in_proj_b.weight"), read(f"{attn}.in_proj_a.weight")],
-            axis=0,
+        proj = tuple(
+            (f"{attn}.{name}.weight", _ALL)
+            for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
         )
-        out = read(f"{attn}.out_proj.weight")
+        out = (f"{attn}.out_proj.weight", _ALL)
 
-    gate = read(f"{base}.mlp.gate_proj.weight")
-    up = read(f"{base}.mlp.up_proj.weight")
-    down = read(f"{base}.mlp.down_proj.weight")
-    hidden, ffn = int(down.shape[0]), int(down.shape[1])
-    parts = ffn_parts(hidden, ffn)
+    mlp = f"{base}.mlp"
+    segments: Segments = {
+        "proj": proj,
+        "o": (out,),
+        "gate": ((f"{mlp}.gate_proj.weight", _ALL),),
+        "up": ((f"{mlp}.up_proj.weight", _ALL),),
+    }
+    down = f"{mlp}.down_proj.weight"
+    for index in range(ffn_parts(hidden, ffn)):
+        segments[f"down{index}"] = ((down, slice(index * hidden, (index + 1) * hidden)),)
+    return segments
 
-    entries: dict[str, np.ndarray] = {"proj": proj, "o": out, "gate": gate, "up": up}
-    for i in range(parts):
-        entries[f"down{i}"] = down[:, i * hidden:(i + 1) * hidden]
+
+def ane_layer_weights(
+    read: Callable[[str], np.ndarray],
+    *,
+    layer: int,
+    layer_type: AttentionRole,
+    hidden: int,
+    ffn: int,
+    prefix: str = "language_model",
+) -> dict[str, np.ndarray]:
+    """一层的 ANE 权重（`layer_mil` 的 `entries`），来源是原样权重。"""
+    entries: dict[str, np.ndarray] = {}
+    for name, segments in ane_layer_segments(
+        layer=layer, layer_type=layer_type, hidden=hidden, ffn=ffn, prefix=prefix
+    ).items():
+        entries[name] = np.concatenate([read(tensor)[:, columns] for tensor, columns in segments], axis=0)
+    return entries
+
+
+def ane_layer_quantized(
+    read: Callable[[str], np.ndarray],
+    parts: Callable[[str], tuple[np.ndarray, np.ndarray] | None],
+    *,
+    layer: int,
+    layer_type: AttentionRole,
+    hidden: int,
+    ffn: int,
+    prefix: str = "language_model",
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """一层的 ANE 权重，形态是 `(int8 码, 标度)`：容器自带码就直接用，否则现量化。
+
+    `parts(tensor)` 给 `(码, fp32 标度)` 或 `None`（这份容器里它就是原样权重）。容器自带码
+    时必须用它 —— 那是检查点对同一批数值已经做过的量化，重算一遍会叠加第二次误差
+    （`ane_blob.build_quantized` 的注释里有实测数字）。
+
+    码按行接起来、标度同理：行拼与列切都在"输出行"以外，不动每行的标度。
+    """
+    entries: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name, segments in ane_layer_segments(
+        layer=layer, layer_type=layer_type, hidden=hidden, ffn=ffn, prefix=prefix
+    ).items():
+        codes: list[np.ndarray] = []
+        scales: list[np.ndarray] = []
+        for tensor, columns in segments:
+            existing = parts(tensor)
+            if existing is None:
+                quantized = ane_blob.quant_per_channel(
+                    np.asarray(read(tensor)[:, columns], np.float16)
+                )
+                codes.append(quantized.codes)
+                scales.append(quantized.scale)
+            else:
+                part_codes, part_scale = existing
+                codes.append(part_codes[:, columns])
+                scales.append(np.asarray(part_scale, np.float16))
+        entries[name] = (np.concatenate(codes, axis=0), np.concatenate(scales, axis=0))
     return entries
 
 

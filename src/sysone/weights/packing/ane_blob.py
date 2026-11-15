@@ -99,6 +99,7 @@ def build(
     """把若干 fp16 权重装成一个 blob，返回字节与每张权重的位置表。
 
     顺序按入参顺序（Mapping 用插入序），量化时每张权重占 codes + scale 两个条目。
+    权重**已经是 int8** 时走 `build_quantized`：那条路不再按 amax 重算标度。
     """
     items = list(weights.items()) if isinstance(weights, Mapping) else list(weights)
     # 交错写：量化权重的 codes 与它的 scale 条目相邻，读侧不需要额外索引。
@@ -111,7 +112,40 @@ def build(
             flat.append((name, "fp16", q.scale.tobytes(), q.scale.shape, False))
         else:
             flat.append((name, "fp16", w16.tobytes(), w16.shape, True))
+    return _assemble(flat)
 
+
+def build_quantized(
+    weights: Mapping[str, tuple[np.ndarray, np.ndarray]],
+) -> tuple[bytes, dict[str, BlobEntry]]:
+    """已经是 `(int8 码, 标度)` 的权重直接装进 blob，**不再量化一次**。
+
+    检查点自带 int8 码时必须走这条：按 amax 重算标度等于把已经落过格的数值再取整一次，
+    误差会叠加。按输出行切片（`down0`/`down1`/…）时更明显 —— 切片的 amax 比整行小，
+    标度更细，重算出来的码与检查点的码不一致，等于给这一层多加半次量化误差
+    （票据 15 §14 的实测：2B 的 logits 偏移由此从 1.1e-3 涨到 7.8e-3）。
+
+    标度按 fp16 落盘（blob 的容器约定），调用方给的标度是 fp32 时会被舍入一次。
+    """
+    flat: list[tuple[str, str, bytes, tuple[int, ...], bool]] = []
+    for name, (codes, scale) in weights.items():
+        c8 = np.ascontiguousarray(codes, dtype=np.int8)
+        s16 = np.ascontiguousarray(scale, dtype=np.float16)
+        if c8.ndim != 2:
+            raise ValueError(f"{name} 的 int8 码不是二维的：{c8.shape}")
+        if s16.shape != (c8.shape[0],):
+            raise ValueError(
+                f"{name} 的标度形状 {s16.shape} 与码 {c8.shape} 不配对（每行一个标度）"
+            )
+        flat.append((name, "int8", c8.tobytes(), c8.shape, True))
+        flat.append((name, "fp16", s16.tobytes(), s16.shape, False))
+    return _assemble(flat)
+
+
+def _assemble(
+    flat: Sequence[tuple[str, str, bytes, tuple[int, ...], bool]],
+) -> tuple[bytes, dict[str, BlobEntry]]:
+    """把 `(名字, dtype, 字节, 形状, 是不是主条目)` 的顺序表写成容器字节与位置表。"""
     total = HEADER_BYTES + sum(ENTRY_BYTES + len(payload) for _n, _t, payload, _s, _k in flat)
     buf = bytearray(total)
     struct.pack_into("<II", buf, 0, len(flat), 2)

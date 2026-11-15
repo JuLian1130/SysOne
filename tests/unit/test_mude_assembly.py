@@ -54,7 +54,7 @@ def _full_shapes(layer: int) -> dict[str, tuple[int, ...]]:
 
 def test_linear_layer_projection_is_8224_rows():
     entries = mude.ane_layer_weights(_fake_read(_linear_shapes(0)), layer=0,
-                                     layer_type=AttentionRole.LINEAR)
+                                     layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN)
     assert entries["proj"].shape == (8224, HIDDEN), "qkv 6144 + z 2048 + a 16 + b 16"
     assert entries["o"].shape == (HIDDEN, HIDDEN)
     assert entries["gate"].shape == entries["up"].shape == (FFN, HIDDEN)
@@ -65,7 +65,7 @@ def test_linear_layer_projection_is_8224_rows():
 
 def test_full_layer_projection_is_5120_rows():
     entries = mude.ane_layer_weights(_fake_read(_full_shapes(3)), layer=3,
-                                     layer_type=AttentionRole.FULL)
+                                     layer_type=AttentionRole.FULL, hidden=HIDDEN, ffn=FFN)
     assert entries["proj"].shape == (5120, HIDDEN), "q 4096（含门控）+ k 512 + v 512"
     assert entries["o"].shape == (HIDDEN, HIDDEN)
     assert set(entries) == {"proj", "o", "gate", "up", "down0", "down1", "down2"}
@@ -75,9 +75,68 @@ def test_down_is_split_along_k_axis_in_order():
     """三段 down 按列拼回去必须等于原矩阵，顺序不能乱。"""
     read = _fake_read(_linear_shapes(0))
     down = read("language_model.layers.0.mlp.down_proj.weight")
-    entries = mude.ane_layer_weights(read, layer=0, layer_type=AttentionRole.LINEAR)
+    entries = mude.ane_layer_weights(read, layer=0, layer_type=AttentionRole.LINEAR,
+                                     hidden=HIDDEN, ffn=FFN)
     rebuilt = np.concatenate([entries["down0"], entries["down1"], entries["down2"]], axis=1)
     np.testing.assert_array_equal(rebuilt, down)
+
+
+def _no_parts(name: str) -> None:
+    return None
+
+
+def test_quantized_layer_takes_the_containers_codes():
+    """容器自带码时，条目就是它的码与标度 —— 行拼与列切都不重算。
+
+    这里给一份"故意与 amax 不符"的码（码全是 ±1、标度是整行的），如果实现又按 amax
+    量化了一遍，码就不会再是 ±1，测试立刻失败。
+    """
+    shapes = _linear_shapes(0)
+    read = _fake_read(shapes)
+
+    def parts(name: str):
+        rows = shapes[name][0]
+        cols = shapes[name][1]
+        codes = np.where((np.arange(rows)[:, None] + np.arange(cols)[None, :]) % 2 == 0, 1, -1)
+        return codes.astype(np.int8), np.full(rows, 0.0625, dtype=np.float32)
+
+    entries = mude.ane_layer_quantized(
+        read, parts, layer=0, layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN
+    )
+    codes, scales = entries["down0"]
+    assert codes.shape == (HIDDEN, HIDDEN) and codes.dtype == np.int8
+    # 列切的是第 0 段，所以每行的列号从 0 开始重新计 —— 与切片前的棋盘格一致。
+    assert np.array_equal(codes[0], np.where(np.arange(HIDDEN) % 2 == 0, 1, -1))
+    np.testing.assert_array_equal(scales, np.full(HIDDEN, 0.0625, dtype=np.float16))
+    # 三段按列拼回去还是那张棋盘格。
+    rebuilt = np.concatenate([entries[f"down{i}"][0] for i in range(ffn_parts(HIDDEN, FFN))], axis=1)
+    np.testing.assert_array_equal(
+        rebuilt,
+        np.where((np.arange(HIDDEN)[:, None] + np.arange(FFN)[None, :]) % 2 == 0, 1, -1),
+    )
+    # 投影是行拼接：前 6144 行来自 qkv，所以第 6144 行开始的棋盘格相位仍按各张量自己的行号。
+    assert entries["proj"][0].shape == (8224, HIDDEN)
+    assert entries["proj"][1].shape == (8224,)
+
+
+def test_quantized_layer_re_quantizes_what_the_container_keeps_as_is():
+    """容器里按 16 bit 存的张量（`parts` 给 None）在这里现量化，码不再是棋盘格。"""
+    shapes = _linear_shapes(0)
+    read = _fake_read(shapes)
+    entries = mude.ane_layer_quantized(
+        read, _no_parts, layer=0, layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN
+    )
+    codes, scales = entries["gate"]
+    assert codes.shape == (FFN, HIDDEN)
+    # 现量化的码会用到 -127..127 的整个量程，不可能只有 ±1。
+    assert int(np.abs(codes).max()) > 1
+    assert scales.shape == (FFN,)
+    expected = read("language_model.layers.0.mlp.gate_proj.weight").astype(np.float16)
+    np.testing.assert_allclose(
+        codes.astype(np.float32) * scales.astype(np.float32)[:, None].astype(np.float16).astype(np.float32),
+        expected.astype(np.float32),
+        atol=float(np.abs(expected).max()) / 127.0 * 1.01,
+    )
 
 
 def test_the_checkpoint_needs_the_plus_one_norm_offset():

@@ -125,6 +125,20 @@ def write_file(path: Path | str, tensors: dict[str, np.ndarray]) -> Path:
     return resolved
 
 
+def file_identity(path: Path) -> dict:
+    """文件身份：路径 + 字节数 + mtime。产物缓存拿它当"这份权重没换过"的证据。
+
+    刻意不算内容哈希：哈希要把整个文件读一遍，而缓存要省掉的正是读一遍那几秒。
+    认不出来的情形只有"文件被原地改写且 mtime、大小都没变"，发布与替换权重都会改 mtime。
+    """
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
 class SafeTensorFile:
     """单文件惰性读取：只解析 header，数据区按需 mmap 切片。
 
@@ -159,6 +173,10 @@ class SafeTensorFile:
 
     def names(self) -> frozenset[str]:
         return frozenset(self._header)
+
+    def fingerprint(self) -> dict:
+        """这份权重容器的身份（产物缓存只比它，不比哈希）。"""
+        return {"container": "tensor", "files": [file_identity(self.path)]}
 
     def read(self, name: str) -> np.ndarray:
         try:

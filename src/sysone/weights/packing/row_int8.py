@@ -15,7 +15,7 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 
 from ...errors import ConfigError, MissingTensorError
-from ..store import SafeTensorFile
+from ..store import SafeTensorFile, file_identity
 
 MANIFEST_NAME = "int8_manifest.json"
 QUANT_SUFFIX = ".__q"
@@ -179,6 +179,11 @@ class RowInt8Store:
 
     def missing(self, expected: Iterable[str]) -> set[str]:
         return set(expected) - set(self.manifest.names())
+
+    def fingerprint(self) -> dict:
+        """这份权重容器的身份：manifest 加上每个分片（换一个文件就是另一份权重）。"""
+        paths = [self.dir / MANIFEST_NAME, *(handle.path for handle in self._files)]
+        return {"container": "row-int8", "files": [file_identity(path) for path in paths]}
 
     @property
     def artifact_bytes(self) -> int:

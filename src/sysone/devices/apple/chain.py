@@ -17,8 +17,9 @@ import numpy as np
 
 from ...domain.attention import AttentionRole
 from ...errors import ConfigError
-from ...models.families.mude import CODE_ROWS, ane_layer_weights
-from ...weights.packing.ane_blob import build as build_blob
+from ...models.families.mude import CODE_ROWS, ane_layer_quantized, ane_layer_weights
+from ...weights.checkpoint import WeightStore, int8_parts, open_checkpoint
+from ...weights.packing.ane_blob import build as build_blob, build_quantized
 from ...weights.store import SafeTensorFile
 from .compile import (
     S_NATIVE,
@@ -88,7 +89,7 @@ class MudeChain:
         layers: list[AneLayer],
         params: list[dict[str, np.ndarray]],
         roles: list[AttentionRole],
-        store: SafeTensorFile,
+        store: WeightStore,
         embed_name: str,
         final_norm: np.ndarray,
         readout: np.ndarray,
@@ -158,6 +159,11 @@ class MudeChain:
         resident: int | None = None,
     ) -> "MudeChain":
         """编译 20 层程序并从 `model_dir` 读权重。
+
+        权重容器两种都收：bf16 的 `model.safetensors` 单文件，或 row-int8 目录（`__q` 码 +
+        fp32 标度 + `int8_manifest.json`，4B 的 h2o 是这种）。选择在
+        `weights.checkpoint.open_checkpoint` 里做，`read` 一律给 float32，所以下面这些
+        读权重的地方都不认识容器。
 
         `device` 目前只有 `"ane"`（这条链就是 ANE 链）；`scratch_dir` 放 MIL/blob 产物，
         默认在系统临时目录，产物按内容哈希复用。`metal=True` 时额外建一条 GPU 流水线
@@ -233,7 +239,7 @@ class MudeChain:
         if width < s:
             raise ValueError(f"缓冲宽度 {width} 小于桶宽 {s}：桶不能跨在缓冲之外")
 
-        store = SafeTensorFile(root / "model.safetensors")
+        store = open_checkpoint(root)
         scratch = (Path(scratch_dir) if scratch_dir is not None
                    else Path(tempfile.gettempdir()) / "sysone-mude-chain")
         # dylib 的 program 缓存按名字键，进程内允许多条链共存（对拍时 numpy 与 Metal 各一条），
@@ -567,7 +573,7 @@ class MudeChain:
 # 一层的产物目录里已经有了"就是这份权重、这个几何、这个桶宽、这个量化"的证明时，
 # 就不再读 fp16 权重、也不再量化 —— 这两段在本机是 8.6 s，而装载本身只要 0.7 s。
 def _artifact_source(
-    store: SafeTensorFile,
+    store: WeightStore,
     *,
     layer: int,
     role: AttentionRole,
@@ -578,16 +584,15 @@ def _artifact_source(
     s: int,
     quantize: bool,
 ) -> dict:
-    """产物的身份：权重文件的 stat + 几何 + 量化开关 + `ARTIFACT_VERSION`。
+    """产物的身份：权重容器的指纹 + 几何 + 量化开关 + `ARTIFACT_VERSION`。
 
-    刻意用 stat 而不是内容哈希：哈希要把 1.5 GB 读一遍，而读一遍正是要省掉的那一段。
-    认不出来的情形只有"权重被原地改写且 mtime、大小都没变"，发布与替换权重都会改 mtime。
+    `store.fingerprint()` 是"这份权重没换过"的证据：大小与 mtime，不算内容哈希（哈希要把
+    1.5 GB 读一遍，而读一遍正是缓存要省掉的那一段）。容器形态也进指纹 —— 同一份权重存成
+    bf16 单文件与存成 row-int8，读出来的数值不是逐位相同的（后者多了 int8 往返），
+    产物就不该互相认领。
     """
-    stat = store.path.stat()
     return {
-        "weights": str(store.path.resolve()),
-        "bytes": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
+        "weights": store.fingerprint(),
         "layer": int(layer),
         "type": str(role),
         "cout": int(cout),
@@ -599,8 +604,13 @@ def _artifact_source(
     }
 
 
+def _entry_array(entry: np.ndarray | tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    """一条 ANE 权重的形状来源：未量化时是矩阵本身，量化后看码那一半（标度是一维向量）。"""
+    return entry[0] if isinstance(entry, tuple) else entry
+
+
 def _build_layer_program(
-    store: SafeTensorFile,
+    store: WeightStore,
     *,
     directory: Path,
     index: int,
@@ -614,21 +624,32 @@ def _build_layer_program(
     source: dict,
     split: tuple[int, int] | None = None,
 ) -> ProgramFiles:
-    """读这一层的 fp16 权重、量化、生成 MIL 并落盘（缓存未命中的那一路）。
+    """读这一层的权重、装 blob、生成 MIL 并落盘（缓存未命中的那一路）。
+
+    码从哪来取决于容器：row-int8 检查点自带，bf16 检查点在这里现量化。两条路都从
+    `ane_layer_segments` 的同一张条目表出发，所以条目名、行拼顺序、列切位置只有一份。
 
     `split=(q_rows, kv_rows)` 时把整块投影**按行切成两段**（全注意力层，票据 06）：int8 是按
     输出行量化的，切行不动 scale，所以两段的 codes 与未切时逐字节相同 —— blob 与 ANE 常驻
     权重一分不多，换到的是 `qg` 可以成环。
     """
-    entries = ane_layer_weights(store.read, layer=index, layer_type=role)
-    actual = int(entries["proj"].shape[0])
+    if quantize:
+        # row-int8 检查点自带 int8 码，直接用；bf16 检查点没有码，这条路上现量化。
+        entries: dict = ane_layer_quantized(
+            store.read, lambda name: int8_parts(store, name),
+            layer=index, layer_type=role, hidden=hidden, ffn=ffn,
+        )
+        actual = int(_entry_array(entries["proj"]).shape[0])
+    else:
+        entries = ane_layer_weights(store.read, layer=index, layer_type=role, hidden=hidden, ffn=ffn)
+        actual = int(entries["proj"].shape[0])
     if actual != cout:
         # `cout` 来自写死在 MSL 里的几何；权重形状与它对不上说明这个 checkpoint 不是
         # 这套几何编译的，继续下去会得到一个形状对、语义错的 program。
         raise ValueError(
             f"第 {index} 层的 proj 行数 {actual} 与几何给出的 cout={cout} 不一致"
         )
-    out_shape = tuple(int(n) for n in entries["o"].shape)
+    out_shape = tuple(int(n) for n in _entry_array(entries["o"]).shape)
     if out_shape != (hidden, core_out):
         # `o` 的行是 hidden（输出），列是 core_out（输入）。列数对不上说明几何与这份
         # checkpoint 不是一套的 —— 继续下去 ANE 会按 core_out 行去读一个更窄的矩阵，
@@ -645,8 +666,16 @@ def _build_layer_program(
             )
         proj = entries["proj"]
         rest = {key: value for key, value in entries.items() if key != "proj"}
-        entries = {**rest, "proj_q": proj[:q_rows], "proj_kv": proj[q_rows:]}
-    blob, blob_entries = build_blob(entries, quantize=quantize)
+        if quantize:
+            codes, scales = proj
+            entries = {**rest, "proj_q": (codes[:q_rows], scales[:q_rows]),
+                       "proj_kv": (codes[q_rows:], scales[q_rows:])}
+        else:
+            entries = {**rest, "proj_q": proj[:q_rows], "proj_kv": proj[q_rows:]}
+    if quantize:
+        blob, blob_entries = build_quantized(entries)
+    else:
+        blob, blob_entries = build_blob(entries, quantize=False)
     mil = layer_mil(hidden=hidden, core_out=core_out, cout=cout, ffn=ffn, s=s,
                     entries=blob_entries, split=split is not None)
     return write_program(
@@ -687,7 +716,7 @@ def _norm(weight: np.ndarray, offset: float) -> np.ndarray:
 
 
 def _layer_params(
-    store: SafeTensorFile, index: int, role: AttentionRole, norm_offset: float
+    store: WeightStore, index: int, role: AttentionRole, norm_offset: float
 ) -> dict[str, np.ndarray]:
     """一层的 numpy 侧权重：各 norm、卷积、A_log / dt_bias。norm 的偏移由调用方给。"""
     base = f"language_model.layers.{index}"

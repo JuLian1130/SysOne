@@ -52,7 +52,10 @@ BLOB_NAME = "weights.bin"
 #
 # 2：全注意力层的投影拆成 q/kv 两段（票据 06）—— 同一层目录里的旧 MIL 有 3 个 procedure，
 #    与新的 `PROCS_SPLIT` 对不上，必须重建。
-ARTIFACT_VERSION = 2
+# 3：blob 的 int8 码可以来自检查点自己（row-int8 容器）而不是每次现量化。对 bf16 检查点
+#    产物逐字节不变，但对 row-int8 检查点会变 —— 而"权重文件没换、量化开关没变"的 sidecar
+#    认不出这个差别，所以必须靠版本盐把旧产物判掉。
+ARTIFACT_VERSION = 3
 
 # 一层的 procedure 序号。两层形态（票据 06）：
 # - 线性层（以及 numpy 逐段对拍）：投影是一整段，序号与旧引擎一致（proj/out/ffn = 0/1/2）；

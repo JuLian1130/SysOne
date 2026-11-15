@@ -112,3 +112,30 @@ def test_int8_entry_without_scale_is_unusable():
 
     with pytest.raises(NotReadyError):
         _conv("p", cin=2, cout=2, s=4, entry=entry, src="x", out="y")
+
+
+def test_build_quantized_writes_the_codes_it_is_given():
+    """容器自带码时原样落盘：不按 amax 重算，标度也从调用方来。"""
+    codes = np.array([[-127, 0, 127], [1, -3, 5]], dtype=np.int8)
+    scale = np.array([0.5, 0.25], dtype=np.float32)
+    blob, entries = ane_blob.build_quantized({"w": (codes, scale)})
+
+    entry = entries["w"]
+    assert entry.quantized and entry.shape == (2, 3)
+    stored = np.frombuffer(blob, dtype=np.int8, count=entry.nbytes, offset=entry.offset + 64)
+    np.testing.assert_array_equal(stored.reshape(codes.shape), codes)
+    stored_scale = np.frombuffer(blob, dtype=np.float16, count=2, offset=entry.scale_offset + 64)
+    np.testing.assert_array_equal(stored_scale, scale.astype(np.float16))
+
+
+def test_build_quantized_rejects_a_scale_that_is_not_per_row():
+    with pytest.raises(ValueError):
+        ane_blob.build_quantized({"w": (np.zeros((2, 4), dtype=np.int8),
+                                       np.zeros((2, 4), dtype=np.float32))})
+
+
+def test_build_quantized_rejects_a_vector():
+    """标度是「每行一个」，所以码必须是二维的；一维的码进 blob 后没人能给它对号。"""
+    with pytest.raises(ValueError):
+        ane_blob.build_quantized({"w": (np.zeros((4,), dtype=np.int8),
+                                       np.zeros((4,), dtype=np.float32))})

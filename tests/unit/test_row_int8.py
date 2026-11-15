@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from helpers import write_row_int8_checkpoint
 from sysone.errors import BudgetExceededError, ConfigError, MissingTensorError
 from sysone.weights.packing import (
     QUANT_SUFFIX,
@@ -63,14 +63,8 @@ def test_pack_tensors_manifest_counts() -> None:
 def test_manifest_roundtrip_json(tmp_path: Path) -> None:
     tensors = {"w": np.full((16, 16), 0.25, dtype=np.float32),
                "n": np.ones(16, dtype=np.float32)}
-    packed, manifest = pack_tensors(tensors, min_elems=1)
-    write_file(tmp_path / "model.safetensors", packed)
-    payload = {
-        "tensors": {n: {"kind": e.kind, "shape": list(e.shape)} for n, e in manifest.entries.items()},
-        "source_bf16_bytes": manifest.source_bf16_bytes,
-        "int8_bytes": manifest.int8_bytes,
-    }
-    (tmp_path / "int8_manifest.json").write_text(json.dumps(payload), "utf-8")
+    manifest = pack_tensors(tensors, min_elems=1)[1]
+    write_row_int8_checkpoint(tmp_path, tensors)
     loaded = RowInt8Manifest.load(tmp_path)
     assert loaded.names() == manifest.names()
     assert loaded.quantized() == frozenset({"w"})
@@ -80,14 +74,8 @@ def test_manifest_roundtrip_json(tmp_path: Path) -> None:
 def test_row_int8_store_dequantizes(tmp_path: Path) -> None:
     tensors = {"w": np.full((8, 8), 0.5, dtype=np.float32),
                "n": np.arange(8, dtype=np.float32)}
-    packed, manifest = pack_tensors(tensors, min_elems=1)
-    write_file(tmp_path / "model.safetensors", packed)
-    payload = {
-        "tensors": {n: {"kind": e.kind, "shape": list(e.shape)} for n, e in manifest.entries.items()},
-        "source_bf16_bytes": manifest.source_bf16_bytes,
-        "int8_bytes": manifest.int8_bytes,
-    }
-    (tmp_path / "int8_manifest.json").write_text(json.dumps(payload), "utf-8")
+    manifest = pack_tensors(tensors, min_elems=1)[1]
+    write_row_int8_checkpoint(tmp_path, tensors)
     store = RowInt8Store(tmp_path)
     assert store.read("w").shape == (8, 8)
     assert np.isclose(store.read("w"), 0.5, atol=1e-2).all()

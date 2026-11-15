@@ -111,7 +111,7 @@ class ApplePlatform:
             raise UnsupportedPrecisionError(
                 "ANE 只接受 per-channel int8（码与 fp16 标度同 blob）",
                 quant=str(quant),
-                hint="per-row int8 是 GPU 厂商路径的形态",
+                hint="per-row int8 是检查点（及其 GPU 路径）的存法，装载时会派生成 per-channel blob",
             )
 
     def memory(self) -> MemoryInfo:
