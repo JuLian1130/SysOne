@@ -13,23 +13,20 @@ from .attention import MaskPlan
 from ..errors import ConfigError
 
 
-def ffn_parts(hidden: int, ffn: int) -> int:
-    """FFN 的 down 投影把 K 维切成的段数 —— 旧引擎取 `ffn/hidden`（mude 是 3）。
+def ffn_segments(hidden: int, ffn: int) -> tuple[slice, ...]:
+    """FFN 的 down 投影把 K 维切成哪几段：每段 `hidden` 列，余数落在最后一段。
 
-    ANE 的 conv 一次吃下 6144 个输入通道偏大，旧实现按 `hidden` 一段一段切。这里要求
-    `ffn` 能被 `hidden` 整除：mude 是 6144/2048 = 3；4B 是 9216/2560 = 3.6，需要变长切分，
-    留到 M4 的 4B 实验再说，现在显式报错而不是悄悄生成一个坏 program。
+    ANE 的 conv 一次吃下整个 `ffn` 偏大，旧引擎按 `hidden` 一段一段切 —— mude 是
+    6144/2048，正好 3 段等长。4B 是 9216/2560 = 3.6，等长切不出来：前三段各 2560、
+    最后一段 1536。段长不齐 ANE 照收，实测与等长切分同量级（S=4096 整层 FFN 41.5 ms，
+    见票据 15 §15），所以这里不再要求整除。
+
+    返回值是**列区间**（顺序覆盖 `[0, ffn)`）：装配侧用它切 `down_proj`，编译侧用
+    `start/stop` 生成 `slice_by_size` 与对应宽度的 conv，两边共用一套规则。
     """
     if hidden <= 0 or ffn <= 0:
         raise ConfigError("FFN 切分需要正的 hidden/ffn", hidden=hidden, ffn=ffn)
-    if ffn % hidden:
-        raise ConfigError(
-            "FFN 的 down 投影要求 ffn 能被 hidden 整除",
-            hidden=hidden,
-            ffn=ffn,
-            hint="4B（9216/2560）需要变长切分，M2 只支持 mude 的 6144/2048",
-        )
-    return ffn // hidden
+    return tuple(slice(begin, min(begin + hidden, ffn)) for begin in range(0, ffn, hidden))
 
 
 class StageOp(StrEnum):

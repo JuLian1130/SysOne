@@ -130,6 +130,38 @@ def test_ffn_mil_splits_k_axis_and_fuses_activation():
     assert mil.count("func ") == 1
 
 
+def test_ffn_mil_cuts_an_uneven_tail_at_the_4b_geometry():
+    """4B 的 9216/2560 = 3.6：四段（2560/2560/2560/1536），最后一段的宽度也进 MIL。
+
+    切法不是"能整除就三段，不整除就报错"，而是每段 `hidden`、余数垫在最后一段 —— 所以
+    `slice_by_size` 的偏移、conv 的 `cin`、权重张量的形状三处都得跟着最后一段变窄。
+    """
+    hidden, ffn = 2560, 9216
+    entries = {
+        "gate": _entry(offset=100, shape=(ffn, hidden)),
+        "up": _entry(offset=200, shape=(ffn, hidden)),
+        **{f"down{i}": _entry(offset=1000 * (i + 1), shape=(hidden, size))
+           for i, size in enumerate((hidden, hidden, hidden, 1536))},
+    }
+    mil = ffn_mil(hidden=hidden, ffn=ffn, s=64, entries=entries)
+
+    # 四段的 K 轴偏移：0 / 2560 / 5120 / 7680
+    for begin in (0, hidden, 2 * hidden, 3 * hidden):
+        assert f"val = tensor<int32, [4]>([0, {begin}, 0, 0])" in mil
+    # 最后一段的切宽 1536 与它那条 conv 的输入通道数
+    assert "val = tensor<int32, [4]>([1, 1536, 1, 64])" in mil
+    assert "tensor<fp16, [2560, 1536, 1, 1]> k3_w = const()" in mil
+    assert "tensor<fp16, [2560, 2560, 1, 1]> k0_w = const()" in mil
+    assert mil.count("conv(") == 6, "gate/up 各一，down 切成 4 段各一"
+    # 四段里没有第五段：多切一段会去读不存在的 down4
+    assert "k4_w" not in mil and "down4" not in mil
+    # 累加链：s1 = y0+y1、s2 = s1+y2、s = s2+y3，最后加残差
+    assert "tensor<fp16, [1, 2560, 1, 64]> s1 = add(x = y0, y = y1)" in mil
+    assert "tensor<fp16, [1, 2560, 1, 64]> s2 = add(x = s1, y = y2)" in mil
+    assert "tensor<fp16, [1, 2560, 1, 64]> s = add(x = s2, y = y3)" in mil
+    assert "tensor<fp16, [1, 2560, 1, 64]> y = add(x = s, y = r)" in mil
+
+
 def test_ffn_mil_requires_every_down_chunk():
     entries = {
         "gate": _entry(shape=(24, 8)),

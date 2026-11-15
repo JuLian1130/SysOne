@@ -1,8 +1,8 @@
 """M2.1 一层三段 ANE 计算的对拍（真 ANE + mude 真权重）。
 
 一层在 ANE 上分三段：投影（`hidden → cout`）、输出投影 + 残差（`core_out + hidden → hidden`）、
-融合 FFN（`2×hidden → hidden`，gate/up 在 ANE 内做 silu×up，down 的 K 维按 `ffn/hidden`
-切段后求和）。`core_out` 是 `o_proj` 的输入行数：2B 恰好等于 `hidden`（所以看起来像
+融合 FFN（`2×hidden → hidden`，gate/up 在 ANE 内做 silu×up，down 的 K 维按 `ffn_segments()`
+切段后求和 —— 每段 `hidden` 列，余数落在最后一段）。`core_out` 是 `o_proj` 的输入行数：2B 恰好等于 `hidden`（所以看起来像
 `2×hidden`），4B 是 4096 ≠ 2560。判据比 docs 的端到端阈值（2.5e-2）严，因为这里只测一段、且参考用的是
 **ANE 实际读到的同一份反量化权重** —— 量化误差不混进来，留到 M2.2 的 20 层链。
 """
@@ -20,14 +20,15 @@ from sysone.devices.apple.compile import (
     AneProgram,
     SurfaceSet,
     ffn_mil,
-    ffn_parts,
+    ffn_segments,
     layer_mil,
     out_mil,
     projection_mil,
     write_program,
 )
 from sysone.devices.apple.runtime import AneRuntime
-from sysone.errors import ConfigError
+from sysone.domain.attention import AttentionRole
+from sysone.models.families.mude import ane_layer_segments
 from sysone.weights.packing import ane_blob
 from sysone.weights.store import SafeTensorFile
 
@@ -136,9 +137,10 @@ def test_out_projection_matches_numpy(tmp_path: Path) -> None:
 def test_out_projection_at_the_4b_width_matches_numpy(tmp_path: Path) -> None:
     """4B 宽度的 out program（`[4096 | 2560] → 2560`）在 ANE 上真算一遍。
 
-    权重是**合成的**：h2o 的 checkpoint 还是 row-int8（G4 未做），读不成 ANE blob。所以这条
-    只钉**program 形状与切片语义**，不钉那份模型。参考口径与 mude 那条一样 —— 用 ANE 实际
-    读到的那份反量化权重，量化误差不混进来。
+    权重是**合成的**：h2o 的检查点虽然已经能按 row-int8 读（票据 15 §14），但整链还装不进
+    `MudeChain`（线性层的头扩张与 FFN 之外的装载假设未做），所以这条只钉 **program 形状与
+    切片语义**，不钉那份模型。参考口径与 mude 那条一样 —— 用 ANE 实际读到的那份反量化权重，
+    量化误差不混进来。
     """
     hidden, core_out = 2560, 4096
     rng = np.random.default_rng(29)
@@ -166,15 +168,70 @@ def test_out_projection_at_the_4b_width_matches_numpy(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
+def test_the_4b_layer_program_runs_with_an_uneven_ffn_split(tmp_path: Path) -> None:
+    """h2o 的整层 program 在 ANE 上真跑一遍：12352 行投影、`[4096|2560]` out、四段 FFN。
+
+    条目表用**生产路径的那一份**（`mude.ane_layer_segments`），所以这条同时钉住三件事：
+    4B 的 9216/2560 真的切成了 2560/2560/2560/1536、最后一段的窄 conv 被 ANE 接受、
+    四段分别算完累加出来的就是 `down @ h`。权重是合成的（h2o 整链还装不进 `MudeChain`）。
+    """
+    hidden, ffn, core_out, cout = 2560, 9216, 4096, 12352
+    segments = ane_layer_segments(layer=0, layer_type=AttentionRole.LINEAR,
+                                 hidden=hidden, ffn=ffn)
+    down = {name: columns[0][1] for name, columns in segments.items()
+            if name.startswith("down")}
+    assert [columns.stop - columns.start for columns in down.values()] == [2560, 2560, 2560, 1536]
+
+    rng = np.random.default_rng(31)
+
+    def matrix(rows: int, cols: int) -> np.ndarray:
+        return (rng.standard_normal((rows, cols)) * 0.05).astype(np.float16)
+
+    weights = {
+        "proj": matrix(cout, hidden), "o": matrix(hidden, core_out),
+        "gate": matrix(ffn, hidden), "up": matrix(ffn, hidden),
+        **{name: matrix(hidden, columns.stop - columns.start) for name, columns in down.items()},
+    }
+    blob, entries = ane_blob.build(weights, quantize=True)
+    mil = layer_mil(hidden=hidden, core_out=core_out, cout=cout, ffn=ffn, s=S, entries=entries)
+    files = write_program(tmp_path / "layer0_4b", mil=mil, blob=blob, s=S,
+                          meta={"case": "m21-layer-4b"})
+
+    x = rng.standard_normal((hidden, S)).astype(np.float16)
+    v = rng.standard_normal((core_out, S)).astype(np.float16)
+    r = rng.standard_normal((hidden, S)).astype(np.float16)
+
+    runtime = AneRuntime()
+    layer = AneLayer(runtime, files, name="m21_layer_4b", hidden=hidden, core_out=core_out,
+                     cout=cout, ffn=ffn, s=S)
+    try:
+        y_proj, _ = layer.project(x)
+        y_out, _ = layer.output(v, r)
+        y_ffn, _ = layer.feed_forward(x, r)
+    finally:
+        layer.close()
+        runtime.close()
+
+    w = {name: ane_blob.quant_per_channel(weight).dequant.astype(np.float32)
+         for name, weight in weights.items()}
+    assert _rel_l2(y_proj, w["proj"] @ x.astype(np.float32)) < PROJ_BUDGET
+    assert _rel_l2(y_out, w["o"] @ v.astype(np.float32) + r.astype(np.float32)) < OUT_BUDGET
+    h = (_silu(w["gate"] @ x.astype(np.float32)) * (w["up"] @ x.astype(np.float32))).astype(np.float16)
+    accumulated = np.zeros((hidden, S), dtype=np.float32)
+    for name, columns in down.items():
+        accumulated += w[name] @ h[columns].astype(np.float32)
+    assert _rel_l2(y_ffn, accumulated + r.astype(np.float32)) < FFN_BUDGET
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
 def test_ffn_matches_numpy(tmp_path: Path) -> None:
     gate_w = _load([GATE])[GATE]
     up_w = _load([UP])[UP]
     down_w = _load([DOWN])[DOWN]
     hidden = gate_w.shape[1]
     ffn = down_w.shape[1]
-    parts = ffn_parts(hidden, ffn)
-    assert parts == ffn // hidden
-    chunks = [down_w[:, i * hidden:(i + 1) * hidden] for i in range(parts)]
+    segments = ffn_segments(hidden, ffn)
+    chunks = [down_w[:, columns] for columns in segments]
 
     rng = np.random.default_rng(13)
     xn = rng.standard_normal((hidden, S)).astype(np.float16)  # 归一化后的 hidden
@@ -200,16 +257,17 @@ def test_ffn_matches_numpy(tmp_path: Path) -> None:
     h32 = _silu(gate @ xn.astype(np.float32)) * (up @ xn.astype(np.float32))
     h16 = h32.astype(np.float16)
     accumulated = np.zeros((hidden, S), dtype=np.float32)
-    for i, chunk in enumerate(down):
-        accumulated += chunk @ h16[i * hidden:(i + 1) * hidden].astype(np.float32)
+    for chunk, columns in zip(down, segments):
+        accumulated += chunk @ h16[columns].astype(np.float32)
     reference = (accumulated + r.astype(np.float32)).astype(np.float16)
 
     rel = _rel_l2(y, reference)
     assert rel < FFN_BUDGET, f"relL2 {rel:.2e} 超过 {FFN_BUDGET}"
 
 
-def test_ffn_parts_is_three_for_mude_geometry() -> None:
-    assert ffn_parts(2048, 6144) == 3
+def test_ffn_is_cut_into_equal_parts_for_mude_geometry() -> None:
+    segments = ffn_segments(2048, 6144)
+    assert [columns.stop - columns.start for columns in segments] == [2048, 2048, 2048]
 
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
@@ -240,8 +298,8 @@ def test_split_projection_matches_numpy(tmp_path: Path) -> None:
         "proj_q": proj[:q_rows], "proj_kv": proj[q_rows:],
         "o": w[rest[0]], "gate": w[rest[1]], "up": w[rest[2]],
     }
-    entries.update({f"down{i}": w[rest[3]][:, i * hidden:(i + 1) * hidden]
-                    for i in range(ffn_parts(hidden, ffn))})
+    entries.update({f"down{i}": w[rest[3]][:, columns]
+                    for i, columns in enumerate(ffn_segments(hidden, ffn))})
 
     blob, blob_entries = ane_blob.build(entries, quantize=True)
     mil = layer_mil(hidden=hidden, core_out=hidden, cout=q_rows + kv_rows, ffn=ffn, s=S,
@@ -302,7 +360,7 @@ def test_fused_layer_program_runs_three_procedures(tmp_path: Path) -> None:
     assert proj.shape[0] == 8224
     hidden, cout = proj.shape[1], proj.shape[0]
     ffn = w[DOWN].shape[1]
-    chunks = [w[DOWN][:, i * hidden:(i + 1) * hidden] for i in range(ffn_parts(hidden, ffn))]
+    chunks = [w[DOWN][:, columns] for columns in ffn_segments(hidden, ffn)]
 
     items = {"proj": proj, "o": w[OUT], "gate": w[GATE], "up": w[UP]}
     items.update({f"down{i}": c for i, c in enumerate(chunks)})
@@ -351,12 +409,14 @@ def test_fused_layer_program_runs_three_procedures(tmp_path: Path) -> None:
     assert y_proj.shape == (cout, S) and y_out.shape == (hidden, S) and y_ffn.shape == (hidden, S)
 
 
-def test_ffn_parts_rejects_4b_geometry() -> None:
-    """4B 是 9216/2560=3.6，需要变长切分；M2 只做 mude，这里必须显式失败。"""
-    with pytest.raises(ConfigError) as excinfo:
-        ffn_parts(2560, 9216)
-    assert excinfo.value.context["hidden"] == 2560
-    assert excinfo.value.context["ffn"] == 9216
+def test_ffn_is_cut_into_three_parts_and_a_tail_for_4b_geometry() -> None:
+    """9216/2560 = 3.6：三段等长的加一段 1536，覆盖整个 K 维。
+
+    段长不齐是 ANE 的输入事实（实测收），所以这里不再是"必须整除"的拒绝，而是钉住切法。
+    """
+    segments = ffn_segments(2560, 9216)
+    assert [columns.stop - columns.start for columns in segments] == [2560, 2560, 2560, 1536]
+    assert sum(columns.stop - columns.start for columns in segments) == 9216
 
 
 def test_program_files_are_reused_on_second_write(tmp_path: Path) -> None:
@@ -380,7 +440,7 @@ def test_pool_slots_and_async_eval(tmp_path: Path) -> None:
     """
     # 几何要落在 ANE 肯跑的范围内：通道数太窄（如 hidden=8 / ffn=24）时 ANE 会在
     # `evaluate` 阶段直接报 `Program Inference error`（status=0x1d）。这里取 64/192/64，
-    # `ffn_parts(64, 192) == 3` 刚好覆盖 down 的三段切片。
+    # `ffn_segments(64, 192)` 刚好三段等长，覆盖 down 的三段切片。
     hidden, ffn, cout, s = 64, 192, 64, 64
     rng = np.random.default_rng(3)
     items = {
@@ -388,8 +448,8 @@ def test_pool_slots_and_async_eval(tmp_path: Path) -> None:
         "o": rng.standard_normal((hidden, hidden)).astype(np.float16),
         "gate": rng.standard_normal((ffn, hidden)).astype(np.float16),
         "up": rng.standard_normal((ffn, hidden)).astype(np.float16),
-        **{f"down{i}": rng.standard_normal((hidden, hidden)).astype(np.float16)
-           for i in range(ffn_parts(hidden, ffn))},
+        **{f"down{i}": rng.standard_normal((hidden, columns.stop - columns.start)).astype(np.float16)
+           for i, columns in enumerate(ffn_segments(hidden, ffn))},
     }
     blob, entries = ane_blob.build(items, quantize=False)
     mil = layer_mil(hidden=hidden, core_out=hidden, cout=cout, ffn=ffn, s=s,

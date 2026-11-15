@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from sysone.domain.attention import AttentionRole
-from sysone.domain.work import ffn_parts
+from sysone.domain.work import ffn_segments
 from sysone.models.families import mude
 
 HIDDEN, FFN = 2048, 6144
@@ -52,14 +52,31 @@ def _full_shapes(layer: int) -> dict[str, tuple[int, ...]]:
     }
 
 
+def _linear_shapes_4b(layer: int) -> dict[str, tuple[int, ...]]:
+    """h2o 的线性层：hidden 2560，value 头 32×128 = 4096，ffn 9216。"""
+    hidden = 2560
+    base = f"language_model.layers.{layer}"
+    attn = f"{base}.linear_attn"
+    return {
+        f"{attn}.in_proj_qkv.weight": (8192, hidden),     # qk 2048 + v 4096 + 2×1024 卷积窗
+        f"{attn}.in_proj_z.weight": (4096, hidden),
+        f"{attn}.in_proj_a.weight": (32, hidden),
+        f"{attn}.in_proj_b.weight": (32, hidden),
+        f"{attn}.out_proj.weight": (hidden, 4096),
+        f"{base}.mlp.gate_proj.weight": (9216, hidden),
+        f"{base}.mlp.up_proj.weight": (9216, hidden),
+        f"{base}.mlp.down_proj.weight": (hidden, 9216),
+    }
+
+
 def test_linear_layer_projection_is_8224_rows():
     entries = mude.ane_layer_weights(_fake_read(_linear_shapes(0)), layer=0,
                                      layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN)
     assert entries["proj"].shape == (8224, HIDDEN), "qkv 6144 + z 2048 + a 16 + b 16"
     assert entries["o"].shape == (HIDDEN, HIDDEN)
     assert entries["gate"].shape == entries["up"].shape == (FFN, HIDDEN)
-    parts = ffn_parts(HIDDEN, FFN)
-    assert parts == 3
+    segments = ffn_segments(HIDDEN, FFN)
+    assert [columns.stop - columns.start for columns in segments] == [HIDDEN] * 3
     assert entries["down0"].shape == entries["down1"].shape == entries["down2"].shape == (HIDDEN, HIDDEN)
 
 
@@ -109,7 +126,9 @@ def test_quantized_layer_takes_the_containers_codes():
     assert np.array_equal(codes[0], np.where(np.arange(HIDDEN) % 2 == 0, 1, -1))
     np.testing.assert_array_equal(scales, np.full(HIDDEN, 0.0625, dtype=np.float16))
     # 三段按列拼回去还是那张棋盘格。
-    rebuilt = np.concatenate([entries[f"down{i}"][0] for i in range(ffn_parts(HIDDEN, FFN))], axis=1)
+    rebuilt = np.concatenate(
+        [entries[f"down{i}"][0] for i in range(len(ffn_segments(HIDDEN, FFN)))], axis=1
+    )
     np.testing.assert_array_equal(
         rebuilt,
         np.where((np.arange(HIDDEN)[:, None] + np.arange(FFN)[None, :]) % 2 == 0, 1, -1),
@@ -148,7 +167,18 @@ def test_the_checkpoint_needs_the_plus_one_norm_offset():
     assert mude.NORM_OFFSET == 1.0
 
 
-def test_4b_geometry_is_rejected_by_the_shared_rule():
-    with pytest.raises(Exception) as excinfo:
-        ffn_parts(2560, 9216)
-    assert "整除" in str(excinfo.value)
+def test_4b_geometry_splits_the_ffn_into_three_full_parts_and_a_tail():
+    """9216/2560 = 3.6：三段 2560 加一段 1536，覆盖整个 K 维。
+
+    段长不齐是 4B 的形状事实，不是可以四舍五入掉的误差 —— 少 0.6 段就是少算 1536 列。
+    """
+    segments = ffn_segments(2560, 9216)
+    assert [columns.stop - columns.start for columns in segments] == [2560, 2560, 2560, 1536]
+    assert [columns.start for columns in segments] == [0, 2560, 5120, 7680]
+    assert segments[-1].stop == 9216
+    entries = mude.ane_layer_weights(_fake_read(_linear_shapes_4b(0)), layer=0,
+                                     layer_type=AttentionRole.LINEAR, hidden=2560, ffn=9216)
+    assert entries["down3"].shape == (2560, 1536)
+    rebuilt = np.concatenate([entries[f"down{i}"] for i in range(4)], axis=1)
+    np.testing.assert_array_equal(rebuilt, _fake_read(_linear_shapes_4b(0))(
+        "language_model.layers.0.mlp.down_proj.weight"))

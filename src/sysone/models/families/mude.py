@@ -10,7 +10,7 @@ import numpy as np
 from ...config import EngineConfig
 from ...domain.attention import AttentionRole, MaskMode
 from ...domain.decision import Question
-from ...domain.work import ffn_parts
+from ...domain.work import ffn_segments
 from ...errors import ConfigError
 from ...weights.packing import ane_blob
 from ..descriptor import ModelDescriptor, ReadoutPlan
@@ -224,8 +224,9 @@ def ane_layer_segments(
     线性层的 `b` 在 `a` 之前，是 Metal 核的约定（`k_gdn` 从 `COUT_GDN-32` 起读 `b`、从
     `COUT_GDN-16` 起读 `a`，见 `docs/ANE/anebench/e8_common.h:29`）；numpy 链按同一顺序读。
 
-    FFN 的 `down_proj` 是 `[hidden, ffn]`，按 `hidden` 切 `ffn_parts()` 段，所以 `down{i}` 切的是
-    **输入**维；`out` 是 `out_proj` / `o_proj`（`[hidden, core_out]`，残差在 program 里加）。
+    FFN 的 `down_proj` 是 `[hidden, ffn]`，按 `ffn_segments()` 切**输入**维（mude 三段等长、
+    4B 最后一段短一截），所以 `down{i}` 切的列区间由那份规则给；`out` 是 `out_proj` / `o_proj`
+    （`[hidden, core_out]`，残差在 program 里加）。
 
     行拼与列切都不动 int8 的标度（量化按输出行），所以这张表对"现量化"和"容器自带码"
     两条路是同一份 —— 两个物化函数都从它出发。
@@ -252,8 +253,8 @@ def ane_layer_segments(
         "up": ((f"{mlp}.up_proj.weight", _ALL),),
     }
     down = f"{mlp}.down_proj.weight"
-    for index in range(ffn_parts(hidden, ffn)):
-        segments[f"down{index}"] = ((down, slice(index * hidden, (index + 1) * hidden)),)
+    for index, columns in enumerate(ffn_segments(hidden, ffn)):
+        segments[f"down{index}"] = ((down, columns),)
     return segments
 
 

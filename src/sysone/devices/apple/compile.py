@@ -27,7 +27,7 @@ from typing import Mapping
 
 import numpy as np
 
-from ...domain.work import ffn_parts  # 规则只有一份，装配（models）与编译（devices）共用
+from ...domain.work import ffn_segments  # 规则只有一份，装配（models）与编译（devices）共用
 from ...errors import ConfigError, NotReadyError
 from ...weights.packing.ane_blob import BlobEntry
 from .runtime import AneRuntime, Surface
@@ -158,8 +158,8 @@ def _out_body(*, hidden: int, core_out: int, s: int, entry: BlobEntry) -> list[s
 
 
 def _ffn_body(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) -> list[str]:
-    parts = ffn_parts(hidden, ffn)
-    missing = [f"down{i}" for i in range(parts) if f"down{i}" not in entries]
+    segments = ffn_segments(hidden, ffn)
+    missing = [f"down{i}" for i in range(len(segments)) if f"down{i}" not in entries]
     if "gate" not in entries or "up" not in entries or missing:
         raise NotReadyError("FFN 权重不全", missing=sorted(set(missing)) or ["gate/up"])
 
@@ -173,13 +173,15 @@ def _ffn_body(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]
            f'        tensor<fp16, [1, {ffn}, 1, {s}]> h = '
            f'mul(x = gs, y = up)[name = string("h")];']
     )
-    for i in range(parts):
-        body += _slice(f"d{i}", begin=i * hidden, size=hidden, s=s, src="h", out=f"h{i}")
-        body += _conv(f"k{i}", cin=hidden, cout=hidden, s=s, entry=entries[f"down{i}"],
+    # 每段一条 conv、各自累加：`down_proj @ h = Σ_i down_i @ h_i`，段长由 `ffn_segments` 定。
+    for i, columns in enumerate(segments):
+        size = columns.stop - columns.start
+        body += _slice(f"d{i}", begin=columns.start, size=size, s=s, src="h", out=f"h{i}")
+        body += _conv(f"k{i}", cin=size, cout=hidden, s=s, entry=entries[f"down{i}"],
                       src=f"h{i}", out=f"y{i}")
     acc = "y0"
-    for i in range(1, parts):
-        nxt = f"s{i}" if i < parts - 1 else "s"
+    for i in range(1, len(segments)):
+        nxt = f"s{i}" if i < len(segments) - 1 else "s"
         body.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> {nxt} = '
                     f'add(x = {acc}, y = y{i})[name = string("{nxt}")];')
         acc = nxt
@@ -209,7 +211,8 @@ def out_mil(*, hidden: int, core_out: int, s: int, entry: BlobEntry) -> str:
 def ffn_mil(*, hidden: int, ffn: int, s: int, entries: Mapping[str, BlobEntry]) -> str:
     """融合 FFN（旧引擎 proc 2）：gate/up → silu×up → K 切分的 down → 残差。
 
-    `entries` 的键是 `gate`、`up`、`down0`..`down{parts-1}`；parts 由 `ffn_parts()` 定。
+    `entries` 的键是 `gate`、`up`、`down0`..`down{n-1}`，切分由 `ffn_segments()` 定
+    （mude 3 段等长 2048；4B 是 2560/2560/2560/1536）。
     """
     if hidden <= 0 or s <= 0:
         raise NotReadyError("MIL 形状必须为正", hidden=hidden, s=s)
