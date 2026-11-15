@@ -109,7 +109,15 @@ def attention(q: np.ndarray, k: np.ndarray, v: np.ndarray, mask: np.ndarray | No
     return np.transpose(np.einsum("hst,htd->hsd", a, vh), (1, 0, 2))
 
 
-def delta_rule(q: np.ndarray, k: np.ndarray, v: np.ndarray, g: np.ndarray, beta: np.ndarray) -> np.ndarray:
+def delta_rule(
+    q: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    g: np.ndarray,
+    beta: np.ndarray,
+    *,
+    repeat: int = 1,
+) -> np.ndarray:
     """chunked gated delta rule，`[S, heads, dim]` 进、`[S, heads, dim]` 出。
 
     逐条对齐 `torch_chunk_gated_delta_rule`：q/k 先 l2norm、q 再乘 `dim**-0.5`；按 64 分块；
@@ -117,11 +125,27 @@ def delta_rule(q: np.ndarray, k: np.ndarray, v: np.ndarray, g: np.ndarray, beta:
     得 `new_values` 与 `k_cumdecay`；块内 `intra = (q @ kᵀ) * pairwise`；逐块
     `v_new = new_values - k_cumdecay @ state`、`out = q @ state + intra @ v_new`、
     `state = state * chunk_decay + kᵀ @ v_new`。
+
+    `repeat > 1` 是参考实现的 `repeat_interleave(q, repeat, dim=1)`：v 的头数是 k 的
+    `repeat` 倍（h2o 是 32 vs 16），q/k 每一头供 `repeat` 个 v 头共用。`g` 与 `beta` 是
+    **按 v 头**给的（`A_log` / `dt_bias` / `in_proj_b` / `in_proj_a` 都是 v 头宽），所以只展开
+    q 与 k，不碰它们。Metal 核里这一步由寻址隐含完成（`E8G_R`，见 `e8_gdn.metal`）。
     """
     q, k, v = (np.asarray(t, dtype=np.float32) for t in (q, k, v))
-    s_len, heads, dim = q.shape
+    s_len, keys, dim = q.shape
+    if q.shape != k.shape or v.ndim != 3:
+        raise ValueError(f"delta_rule 的 q/k/v 形状不配对：{q.shape} / {k.shape} / {v.shape}")
+    if int(repeat) < 1 or v.shape[1] != keys * int(repeat):
+        raise ValueError(
+            f"v 头数 {v.shape[1]} 与 k 头数 {keys}×repeat={int(repeat)} 不一致"
+        )
+    v_heads = v.shape[1]
     q = l2norm(q) * (dim ** -0.5)
     k = l2norm(k)
+    if int(repeat) > 1:
+        q = np.repeat(q, int(repeat), axis=1)
+        k = np.repeat(k, int(repeat), axis=1)
+    heads = v_heads
     g = np.asarray(g, dtype=np.float32)
     beta = np.asarray(beta, dtype=np.float32)
 

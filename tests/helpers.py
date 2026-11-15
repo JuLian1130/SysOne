@@ -69,6 +69,127 @@ def write_row_int8_checkpoint(
     return directory
 
 
+
+def make_mude_checkpoint(
+    directory: Path,
+    *,
+    hidden: int = 256,
+    ffn: int = 768,
+    q_heads: int = 2,
+    kv_heads: int = 1,
+    head_dim: int = 256,
+    l_k_heads: int = 2,
+    l_k_dim: int = 128,
+    l_v_heads: int = 4,
+    l_v_dim: int = 128,
+    conv_k: int = 4,
+    vocab: int = 512,
+    layers: tuple[str, ...] = ("linear_attention", "full_attention"),
+    code_rows: int = 255,
+    seed: int = 0,
+) -> Path:
+    """造一个 mude 链形状的检查点目录（`config.json` + 权重 + 题面配置 + 读出表）。
+
+    默认几何刻意选成 **4B 的形状关系**：`qk_dim = 256`、`value_dim = 512`（v 头 4 个对
+    k 头 2 个），`core_out = q_heads × head_dim = 2 × 256` 等于 `value_dim` —— 与 h2o 一样
+    是 `2 × qk + value` 的卷积宽度，且 **v 头数是 k 头数的两倍**（`repeat_interleave` 那条
+    路才真的被走到）。`core_out == value_dim` 是几何的硬约束（两种层共用一套 out program）。
+
+    两个头维不能随便改，两个核都按 128 / 256 排过：
+    - GDN 的 `l_k_dim` / `l_v_dim` 必须是 128（`e8_gdn.metal:109`，线程几何按 128 排）；
+    - 全注意力的 `head_dim` 必须是 256（`e8_attn.metal` 的 `q_0..q_31` 分片偏移按 256 排）。
+    mude 与 h2o 两两都满足，所以这不是缺口，但夹具换个头维就会炸（或更糟：静默算错）。
+    """
+    rng = np.random.default_rng(seed)
+    directory.mkdir(parents=True, exist_ok=True)
+    assert q_heads * head_dim == l_v_heads * l_v_dim, "core_out 必须等于 value_dim"
+
+    def matrix(rows: int, cols: int) -> np.ndarray:
+        return (rng.standard_normal((rows, cols)) * 0.05).astype(np.float16)
+
+    def vector(size: int, *, positive: bool = False) -> np.ndarray:
+        values = rng.standard_normal(size) * 0.05
+        return (np.abs(values) if positive else values).astype(np.float16)
+
+    qk, value = l_k_heads * l_k_dim, l_v_heads * l_v_dim
+    weights: dict[str, np.ndarray] = {
+        "language_model.embed_tokens.weight": matrix(vocab, hidden),
+        # norm 是零中心存的（家族递 `NORM_OFFSET = 1.0`），所以这里给 0 附近的值。
+        "language_model.norm.weight": vector(hidden),
+    }
+    for index, kind in enumerate(layers):
+        base = f"language_model.layers.{index}"
+        weights[f"{base}.input_layernorm.weight"] = vector(hidden)
+        weights[f"{base}.post_attention_layernorm.weight"] = vector(hidden)
+        weights[f"{base}.mlp.gate_proj.weight"] = matrix(ffn, hidden)
+        weights[f"{base}.mlp.up_proj.weight"] = matrix(ffn, hidden)
+        weights[f"{base}.mlp.down_proj.weight"] = matrix(hidden, ffn)
+        if kind == "linear_attention":
+            attn = f"{base}.linear_attn"
+            weights[f"{attn}.in_proj_qkv.weight"] = matrix(2 * qk + value, hidden)
+            weights[f"{attn}.in_proj_z.weight"] = matrix(value, hidden)
+            weights[f"{attn}.in_proj_b.weight"] = matrix(l_v_heads, hidden)
+            weights[f"{attn}.in_proj_a.weight"] = matrix(l_v_heads, hidden)
+            weights[f"{attn}.out_proj.weight"] = matrix(hidden, value)
+            weights[f"{attn}.conv1d.weight"] = (
+                rng.standard_normal((2 * qk + value, 1, conv_k)) * 0.05
+            ).astype(np.float16)
+            weights[f"{attn}.A_log"] = rng.standard_normal(l_v_heads).astype(np.float32)
+            weights[f"{attn}.dt_bias"] = vector(l_v_heads)
+            weights[f"{attn}.norm.weight"] = vector(l_v_dim, positive=True) + 0.5
+        else:
+            attn = f"{base}.self_attn"
+            weights[f"{attn}.q_proj.weight"] = matrix(2 * q_heads * head_dim, hidden)
+            weights[f"{attn}.k_proj.weight"] = matrix(kv_heads * head_dim, hidden)
+            weights[f"{attn}.v_proj.weight"] = matrix(kv_heads * head_dim, hidden)
+            weights[f"{attn}.o_proj.weight"] = matrix(hidden, q_heads * head_dim)
+            weights[f"{attn}.q_norm.weight"] = vector(head_dim)
+            weights[f"{attn}.k_norm.weight"] = vector(head_dim)
+
+    header: dict[str, dict[str, object]] = {}
+    chunks: list[bytes] = []
+    offset = 0
+    for name, array in weights.items():
+        data = np.ascontiguousarray(array).tobytes()
+        header[name] = {
+            "dtype": {np.dtype(np.float32): "F32", np.dtype(np.float16): "F16"}[array.dtype],
+            "shape": list(array.shape),
+            "data_offsets": [offset, offset + len(data)],
+        }
+        chunks.append(data)
+        offset += len(data)
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    (directory / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded + b"".join(chunks)
+    )
+
+    config = {
+        "text_config": {
+            "hidden_size": hidden,
+            "intermediate_size": ffn,
+            "num_attention_heads": q_heads,
+            "num_key_value_heads": kv_heads,
+            "head_dim": head_dim,
+            "num_hidden_layers": len(layers),
+            "layer_types": list(layers),
+            "linear_num_key_heads": l_k_heads,
+            "linear_key_head_dim": l_k_dim,
+            "linear_num_value_heads": l_v_heads,
+            "linear_value_head_dim": l_v_dim,
+            "linear_conv_kernel_dim": conv_k,
+            "rope_parameters": {"rope_theta": 10_000.0, "partial_rotary_factor": 0.25},
+            "max_position_embeddings": 4096,
+        }
+    }
+    (directory / "config.json").write_text(json.dumps(config), "utf-8")
+    (directory / "decision_config.json").write_text(json.dumps({"temperature": 1.0}), "utf-8")
+    write_safetensors(
+        directory / "readout.safetensors",
+        {"weight": (rng.standard_normal((code_rows, hidden)) * 0.05).astype(np.float32)},
+    )
+    return directory
+
+
 def tiny_weights(descriptor: ModelDescriptor, seed: int = 0) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
 

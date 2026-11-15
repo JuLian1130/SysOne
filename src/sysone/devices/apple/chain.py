@@ -96,16 +96,9 @@ class MudeChain:
         temperature: float,
         cos: np.ndarray,
         sin: np.ndarray,
-        hidden: int,
-        core_out: int,
+        geometry: Geometry,
         s: int,
         width: int,
-        heads: int,
-        kv_heads: int,
-        head_dim: int,
-        rotary_dim: int,
-        linear_heads: int,
-        linear_dim: int,
         own_runtime: bool = True,
         pipeline: object | None = None,
         pool: list[SurfaceSet] | None = None,
@@ -128,17 +121,12 @@ class MudeChain:
         self._temperature = float(temperature)
         self._cos = cos
         self._sin = sin
-        self._hidden = int(hidden)
-        self._core_out = int(core_out)
+        # 形状只有一个来源：几何对象。它同时被 MIL 生成、缓冲分配与下面这些 numpy 段用，
+        # 抄成局部标量就会有两份真相（GDN 的 v 头数就曾经这样被写死成 k 头数）。
+        self._geometry = geometry
         self._s = int(s)
         # GPU 侧缓冲的列数（= 一轮要算的 token 总数）；numpy 链把它当画布宽度用。
         self._width = int(width)
-        self._heads = int(heads)
-        self._kv_heads = int(kv_heads)
-        self._head_dim = int(head_dim)
-        self._rotary_dim = int(rotary_dim)
-        self._linear_heads = int(linear_heads)
-        self._linear_dim = int(linear_dim)
         self._closed = False
 
     # ------------------------------------------------------------------ 加载
@@ -202,11 +190,10 @@ class MudeChain:
         rotary_dim = int(head_dim * float(rope.get("partial_rotary_factor", 1.0)))
         linear_heads = int(text["linear_num_key_heads"])
         linear_dim = int(text["linear_key_head_dim"])
-        # GDN 的 q/k 与 v 在这里同头数同头维，所以不用 repeat_interleave（参考实现里那一步恒等）。
-        if int(text.get("linear_num_value_heads", linear_heads)) != linear_heads:
-            raise ValueError("GDN 的 v 头数与 k 头数不同，当前实现没做 repeat_interleave")
-        if int(text.get("linear_value_head_dim", linear_dim)) != linear_dim:
-            raise ValueError("GDN 的 v 头维与 k 头维不同，当前实现没做 repeat_interleave")
+        # v 的头数与头维不一定等于 k 的：h2o 是 32×128 对 16×128，`repeat_interleave` 那一步
+        # 在 `ops.delta_rule(repeat=...)` 与 Metal 核的寻址里都做了。
+        linear_v_heads = int(text.get("linear_num_value_heads", linear_heads))
+        linear_v_dim = int(text.get("linear_value_head_dim", linear_dim))
         # 设备侧的形状只从这里取（architecture.md §13 R1）：MIL 生成、缓冲分配、kernel 网格。
         geometry = Geometry(
             hid=hidden,
@@ -217,8 +204,8 @@ class MudeChain:
             rotary_dim=rotary_dim,
             l_k_heads=linear_heads,
             l_k_dim=linear_dim,
-            l_v_heads=linear_heads,
-            l_v_dim=linear_dim,
+            l_v_heads=linear_v_heads,
+            l_v_dim=linear_v_dim,
             conv_k=int(text.get("linear_conv_kernel_dim", 4) or 4),
         )
         geometry.validate()
@@ -317,9 +304,7 @@ class MudeChain:
             runtime=runtime, layers=layers, params=params, roles=roles, store=store,
             embed_name="language_model.embed_tokens.weight", final_norm=final_norm,
             readout=readout, temperature=temperature, cos=cos, sin=sin,
-            hidden=hidden, core_out=geometry.core_out, s=s, width=width,
-            heads=heads, kv_heads=kv_heads, head_dim=head_dim,
-            rotary_dim=rotary_dim, linear_heads=linear_heads, linear_dim=linear_dim,
+            geometry=geometry, s=s, width=width,
             own_runtime=own_runtime, pipeline=pipeline, pool=pool,
             own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
         )
@@ -355,13 +340,13 @@ class MudeChain:
             if trace is not None or debug is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace 或 debug（中间量留在面上）",
                                  hint="用 metal=False 的 numpy 链做逐层对拍")
-            embed = _place(self._store.read_rows(self._embed_name, ids), self._hidden,
+            embed = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid,
                            self._width)
             self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix,
                                causal=causal)
             final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
             return self._readout @ final
-        x = _place(self._store.read_rows(self._embed_name, ids), self._hidden, self._width)
+        x = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid, self._width)
         if trace is not None:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
             # 任何一层跑偏都能定位到该层本身而不是前一层。
@@ -483,7 +468,7 @@ class MudeChain:
         xn = _rms(x, params["input_norm"])
         projected, _ = layer.project(xn)
         p = projected.T.astype(np.float32)                 # [s, 5120]，多出的列是 padding
-        heads, kv_heads, head_dim = self._heads, self._kv_heads, self._head_dim
+        heads, kv_heads, head_dim = self._geometry.q_heads, self._geometry.kv_heads, self._geometry.head_dim
         q_rows = heads * head_dim * 2
         k_rows = kv_heads * head_dim
         # q_proj 的行是每个 head 的 [q(head_dim) | gate(head_dim)] 交错排列。
@@ -493,8 +478,8 @@ class MudeChain:
         key = rms_norm(p[:length, q_rows:q_rows + k_rows].reshape(length, kv_heads, head_dim),
                        params["k_norm"])
         value = p[:length, q_rows + k_rows:q_rows + 2 * k_rows].reshape(length, kv_heads, head_dim)
-        query = apply_rotary(query, cos, sin, rotary_dim=self._rotary_dim)
-        key = apply_rotary(key, cos, sin, rotary_dim=self._rotary_dim)
+        query = apply_rotary(query, cos, sin, rotary_dim=self._geometry.rotary_dim)
+        key = apply_rotary(key, cos, sin, rotary_dim=self._geometry.rotary_dim)
         repeat = heads // kv_heads
         key = np.repeat(key, repeat, axis=1)
         value = np.repeat(value, repeat, axis=1)
@@ -505,7 +490,7 @@ class MudeChain:
         keys = np.arange(length)[None, :]
         mask = keys <= queries if causal else (queries >= prefix) | (keys < prefix)
         context = attention(query, key, value, mask).reshape(length, heads * head_dim)
-        y, _ = layer.output(_place(context * sigmoid(gate), self._core_out, self._s), x)
+        y, _ = layer.output(_place(context * sigmoid(gate), self._geometry.core_out, self._s), x)
         xn2 = _rms(y, params["post_norm"])
         return layer.feed_forward(xn2, y)[0]
 
@@ -517,30 +502,40 @@ class MudeChain:
         length: int,
         debug: dict | None = None,
     ) -> np.ndarray:
-        """线性注意力层（GDN）：depthwise 因果卷积 → q/k/v → chunked delta rule → 门控 norm。"""
+        """线性注意力层（GDN）：depthwise 因果卷积 → q/k/v → chunked delta rule → 门控 norm。
+
+        投影的行序是 `[qkv(conv_dim) | z(value_dim) | b(l_v_heads) | a(l_v_heads)]`（`b` 在 `a`
+        之前，见 `e8_common.h:29`）。三段的宽度**都来自几何**：2B 上 `qk_dim = value_dim = 2048`
+        所以 q/k/v 三段等长、`z` 也恰好 2048，按 `hidden` 写死碰巧对；4B 是 qk 2048、v 4096，
+        写死就会把 v 的后 2048 行读成 z。
+        """
+        geom = self._geometry
         xn = _rms(x, params["input_norm"])
         projected, _ = layer.project(xn)
-        p = projected.T.astype(np.float32)                 # [s, 8224]
-        heads, dim = self._linear_heads, self._linear_dim
-        conv_rows = 3 * heads * dim                        # q丨k丨v，各 2048
-        mixed = causal_depthwise_conv(p[:length, :conv_rows], params["conv"])   # 已过 silu
-        query = mixed[:, :heads * dim].reshape(length, heads, dim)
-        key = mixed[:, heads * dim:2 * heads * dim].reshape(length, heads, dim)
-        value = mixed[:, 2 * heads * dim:].reshape(length, heads, dim)
-        z = p[:length, conv_rows:conv_rows + self._hidden].reshape(length, heads, dim)
-        # 投影行序与 Metal 核一致：`[qkv丨z丨b丨a]`（`b` 在 `a` 之前，见 `e8_common.h:29`）。
-        b = p[:length, conv_rows + self._hidden:conv_rows + self._hidden + heads]
-        a = p[:length, conv_rows + self._hidden + heads:conv_rows + self._hidden + 2 * heads]
+        p = projected.T.astype(np.float32)                 # [s, cout_gdn]
+        mixed = causal_depthwise_conv(p[:length, :geom.conv_dim], params["conv"])  # 已过 silu
+        qk, v_dim = geom.qk_dim, geom.value_dim
+        query = mixed[:, :qk].reshape(length, geom.l_k_heads, geom.l_k_dim)
+        key = mixed[:, qk:2 * qk].reshape(length, geom.l_k_heads, geom.l_k_dim)
+        value = mixed[:, 2 * qk:].reshape(length, geom.l_v_heads, geom.l_v_dim)
+        head = geom.l_v_heads                              # `z` 与 `b` / `a` 都按 v 头走
+        z = p[:length, geom.conv_dim:geom.conv_dim + v_dim].reshape(length, head, geom.l_v_dim)
+        base = geom.conv_dim + v_dim
+        b = p[:length, base:base + head]
+        a = p[:length, base + head:base + 2 * head]
         beta = sigmoid(b)
         g = -np.exp(params["a_log"]) * softplus(a + params["dt_bias"])
-        core = delta_rule(query, key, value, g, beta)      # [L, heads, dim]
+        core = delta_rule(query, key, value, g, beta,
+                          repeat=head // geom.l_k_heads)   # [L, v_heads, v_dim]
         # 门控 norm 是按头做的：参考实现在 [S*heads, dim] 上归一化，不能摊平成 [S, hidden]。
-        gated = rms_norm_gated(core.reshape(length * heads, dim), z.reshape(length * heads, dim),
-                               params["norm"]).reshape(length, heads * dim)
-        y, _ = layer.output(_place(gated, self._core_out, self._s), x)
+        gated = rms_norm_gated(core.reshape(length * head, geom.l_v_dim),
+                               z.reshape(length * head, geom.l_v_dim),
+                               params["norm"]).reshape(length, v_dim)
+        y, _ = layer.output(_place(gated, geom.core_out, self._s), x)
         xn2 = _rms(y, params["post_norm"])
         if debug is not None:
-            debug.update(xn=xn, projected=p, mixed=mixed, z=p[:length, conv_rows:conv_rows + self._hidden],
+            debug.update(xn=xn, projected=p, mixed=mixed,
+                         z=p[:length, geom.conv_dim:geom.conv_dim + v_dim],
                          a=a, b=b, beta=beta, g=g, core=core, gated=gated, y=y, xn2=xn2)
         return layer.feed_forward(xn2, y)[0]
 
