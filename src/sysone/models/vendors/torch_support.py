@@ -3,11 +3,19 @@
 这样 4B 的 bf16 常驻（约 9.3 GB）从不出现在内存里：权重以 int8 码表 + 每行
 fp32 scale 的形式常驻，反量化发生在每次前向的线性层里。
 
+两条都对着实测定的（`.scratch/mem_budget_h2o.py`）：
+
+- **`skip_prefixes` 是"整块不装"，不是"缺了就算"**。视觉塔在纯文本 prefill 里一次都不碰，
+  但它在权重文件里存在，于是"只在缺失时跳过"会把 0.62 GiB 白填进设备；
+- **上传不复制**。`read_raw` 给的是只读的 mmap 视图，旧实现为了可写先 `copy()` 一份，
+  32 层 / 3.3 GiB 的一趟实测多花 45 % 的时间（`.scratch/stream_cost_h2o.py`）。
+
 只被 vendor 桥 import，核心面（`tests/unit/test_import_light.py`）不碰 torch。
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -89,11 +97,35 @@ def _assign(module: torch.nn.Module, name: str, tensor: torch.Tensor, *, param: 
         module._buffers[name] = tensor
 
 
-def _to(tensor: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+_NP_TO_TORCH = {
+    np.dtype(np.int8): torch.int8,
+    np.dtype(np.uint8): torch.uint8,
+    np.dtype(np.int16): torch.int16,
+    np.dtype(np.float16): torch.float16,
+    np.dtype(np.float32): torch.float32,
+    np.dtype(np.float64): torch.float64,
+}
+
+
+def _view(tensor: np.ndarray) -> torch.Tensor:
+    """零拷贝把 numpy 缓冲交给 torch —— 只读的 mmap 视图也能直接看。
+
+    `torch.frombuffer` 收不可写缓冲时会警告"你能写进这块只读内存"。我们不写（只做 dtype
+    转换与上传），所以就地屏蔽那条警告；换来的是一整趟装载少一次 host 拷贝。
+    """
     array = np.ascontiguousarray(tensor)
-    if not array.flags.writeable:  # mmap 读出来的视图，torch 需要可写缓冲
-        array = array.copy()
-    return torch.from_numpy(array).to(device=device, dtype=dtype)
+    target = _NP_TO_TORCH.get(array.dtype)
+    if target is None:
+        raise ConfigError("torch 侧不认识的 numpy dtype", dtype=str(array.dtype))
+    flat = array.reshape(-1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        view = torch.frombuffer(flat.data, dtype=target, count=int(flat.size))
+    return view.view(tuple(array.shape))
+
+
+def _to(tensor: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return _view(tensor).to(device=device, dtype=dtype)
 
 
 def fill_model(
@@ -107,9 +139,9 @@ def fill_model(
 ) -> torch.nn.Module:
     """用 int8 码表与 keep 张量就地填满 meta 模型。
 
-    线性层的权重换成 `Int8Linear`；其余参数与 buffer 逐个赋值。缺失的张量如果
-    落在 `skip_prefixes`（视觉塔、MTP 草稿模块）下就跳过——纯文本、单次 prefill
-    前向不会碰它们——否则按缺失张量报错。
+    线性层的权重换成 `Int8Linear`；其余参数与 buffer 逐个赋值。落在 `skip_prefixes`
+    下的张量**整块不装**（视觉塔、MTP 草稿模块，纯文本 prefill 一次都不碰）——它们留在
+    meta 上，权重文件里有也不填；其余张量缺失则按缺失张量报错。
     """
     modules = dict(model.named_modules())
     handled: set[str] = set()
@@ -118,13 +150,13 @@ def fill_model(
     for entry_name in store.manifest.quantized():
         if not entry_name.endswith(".weight"):
             continue
+        if entry_name.startswith(skip_prefixes):
+            continue
         module_path = entry_name[: -len(".weight")]
         parent_path, _, leaf = module_path.rpartition(".")
         parent = modules.get(parent_path)
         module = modules.get(module_path)
         if parent is None or module is None:
-            if entry_name.startswith(skip_prefixes):
-                continue
             raise ConfigError("权重名对不上模型模块", tensor=entry_name)
         codes, scale = store.read_parts(entry_name)
         bias = None
@@ -147,11 +179,11 @@ def fill_model(
             full = f"{module_path}.{name}" if module_path else name
             if param is None or full in handled:
                 continue
+            if full.startswith(skip_prefixes):
+                continue
             if tied and full.startswith("lm_head."):
                 continue  # 稍后与 embedding 共用同一个 Parameter
             if full not in names:
-                if full.startswith(skip_prefixes):
-                    continue
                 raise MissingTensorError("权重文件里缺这张量", tensor=full)
             _assign(module, name, _to(store.read_raw(full), device, dtype), param=True)
             handled.add(full)
@@ -159,23 +191,25 @@ def fill_model(
             full = f"{module_path}.{name}" if module_path else name
             if buf is None or full in handled:
                 continue
+            if full.startswith(skip_prefixes):
+                continue
             if name in getattr(module, "_non_persistent_buffers_set", frozenset()):
                 continue  # 派生 buffer（rotary 的 cos/sin 等），前向里会自己算
             if full.endswith(_DERIVED_SUFFIXES):
                 continue
             if full not in names:
-                if full.startswith(skip_prefixes):
-                    continue
                 raise MissingTensorError("权重文件里缺这张量", tensor=full)
             _assign(module, name, _to(store.read_raw(full), device, buf.dtype), param=False)
             handled.add(full)
 
-    _materialize_derived(model, device=device)
+    _materialize_derived(model, device=device, skip_prefixes=skip_prefixes)
     _tie_embeddings(model, config, dtype)
     return model
 
 
-def _materialize_derived(model: torch.nn.Module, *, device: torch.device) -> None:
+def _materialize_derived(
+    model: torch.nn.Module, *, device: torch.device, skip_prefixes: tuple[str, ...] = ()
+) -> None:
     """把派生 buffer（rotary 的 `inv_freq` / `original_inv_freq`）从 meta 变成真实值。
 
     它们是 `persistent=False`，权重文件里没有，装载时只能由模块自己算出来 —— meta 建出来的
@@ -190,6 +224,8 @@ def _materialize_derived(model: torch.nn.Module, *, device: torch.device) -> Non
     buffer 拷过来。这样连 rope 的具体公式都不必知道，跟着 transformers 的版本走。
     """
     for module_path, module in list(model.named_modules()):
+        if module_path.startswith(skip_prefixes):
+            continue      # 整块不装的模块（视觉塔）没必要实化，它根本不会被调用
         pending = [name for name, buffer in module._buffers.items()
                    if buffer is not None and buffer.device.type == "meta"]
         if not pending:
@@ -234,14 +270,3 @@ def text_backbone(model: torch.nn.Module) -> torch.nn.Module:
         if isinstance(layers, torch.nn.ModuleList) and layer_types:
             return module
     return model
-
-
-def output_weight(model: torch.nn.Module) -> torch.Tensor:
-    """读出用的词表矩阵（tied 时就是 embedding）。"""
-    embeddings = model.get_output_embeddings()
-    if embeddings is not None and getattr(embeddings, "weight", None) is not None:
-        return embeddings.weight
-    head = getattr(model, "lm_head", None)
-    if head is not None and getattr(head, "weight", None) is not None:
-        return head.weight
-    raise ConfigError("模型没有输出词表矩阵")

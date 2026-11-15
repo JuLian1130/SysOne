@@ -1,8 +1,9 @@
 """torch 侧装载的单元测试（没有 torch 的环境自动跳过）。
 
-这里不碰 transformers：用一个手写的小网络验证 `fill_model` 的四条规则 ——
-int8 线性层被替换成 `Int8Linear`、keep 张量就地赋值、视觉塔缺失可以留 meta、
-tied 的 lm_head 与 embedding 共享同一个 Parameter。
+这里不碰 transformers：用一个手写的小网络验证 `fill_model` 的五条规则 ——
+int8 线性层被替换成 `Int8Linear`、keep 张量就地赋值、`skip_prefixes` 下的张量
+**即使权重文件里有也不装**（视觉塔、词表整表）、tied 的 lm_head 与 embedding
+共享同一个 Parameter、上传不复制只读缓冲。
 """
 
 from __future__ import annotations
@@ -16,8 +17,9 @@ torch = pytest.importorskip("torch")
 
 from sysone.models.vendors.torch_support import (  # noqa: E402
     Int8Linear,
+    _to,
+    _view,
     fill_model,
-    output_weight,
     torch_dtype,
 )
 
@@ -55,8 +57,8 @@ class _FakeStore:
 class _TinyModel(torch.nn.Module):
     """与真实检查点同样的命名：视觉塔在 `model.visual` 下（`skip_prefixes` 认的就是这个前缀）。
 
-    `get_output_embeddings` 是 `PreTrainedModel` 的接口，手写模块要自己补上 —— 少了它
-    `output_weight` 的第一条路就走不通，而这两条路本来都该被测到。
+    `get_input_embeddings` / `get_output_embeddings` 是 `PreTrainedModel` 的接口，手写模块
+    要自己补上：`_tie_embeddings` 在两个便捷属性都缺时会回落到它们。
     """
 
     def __init__(self) -> None:
@@ -86,7 +88,7 @@ class _TinyModel(torch.nn.Module):
         return self.model.language_model.embed_tokens
 
     def get_output_embeddings(self) -> torch.nn.Module | None:
-        return None      # 真模型里是 `lm_head`；`output_weight` 的第二条路
+        return None      # 真模型里是 `lm_head`；`_tie_embeddings` 的回退路
 
 
 def _tiny_model() -> torch.nn.Module:
@@ -210,9 +212,59 @@ def test_a_meta_buffer_without_a_config_is_an_error() -> None:
     assert "meta buffer" in str(info.value)
 
 
-def test_output_weight_prefers_tied_embedding() -> None:
-    model = _tiny_model()
-    assert output_weight(model).shape == (8, 4)
+def test_skipped_prefixes_stay_on_meta_even_when_the_weights_exist() -> None:
+    """`skip_prefixes` 是"整块不装"，不是"缺了就算"。
+
+    h2o 的检查点里视觉塔（297 张 keep 张量，0.62 GiB）与词表整表（1.18 GiB）都存在，
+    但纯文本前向一个都不碰 —— 旧语义下它们会被整塔填进设备（`.scratch/mem_budget_h2o.py`
+    的常驻分账把这两笔单独列了出来）。
+    """
+    embed_name = "model.language_model.embed_tokens.weight"
+    keep = ("model.visual", "model.language_model.layers", embed_name, "lm_head.")
+    with torch.device("meta"):
+        model = _tiny_model()
+    entries = {
+        "model.visual.patch_embed.weight": _FakeEntry(
+            "model.visual.patch_embed.weight", "keep", (5, 3)),
+        "model.language_model.norm.weight": _FakeEntry(
+            "model.language_model.norm.weight", "keep", (4,)),
+        "model.language_model.norm.bias": _FakeEntry(
+            "model.language_model.norm.bias", "keep", (4,)),
+        embed_name: _FakeEntry(embed_name, "keep", (8, 4)),
+    }
+    payload = {
+        "model.visual.patch_embed.weight": np.ones((5, 3), dtype=np.float32),
+        "model.language_model.norm.weight": np.ones((4,), dtype=np.float32),
+        "model.language_model.norm.bias": np.zeros((4,), dtype=np.float32),
+        embed_name: np.zeros((8, 4), dtype=np.float32),
+    }
+    filled = fill_model(
+        model,
+        SimpleNamespace(tie_word_embeddings=False),
+        _FakeStore(entries, payload),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        skip_prefixes=keep,
+    )
+    assert filled.visual.patch_embed.weight.device.type == "meta"
+    assert filled.language_model.embed_tokens.weight.device.type == "meta"
+    # 没在 skip 名单里的照常填
+    assert filled.language_model.norm.weight.device.type == "cpu"
+
+
+def test_a_read_only_buffer_is_uploaded_without_copying() -> None:
+    """`_to` 零拷贝：mmap 视图是只读的，直接让 torch 看同一片内存。
+
+    旧实现为了"可写"先 `copy()` 一份，32 层 / 3.3 GiB 的一趟实测多花 45 % 的时间
+    （`.scratch/stream_cost_h2o.py`：0.99 s vs 0.68 s）。
+    """
+    source = np.arange(64, dtype=np.float32).reshape(8, 8)
+    read_only = np.frombuffer(source.tobytes(), dtype=np.float32).reshape(8, 8)
+    assert not read_only.flags.writeable
+
+    view = _view(read_only)
+    assert view.data_ptr() == read_only.ctypes.data                # 同一片内存
+    assert torch.equal(_to(read_only, torch.device("cpu"), torch.float32), view)
 
 
 def test_torch_dtype_mapping() -> None:

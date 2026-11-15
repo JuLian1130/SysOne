@@ -7,6 +7,13 @@
 
 我们只负责：用 int8 码表把权重装进 transformers 的 Qwen3.5 结构，以及按请求的
 注意力模式决定要不要让全注意力层读双向。
+
+装载只读**用得到**的权重（`.scratch/mem_budget_h2o.py` 实测 5.139 GiB 常驻里两笔是白占的）：
+
+- 视觉塔 0.62 GiB：纯文本 prefill 走 `text_backbone`，一次都不碰它；
+- 词表整表 1.18 GiB（248 320 × 2 560 bf16）：前向只用 `ids` 那几行、读出只用选项标签
+  那几行，`RowInt8Store.read_rows`（= `SafeTensorFile.read_rows`）就够了 —— mude 的
+  `MudeChain` 一直这么取词表行，vendor 侧此前把整表上设备。
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ from ...domain.work import CompilationTimes
 from ...errors import ConfigError, NotReadyError, ReadoutError, UnsupportedModeError
 from ...weights.packing.row_int8 import RowInt8Store
 from .base import VendorAnswer, wire_answer
-from .torch_support import build_model, fill_model, output_weight, text_backbone, torch_dtype
+from .torch_support import build_model, fill_model, text_backbone, torch_dtype
 
 _SHIM_FILE = "h2o_lightning_shim.py"
 _SERVE_FILE = "serve_config.json"
@@ -38,6 +45,17 @@ _WARMUP_QUESTION = {
 }
 # 三种长度：进程内头几次 prefill 才是坏的，长短各来一遍才能都烧掉
 _WARMUP_STATES = (_WARMUP_STATE, _WARMUP_STATE * 40, _WARMUP_STATE * 120)
+# tied 的词表：前向（embedding）与读出（选项行）都从磁盘按行取，整表不上设备。
+_EMBED_NAME = "model.language_model.embed_tokens.weight"
+# 按行取的桶宽。长 prompt 的 host 瞬时量是一桶（1024 × 5 120 B ≈ 5 MB），不是整条。
+_EMBED_BUCKET = 1024
+_SKIP_PREFIXES = (
+    "model.visual",              # 视觉塔：纯文本前向不碰
+    "multi_modal_projector",
+    "mtp.",
+    _EMBED_NAME,                 # 词表整表：按行取（见 `_embed_rows` / `_option_rows`）
+    "lm_head.",                  # tied，读出直接取词表行
+)
 
 
 def _load_shim(model_dir: Path):
@@ -67,9 +85,8 @@ def _default_precision(device: torch.device) -> str:
 class H2OBridge:
     """H2O-Lightning-4B 的 vendor 桥。
 
-    默认 fp32：实测这个 hybrid 检查点在 CPU 上用 bf16 算会出 NaN 与大幅漂移
-    （首个全注意力层读出 NaN，同一输入的概率在 0.75 与 0.97 之间跳），fp32
-    首访即稳定。权重常驻的是 int8，切 fp32 只加计算量、不加权重内存。
+    计算精度跟随设备（`_default_precision`）：加速器 bf16、CPU fp32。权重常驻的是
+    int8，所以加速器上就是 W8A16 —— 换精度只改计算与激活，不改权重内存。
     """
 
     name = "h2o"
@@ -90,7 +107,6 @@ class H2OBridge:
         self._tokenizer = None
         self._model = None
         self._backbone = None
-        self._lm = None
         self._store = None
         self._bidir = False
         self._load_s = 0.0
@@ -118,9 +134,9 @@ class H2OBridge:
             self._store,
             device=self.device,
             dtype=self.dtype,
+            skip_prefixes=_SKIP_PREFIXES,
         )
         self._backbone = text_backbone(self._model)
-        self._lm = output_weight(self._model)
         self._load_s = time.perf_counter() - started
 
     # ---------------------------------------------------------------- warmup
@@ -165,18 +181,16 @@ class H2OBridge:
             raise ReadoutError("渲染出的 prompt 是空的")
         label_ids = self._label_ids(prompt, ids, labels)
 
-        input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
-        attention_mask = torch.ones_like(input_ids)
+        attention_mask = torch.ones((1, len(ids)), dtype=torch.long, device=self.device)
         with torch.no_grad():
             out = self._backbone(
-                input_ids=input_ids,
+                inputs_embeds=self._embed_rows(ids),
                 attention_mask=attention_mask,
                 use_cache=False,
                 return_dict=True,
             )
         hidden = out.last_hidden_state[:, -1].float()[0]
-        rows = self._lm[label_ids].to(torch.float32)
-        logprobs = (hidden @ rows.T).detach().cpu().tolist()
+        logprobs = (hidden @ self._option_rows(label_ids).T).detach().cpu().tolist()
 
         kind = question.get("type", "choice")
         temperature = self._contract.temperature_by_type.get(kind, self._contract.temperature)
@@ -204,7 +218,6 @@ class H2OBridge:
     def close(self) -> None:
         self._model = None
         self._backbone = None
-        self._lm = None
         if self._store is not None:
             self._store.close()
             self._store = None
@@ -250,7 +263,7 @@ class H2OBridge:
         self._backbone._jev_bidirectional = None
         self._bidir = False
 
-    def _label_ids(self, prompt: str, ids: list[int], labels: list[str]) -> torch.Tensor:
+    def _label_ids(self, prompt: str, ids: list[int], labels: list[str]) -> list[int]:
         """每个选项标签在回答槽上的单 token id（必须是恰好一个新 token）。"""
         base = len(ids)
         picked: list[int] = []
@@ -263,7 +276,23 @@ class H2OBridge:
                     tokens=len(probe) - base,
                 )
             picked.append(int(probe[-1]))
-        return torch.tensor(picked, dtype=torch.long, device=self.device)
+        return picked
+
+    # ------------------------------------------------------------ 词表按行取
+    def _embed_rows(self, ids: list[int]) -> torch.Tensor:
+        """embedding 输出 `[1, S, hidden]`：按桶从磁盘取行，整表不上设备。"""
+        pieces = []
+        for start in range(0, len(ids), _EMBED_BUCKET):
+            part = self._store.read_rows(_EMBED_NAME, ids[start:start + _EMBED_BUCKET])
+            pieces.append(
+                torch.from_numpy(np.ascontiguousarray(part)).to(self.device, self.dtype)
+            )
+        return torch.cat(pieces, dim=0).unsqueeze(0)
+
+    def _option_rows(self, label_ids: list[int]) -> torch.Tensor:
+        """选项标签那几行的词表权重（fp32），读出时与末位隐藏态做点积。"""
+        rows = self._store.read_rows(_EMBED_NAME, label_ids)
+        return torch.from_numpy(np.ascontiguousarray(rows)).to(self.device, torch.float32)
 
 
 __all__ = ["H2OBridge"]
