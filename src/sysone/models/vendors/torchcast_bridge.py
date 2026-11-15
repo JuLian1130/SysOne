@@ -23,6 +23,7 @@ from ...errors import ConfigError, NotReadyError, ReadoutError, UnsupportedModeE
 from ...weights.packing.row_int8 import RowInt8Store
 from .base import VendorAnswer, wire_answer
 from .torch_support import build_model, fill_model, torch_dtype
+from .h2o_bridge import _default_precision
 
 _WARMUP_STATE = "warmup"
 _WARMUP_STATES = (_WARMUP_STATE, _WARMUP_STATE * 40, _WARMUP_STATE * 120)
@@ -47,12 +48,12 @@ class TorchcastBridge:
         model_dir: Path | str,
         *,
         device: str = "cpu",
-        precision: str = "fp32",
+        precision: str | None = None,
         max_length: int = 16384,
     ) -> None:
         self.dir = Path(model_dir)
         self.device = torch.device(device)
-        self.dtype = torch_dtype(precision)
+        self.dtype = torch_dtype(precision or _default_precision(self.device))
         self.max_length = int(max_length)
         self._model = None
         self._engine = None

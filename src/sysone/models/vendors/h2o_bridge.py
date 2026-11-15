@@ -52,6 +52,18 @@ def _load_shim(model_dir: Path):
     return module
 
 
+def _default_precision(device: torch.device) -> str:
+    """默认计算精度：加速器 bf16（W8A16），CPU fp32。
+
+    两半都是实测的。CPU 上 bf16 会在首个全注意力层读出 NaN、同一输入的概率在 0.75 与 0.97
+    之间跳（`f85dcf3` 的记录），所以 CPU 保持 fp32。MPS 上 bf16 完全正常且明显更快更省：
+    13 767 token 的整条 prompt 上，峰值驱动内存 10.28 GiB vs fp32 的 14.44 GiB（−29 %），
+    墙钟 135 s vs 665 s（同一轮对照，票据 13）。短题上两者打平（每 1k token 7.16 vs 7.19 ms），
+    所以这条默认在短序列上不亏、在长序列上净赚。
+    """
+    return "fp32" if device.type == "cpu" else "bf16"
+
+
 class H2OBridge:
     """H2O-Lightning-4B 的 vendor 桥。
 
@@ -67,11 +79,12 @@ class H2OBridge:
         model_dir: Path | str,
         *,
         device: str = "cpu",
-        precision: str = "fp32",
+        precision: str | None = None,
     ) -> None:
         self.dir = Path(model_dir)
         self.device = torch.device(device)
-        self.dtype = torch_dtype(precision)
+        # 计算精度默认"跟随设备"（`_default_precision`）：加速器上 bf16，CPU 上 fp32。
+        self.dtype = torch_dtype(precision or _default_precision(self.device))
         self._shim = None
         self._contract = None
         self._tokenizer = None

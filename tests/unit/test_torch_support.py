@@ -222,10 +222,19 @@ def test_torch_dtype_mapping() -> None:
     assert "未知的权重精度" in str(info.value)
 
 
-def test_vendor_bridges_default_to_fp32() -> None:
-    """CPU 上 bf16 实测会出 NaN 与漂移，默认必须是 fp32。"""
+def test_vendor_bridges_pick_precision_by_device() -> None:
+    """默认跟随设备：CPU 上 fp32（bf16 会出 NaN），加速器上 bf16（W8A16，实测更快更省）。
+
+    两组都是实测的：CPU 的 NaN 见 `f85dcf3`；MPS 上 13 767 token 的峰值内存
+    10.28 GiB（bf16）vs 14.44 GiB（fp32）、墙钟 135 s vs 665 s（票据 13）。
+    """
     from sysone.models.vendors.h2o_bridge import H2OBridge
     from sysone.models.vendors.torchcast_bridge import TorchcastBridge
 
     assert H2OBridge("unused").dtype is torch.float32
     assert TorchcastBridge("unused").dtype is torch.float32
+    assert H2OBridge("unused", device="mps").dtype is torch.bfloat16
+    assert TorchcastBridge("unused", device="mps").dtype is torch.bfloat16
+    # 显式给值仍然优先（对拍与排障要用）
+    assert H2OBridge("unused", device="mps", precision="fp32").dtype is torch.float32
+    assert H2OBridge("unused", precision="bf16").dtype is torch.bfloat16
