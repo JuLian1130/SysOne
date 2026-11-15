@@ -51,30 +51,24 @@ from pathlib import Path
 import numpy as np
 
 from helpers import make_mude_checkpoint
-from sysone.devices.apple.chain import MudeChain, _text_config
+from sysone.devices.apple.chain import SplitChain
+from sysone.models.families import h2o, mude
 from sysone.devices.apple.geometry import Geometry
-from sysone.models.families.mude import NORM_OFFSET
+from sysone.models.families import mude
 
 S = 256
 TOKENS = [7, 11, 13, 17, 19, 23]
 root = Path(sys.argv[1])
 model = make_mude_checkpoint(root / "model")
 
-text = _text_config(model)
-geometry = Geometry(
-    hid=text["hidden_size"], ffn=text["intermediate_size"],
-    q_heads=text["num_attention_heads"], kv_heads=text["num_key_value_heads"],
-    head_dim=text["head_dim"], rotary_dim=text["head_dim"] // 4,
-    l_k_heads=text["linear_num_key_heads"], l_k_dim=text["linear_key_head_dim"],
-    l_v_heads=text["linear_num_value_heads"], l_v_dim=text["linear_value_head_dim"],
-    conv_k=text["linear_conv_kernel_dim"],
-)
-geometry.validate()
+# 家族给的纯数据：形状（descriptor）/ 前缀 / norm 偏移 / RoPE 角基。
+plan = mude.weight_plan(model)
+geometry = Geometry.from_descriptor(plan.descriptor)
 
 scratch = root / "programs"
-cpu = MudeChain.load(model, norm_offset=NORM_OFFSET, s=S, scratch_dir=scratch)
+cpu = SplitChain.load(model, weights=plan, s=S, scratch_dir=scratch)
 try:
-    gpu = MudeChain.load(model, norm_offset=NORM_OFFSET, s=S, scratch_dir=scratch, metal=True)
+    gpu = SplitChain.load(model, weights=plan, s=S, scratch_dir=scratch, metal=True)
     try:
         numpy_logits = cpu.logits(TOKENS)
         metal_logits = gpu.logits(TOKENS)

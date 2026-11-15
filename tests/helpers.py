@@ -87,6 +87,8 @@ def make_mude_checkpoint(
     layers: tuple[str, ...] = ("linear_attention", "full_attention"),
     code_rows: int = 255,
     seed: int = 0,
+    tensor_prefix: str = "language_model",
+    with_readout: bool = True,
 ) -> Path:
     """造一个 mude 链形状的检查点目录（`config.json` + 权重 + 题面配置 + 读出表）。
 
@@ -94,6 +96,10 @@ def make_mude_checkpoint(
     k 头 2 个），`core_out = q_heads × head_dim = 2 × 256` 等于 `value_dim` —— 与 h2o 一样
     是 `2 × qk + value` 的卷积宽度，且 **v 头数是 k 头数的两倍**（`repeat_interleave` 那条
     路才真的被走到）。`core_out == value_dim` 是几何的硬约束（两种层共用一套 out program）。
+
+    `tensor_prefix` / `with_readout` 用来造**另一种布局**的检查点：h2o 的张量叫
+    `model.language_model.*`、读出是厂商的 pooled（目录里没有 `readout.safetensors`），
+    所以"整链能不能装 h2o"这条要靠这两项才测得出来（形状仍用上面的小模型）。
 
     两个头维不能随便改，两个核都按 128 / 256 排过：
     - GDN 的 `l_k_dim` / `l_v_dim` 必须是 128（`e8_gdn.metal:109`，线程几何按 128 排）；
@@ -112,13 +118,14 @@ def make_mude_checkpoint(
         return (np.abs(values) if positive else values).astype(np.float16)
 
     qk, value = l_k_heads * l_k_dim, l_v_heads * l_v_dim
+    prefix = tensor_prefix
     weights: dict[str, np.ndarray] = {
-        "language_model.embed_tokens.weight": matrix(vocab, hidden),
+        f"{prefix}.embed_tokens.weight": matrix(vocab, hidden),
         # norm 是零中心存的（家族递 `NORM_OFFSET = 1.0`），所以这里给 0 附近的值。
-        "language_model.norm.weight": vector(hidden),
+        f"{prefix}.norm.weight": vector(hidden),
     }
     for index, kind in enumerate(layers):
-        base = f"language_model.layers.{index}"
+        base = f"{prefix}.layers.{index}"
         weights[f"{base}.input_layernorm.weight"] = vector(hidden)
         weights[f"{base}.post_attention_layernorm.weight"] = vector(hidden)
         weights[f"{base}.mlp.gate_proj.weight"] = matrix(ffn, hidden)
@@ -179,14 +186,18 @@ def make_mude_checkpoint(
             "linear_conv_kernel_dim": conv_k,
             "rope_parameters": {"rope_theta": 10_000.0, "partial_rotary_factor": 0.25},
             "max_position_embeddings": 4096,
+            "vocab_size": vocab,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": True,
         }
     }
     (directory / "config.json").write_text(json.dumps(config), "utf-8")
     (directory / "decision_config.json").write_text(json.dumps({"temperature": 1.0}), "utf-8")
-    write_safetensors(
-        directory / "readout.safetensors",
-        {"weight": (rng.standard_normal((code_rows, hidden)) * 0.05).astype(np.float32)},
-    )
+    if with_readout:
+        write_safetensors(
+            directory / "readout.safetensors",
+            {"weight": (rng.standard_normal((code_rows, hidden)) * 0.05).astype(np.float32)},
+        )
     return directory
 
 

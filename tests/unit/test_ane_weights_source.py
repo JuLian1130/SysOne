@@ -15,7 +15,7 @@ import numpy as np
 from helpers import write_row_int8_checkpoint
 from sysone.devices.apple.chain import _artifact_source, _build_layer_program
 from sysone.domain.attention import AttentionRole
-from sysone.models.families.mude import ane_layer_segments
+from sysone.devices.apple.blobplan import ane_layer_segments
 from sysone.weights.checkpoint import open_checkpoint
 from sysone.weights.packing import QUANT_SUFFIX, SCALE_SUFFIX
 from sysone.weights.packing.ane_blob import quant_per_channel
@@ -23,7 +23,8 @@ from sysone.weights.store import write_file
 
 HIDDEN, FFN, CORE, S = 64, 128, 16, 256
 COUT = 48 + 16 + 2 + 2        # qkv 48 + z 16 + b 2 + a 2
-BASE = "language_model.layers.0"
+ENV_PREFIX = "language_model"
+BASE = f"{ENV_PREFIX}.layers.0"
 
 
 def _tensors(seed: int = 0) -> dict[str, np.ndarray]:
@@ -47,11 +48,13 @@ def _tensors(seed: int = 0) -> dict[str, np.ndarray]:
 def _build(directory: Path, output: Path):
     store = open_checkpoint(directory)
     try:
-        source = _artifact_source(store, layer=0, role=AttentionRole.LINEAR, cout=COUT,
-                                  core_out=CORE, hidden=HIDDEN, ffn=FFN, s=S, quantize=True)
+        source = _artifact_source(store, prefix=ENV_PREFIX, layer=0,
+                                  role=AttentionRole.LINEAR, cout=COUT, core_out=CORE,
+                                  hidden=HIDDEN, ffn=FFN, s=S, quantize=True)
         return _build_layer_program(
-            store, directory=output, index=0, role=AttentionRole.LINEAR, cout=COUT,
-            core_out=CORE, hidden=HIDDEN, ffn=FFN, s=S, quantize=True, source=source,
+            store, prefix=ENV_PREFIX, directory=output, index=0,
+            role=AttentionRole.LINEAR, cout=COUT, core_out=CORE, hidden=HIDDEN, ffn=FFN,
+            s=S, quantize=True, source=source,
         )
     finally:
         store.close()
@@ -110,7 +113,7 @@ def _blob_arrays(blob: bytes) -> list[tuple[str, np.ndarray]]:
 def _entry_at(arrays: list[tuple[str, np.ndarray]], name: str) -> tuple[str, np.ndarray, np.ndarray]:
     """取某个条目的 `(dtype, 码, 标度)`；条目顺序就是装配表的顺序。"""
     names = list(ane_layer_segments(layer=0, layer_type=AttentionRole.LINEAR,
-                                    hidden=HIDDEN, ffn=FFN))
+                                    hidden=HIDDEN, ffn=FFN, prefix=ENV_PREFIX))
     at = 2 * names.index(name)
     return arrays[at][0], arrays[at][1], arrays[at + 1][1]
 

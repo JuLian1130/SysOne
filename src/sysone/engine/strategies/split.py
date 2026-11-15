@@ -29,7 +29,7 @@ _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one"
 
 
 class ModelChain(Protocol):
-    """`MudeChain` 只需要这两件事：一次整链前向与卸载。"""
+    """`SplitChain` 只需要这两件事：一次整链前向与卸载。"""
 
     def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0,
                 causal: bool = False) -> object: ...
@@ -279,20 +279,22 @@ def mude_runner(
     `resident` 是待命常驻的层数，`None` 表示全装；窗口的具体病理见
     `devices/apple/residency.py`（它是这张卡上最大的一笔内存，所以由调用方决定让不让）。
     """
-    from ...devices.apple.chain import MudeChain
+    from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
     from ...models.families import mude as mude_family
 
     codes = mude_family.read_codes(model_dir)
     prompter = mude_family.MudePrompter(_load_tokenizer(model_dir), codes)
+    weights = mude_family.weight_plan(Path(model_dir))
     bucket_width = int(S_NATIVE if bucket is None else bucket)
     buffer_width = int(bucket_width if width is None else width)
 
     def load_chain() -> ModelChain:
-        return MudeChain.load(
+        return SplitChain.load(
             model_dir,
-            # 这份 checkpoint 的 norm 是零中心存的（真值 `w + 1`）：约定属于家族，设备层不猜。
-            norm_offset=mude_family.NORM_OFFSET,
+            # 形状 / 张量名前缀 / norm 的存法偏移 / RoPE 角基都在这份计划里（家族给的纯数据），
+            # 设备层不认识任何具体 checkpoint。
+            weights=weights,
             s=bucket_width,
             width=buffer_width,
             quantize=quantize,

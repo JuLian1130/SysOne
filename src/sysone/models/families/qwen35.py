@@ -109,6 +109,22 @@ def vision_spec(config: Mapping[str, object]) -> VisionSpec | None:
     )
 
 
+def rope_theta(config: Mapping[str, object]) -> float:
+    """`rope_parameters.rope_theta`：RoPE 的角基。缺了就报错，不替它猜一个。
+
+    这个数是**数值**约定（不是形状），错了不会崩，只会让所有注意力位置角整体缩放 ——
+    正是最难发现的那类错。两个出货模型都是 1e7。
+    """
+    text = text_config(config)
+    rope = text.get("rope_parameters") or {}
+    if not isinstance(rope, Mapping) or "rope_theta" not in rope:
+        raise ConfigError(
+            "config 缺少 rope_parameters.rope_theta",
+            hint="qwen3.5 的 rope 参数在 text_config.rope_parameters 下",
+        )
+    return float(rope["rope_theta"])  # type: ignore[arg-type]
+
+
 def descriptor_from(
     config: Mapping[str, object],
     *,

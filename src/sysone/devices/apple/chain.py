@@ -1,4 +1,8 @@
-"""mude 的 20 层前向链：ANE 跑三段程序，numpy 只跑 norm / RoPE / 注意力 / GDN。
+"""Qwen3.5 形状的分层前向链：ANE 跑三段程序，numpy 只跑 norm / RoPE / 注意力 / GDN。
+
+`SplitChain` 不认识具体 checkpoint：形状来自家族递来的 `WeightPlan`（经
+`Geometry.from_descriptor`），张量名前缀、norm 偏移、RoPE 角基也来自它。两个出货模型
+（mude 2B 的 20 层、h2o 4B 的 32 层）走的是同一条链。
 
 M2.2 第 2 片先求打通与逐层对齐，不做性能优化：全注意力层与线性注意力层的"热点"仍是
 numpy，第 3 片再换 Metal。精度路径与旧引擎一致（int8 权重 + fp16 累加），所以与 torch
@@ -7,7 +11,6 @@ bf16 参照不会逐位相同；链路里也不能出现 torch（`src/` 只用 n
 
 from __future__ import annotations
 
-import json
 import tempfile
 from itertools import count
 from pathlib import Path
@@ -16,11 +19,13 @@ from typing import Sequence
 import numpy as np
 
 from ...domain.attention import AttentionRole
-from ...errors import ConfigError
-from ...models.families.mude import CODE_ROWS, ane_layer_quantized, ane_layer_weights
+from ...errors import ConfigError, NotReadyError
+from ...models.descriptor import ModelDescriptor
+from ...models.layer_plan import WeightPlan
 from ...weights.checkpoint import WeightStore, int8_parts, open_checkpoint
 from ...weights.packing.ane_blob import build as build_blob, build_quantized
 from ...weights.store import SafeTensorFile
+from .blobplan import ane_layer_quantized, ane_layer_weights
 from .compile import (
     S_NATIVE,
     AneLayer,
@@ -74,8 +79,8 @@ def _rope_table(theta: float, s: int, rotary_dim: int) -> tuple[np.ndarray, np.n
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
 
 
-class MudeChain:
-    """mude 20 层链：`forward()` 给出前 `options` 个码的概率，`logits()` 给 255 个原始 logits。
+class SplitChain:
+    """分层链：`forward()` 给出前 `options` 个码的概率，`logits()` 给全部读出码的原始 logits。
 
     `s` 是 ANE 程序的静态列宽，prompt 长度必须不超过它；一层的三段 ANE 程序在 `load()` 里
     编译并常驻，`close()` 统一卸载。参数全部 fp32（numpy 一侧）与 fp16（surfaces）混合，
@@ -92,7 +97,8 @@ class MudeChain:
         store: WeightStore,
         embed_name: str,
         final_norm: np.ndarray,
-        readout: np.ndarray,
+        readout: np.ndarray | None,
+        readout_kind: str,
         temperature: float,
         cos: np.ndarray,
         sin: np.ndarray,
@@ -118,6 +124,7 @@ class MudeChain:
         self._embed_name = embed_name
         self._final_norm = final_norm
         self._readout = readout
+        self._readout_kind = str(readout_kind)
         self._temperature = float(temperature)
         self._cos = cos
         self._sin = sin
@@ -136,8 +143,8 @@ class MudeChain:
         cls,
         model_dir: str | Path,
         *,
+        weights: WeightPlan,
         device: str = "ane",
-        norm_offset: float,
         s: int = S_NATIVE,
         width: int | None = None,
         quantize: bool = True,
@@ -145,7 +152,7 @@ class MudeChain:
         runtime: AneRuntime | None = None,
         metal: bool = False,
         resident: int | None = None,
-    ) -> "MudeChain":
+    ) -> "SplitChain":
         """编译 20 层程序并从 `model_dir` 读权重。
 
         权重容器两种都收：bf16 的 `model.safetensors` 单文件，或 row-int8 目录（`__q` 码 +
@@ -166,55 +173,27 @@ class MudeChain:
         最大块长 —— `blocks()` 里一个块内的层是同时在飞的，整块必须常驻；窗口在块边界换窗、
         重装在线程上预取，省掉窗口之外的 ANE 权重，代价是每层约 66 ms（见 `residency.py`）。
 
-        `norm_offset` 是 norm 权重的**存法偏移**：真值是 `w + offset`。mude 这份 checkpoint
-        是零中心存的（`+1`；不补时第 0 层 cos 只有 0.53，见 `docs/ANE/README.md` §10.22），
-        标准 RMSNorm 是 0。它由家族递给设备层（`mude.NORM_OFFSET`），设备层不认识任何具体
-        checkpoint —— 所以这里**没有默认值**：默认零会让"忘了给"看起来像跑通了。
+        `weights` 是家族递过来的 `WeightPlan`：形状（`descriptor`，经
+        `Geometry.from_descriptor` 投影）、张量名前缀、norm 的**存法偏移**（真值 `w + offset`；
+        两个出货 checkpoint 都是零中心存、`+1`）、RoPE 角基。这四项是"这份 checkpoint 怎么
+        存的"，设备层不认识任何具体 checkpoint，所以它**没有默认值**：给了错的偏移不会崩，
+        只会让每一层都差一点点 —— 默认零正是让"忘了给"看起来像跑通的写法。
+
+        读出可以是 `None`：`descriptor.readout.kind` 不是 `code_rows` 的模型（h2o 是
+        `pooled`）没有码表，这条链就只提供逐层 hidden 与 `logits_rows`，`logits()` 会报
+        `NotReadyError` 指出来（pooled 读出还没实现，票据 15 的 G6）。
         """
         if device != "ane":
-            raise ValueError(f"mude 链只有 ANE 设备，收到 {device!r}")
+            raise ValueError(f"这条链只有 ANE 设备，收到 {device!r}")
         root = Path(model_dir)
-        text = _text_config(root)
-        decision = _load_json(root / "decision_config.json")
-        # `decision_config.json` 的 `attention_mode` 只是默认值（`mude.parse_config` 读它），
-        # 掩码在 `forward`/`logits` 的每次调用里给：三种 `MaskMode` 这条链都能表达（M3 之前
-        # causal 不行，因为核里没有三角项）。这里只取温度读出。
-
-        hidden = int(text["hidden_size"])
-        ffn = int(text["intermediate_size"])
-        heads = int(text["num_attention_heads"])
-        kv_heads = int(text["num_key_value_heads"])
-        head_dim = int(text["head_dim"])
-        rope = text.get("rope_parameters", {})
-        theta = float(rope.get("rope_theta", 10_000_000.0))
-        rotary_dim = int(head_dim * float(rope.get("partial_rotary_factor", 1.0)))
-        linear_heads = int(text["linear_num_key_heads"])
-        linear_dim = int(text["linear_key_head_dim"])
-        # v 的头数与头维不一定等于 k 的：h2o 是 32×128 对 16×128，`repeat_interleave` 那一步
-        # 在 `ops.delta_rule(repeat=...)` 与 Metal 核的寻址里都做了。
-        linear_v_heads = int(text.get("linear_num_value_heads", linear_heads))
-        linear_v_dim = int(text.get("linear_value_head_dim", linear_dim))
-        # 设备侧的形状只从这里取（architecture.md §13 R1）：MIL 生成、缓冲分配、kernel 网格。
-        geometry = Geometry(
-            hid=hidden,
-            ffn=ffn,
-            q_heads=heads,
-            kv_heads=kv_heads,
-            head_dim=head_dim,
-            rotary_dim=rotary_dim,
-            l_k_heads=linear_heads,
-            l_k_dim=linear_dim,
-            l_v_heads=linear_v_heads,
-            l_v_dim=linear_v_dim,
-            conv_k=int(text.get("linear_conv_kernel_dim", 4) or 4),
-        )
-        geometry.validate()
-        roles = [
-            AttentionRole.LINEAR if kind == "linear_attention" else AttentionRole.FULL
-            for kind in text["layer_types"]
-        ]
-        if len(roles) != int(text["num_hidden_layers"]):
-            raise ValueError("layer_types 数量与 num_hidden_layers 不一致")
+        prefix = weights.prefix
+        # 设备侧的形状只从几何取（architecture.md §13 R1）：MIL 生成、缓冲分配、kernel 网格。
+        # 几何从 descriptor 投影，descriptor 由家族的 parser 从 config 填 —— 设备层不再自己
+        # 读 config 拼形状（那会有第二份真相，且 h2o 的 v 头曾被抄成 k 头）。
+        geometry = Geometry.from_descriptor(weights.descriptor)
+        hidden, ffn = geometry.hid, geometry.ffn
+        readout = _readout(root, weights.descriptor)
+        roles = list(weights.descriptor.layer_types)
         # 窗口在装载之前算：比块还短时在这里就报错，不必先装完 20 层再失败。
         targets: tuple[tuple[int, ...], ...] = ()
         if resident is not None:
@@ -247,7 +226,7 @@ class MudeChain:
                                cout=max(geometry.cout_full, geometry.cout_gdn), s=s)
                     for _ in range(pool_slots(roles))]
         try:
-            params = [_layer_params(store, index, role, norm_offset)
+            params = [_layer_params(store, prefix, index, role, weights.norm_offset)
                       for index, role in enumerate(roles)]
             # 产物目录按 (模型名, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
             # 的测试就会把 `s=1024` 的缓存顶掉，下一次装载要多花 9 s 重算权重与量化。
@@ -258,24 +237,23 @@ class MudeChain:
                 split = (geometry.qg_rows, geometry.kv_rows) if role is AttentionRole.FULL else None
                 directory = program_root / f"layer{index:02d}"
                 source = _artifact_source(
-                    store, layer=index, role=role, cout=cout, core_out=geometry.core_out,
-                    hidden=hidden, ffn=ffn, s=s, quantize=quantize,
+                    store, prefix=prefix, layer=index, role=role, cout=cout,
+                    core_out=geometry.core_out, hidden=hidden, ffn=ffn, s=s, quantize=quantize,
                 )
                 files = cached_program(directory, source=source, s=s)
                 if files is None:
                     files = _build_layer_program(
-                        store, directory=directory, index=index, role=role, cout=cout,
-                        core_out=geometry.core_out, hidden=hidden, ffn=ffn, s=s,
+                        store, prefix=prefix, directory=directory, index=index, role=role,
+                        cout=cout, core_out=geometry.core_out, hidden=hidden, ffn=ffn, s=s,
                         quantize=quantize, source=source, split=split,
                     )
                 layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
                                        hidden=hidden, core_out=geometry.core_out,
                                        cout=cout, ffn=ffn, s=s, pool=pool,
                                        split_rows=split))
-            final_norm = _norm(store.read("language_model.norm.weight"), norm_offset)
-            readout = _readout(root)
-            temperature = float(decision.get("temperature", 1.0))
-            cos, sin = _rope_table(theta, width, rotary_dim)
+            final_norm = _norm(store.read(f"{prefix}.norm.weight"), weights.norm_offset)
+            temperature = float(weights.descriptor.readout.temperature or 1.0)
+            cos, sin = _rope_table(weights.rope_theta, width, geometry.rotary_dim)
             if metal:
                 # 窗口在装完之后立刻落回待命集：20 层先装再卸是"两条路只能走一条"的代价，
                 # 省掉的是这一轮之外的时间里那 1.47 GB 的 ANE 权重（`residency.py`）。
@@ -302,8 +280,9 @@ class MudeChain:
 
         return cls(
             runtime=runtime, layers=layers, params=params, roles=roles, store=store,
-            embed_name="language_model.embed_tokens.weight", final_norm=final_norm,
-            readout=readout, temperature=temperature, cos=cos, sin=sin,
+            embed_name=f"{prefix}.embed_tokens.weight", final_norm=final_norm,
+            readout=readout, readout_kind=weights.descriptor.readout.kind,
+            temperature=temperature, cos=cos, sin=sin,
             geometry=geometry, s=s, width=width,
             own_runtime=own_runtime, pipeline=pipeline, pool=pool,
             own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
@@ -314,7 +293,7 @@ class MudeChain:
     def logits(self, tokens: Sequence[int], *, trace: list[np.ndarray] | None = None,
                prefix: int = 0, causal: bool = False,
                debug: dict | None = None) -> np.ndarray:
-        """整条 prompt 走 20 层，返回 `[CODE_ROWS]` 原始 logits（fp32，未除温度）。
+        """整条 prompt 走 20 层，返回 `[rows]` 原始 logits（rows = 读出表的行数）（fp32，未除温度）。
 
         `trace` 非空时把每层输出（最后一条 token 的 `[hidden]`）按顺序追加进去，
         供探针与 torch 的逐层 hidden 对比。`prefix` 是 `prefix_noncausal` 的公共前缀长度
@@ -336,6 +315,8 @@ class MudeChain:
                 "用更大的 width 重新 load")
         if not 0 <= prefix <= length:
             raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
+        # 读出可能不存在（h2o 是 pooled）：先算，最后一步才要码表 —— 这样没有码表的模型
+        # 仍然能用 `hidden()` 跑整链、做逐层对拍。
         if self._pipeline is not None:
             if trace is not None or debug is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace 或 debug（中间量留在面上）",
@@ -345,7 +326,7 @@ class MudeChain:
             self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix,
                                causal=causal)
             final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
-            return self._readout @ final
+            return self._require_readout() @ final
         x = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid, self._width)
         if trace is not None:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
@@ -362,7 +343,45 @@ class MudeChain:
             if trace is not None:
                 trace.append(x[:, length - 1].copy())
         final = rms_norm(x.T, self._final_norm)[length - 1]
-        return self._readout @ final
+        return self._require_readout() @ final
+
+    def hidden(self, tokens: Sequence[int], *, prefix: int = 0,
+               causal: bool = False, trace: list[np.ndarray] | None = None) -> np.ndarray:
+        """整条 prompt 走完全部层，返回 `[length, hidden]` 的最终归一化 hidden。
+
+        这是**没有码表读出的模型**（h2o 的 `pooled`）也能用的出口，也是厂商路径对拍的抓手：
+        G6 接上之前，"h2o 的链算得对不对"只能拿它比。`logits()` 就是它的最后一行过码表。
+        """
+        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
+        length = int(ids.size)
+        if length == 0:
+            raise ValueError("prompt 至少要有一个 token")
+        if length > self._width:
+            raise ValueError(
+                f"prompt 长度 {length} 超过链的缓冲宽度 width={self._width}；"
+                "用更大的 width 重新 load")
+        if not 0 <= prefix <= length:
+            raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
+        if self._pipeline is not None:
+            if trace is not None:
+                raise ValueError("Metal 流水线不提供逐层 trace；用 metal=False 的 numpy 链")
+            embed = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid,
+                           self._width)
+            self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix, causal=causal)
+            return self._pipeline.last_hidden(length).copy()
+        x = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid, self._width)
+        if trace is not None:
+            trace.append(x[:, length - 1].copy())
+        cos, sin = self._cos[:length], self._sin[:length]
+        for index, layer in enumerate(self._layers):
+            params = self._params[index]
+            if self._roles[index] is AttentionRole.FULL:
+                x = self._full_layer(layer, params, x, length, cos, sin, prefix, causal)
+            else:
+                x = self._linear_layer(layer, params, x, length)
+            if trace is not None:
+                trace.append(x[:, length - 1].copy())
+        return rms_norm(x.T, self._final_norm)[:length]
 
     def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0,
                 causal: bool = False) -> np.ndarray:
@@ -390,7 +409,7 @@ class MudeChain:
     def logits_shared(
         self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, causal: bool = False
     ) -> list[np.ndarray]:
-        """共享前缀的整条前向：返回每题的 `[CODE_ROWS]` 原始 logits（未除温度）。"""
+        """共享前缀的整条前向：返回每题的 `[rows]` 原始 logits（未除温度）。"""
         if self._pipeline is None:
             raise ValueError("共享前缀只有 Metal 链提供（load 时用 metal=True）")
         ids = np.asarray(prefix, dtype=np.int64).reshape(-1)
@@ -418,7 +437,7 @@ class MudeChain:
         out: list[np.ndarray] = []
         for row in hidden:
             final = rms_norm(row[None, :], self._final_norm)[0]
-            out.append(self._readout @ final)
+            out.append(self._require_readout() @ final)
         return out
 
     def logits_rows(self, tokens: Sequence[int], *, prefix: int = 0) -> np.ndarray:
@@ -441,7 +460,18 @@ class MudeChain:
         self._pipeline.run_rows(
             self._store.read_rows(self._embed_name, ids), length=length, prefix=prefix)
         final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
-        return self._readout @ final
+        return self._require_readout() @ final
+
+    def _require_readout(self) -> np.ndarray:
+        """码表读出；没有就明确报错（`pooled` 读出还没接，见 `_readout`）。"""
+        if self._readout is None:
+            raise NotReadyError(
+                "这个模型没有码表读出，`logits()` 用不了",
+                readout_kind=self._readout_kind,
+                hint="h2o 的 pooled 读出 + selector 还没接（票据 15 G6）；"
+                     "在此之前只能用 `logits_rows` / 逐层 hidden 做对拍",
+            )
+        return self._readout
 
     def _probabilities(self, logits: np.ndarray, options: int) -> np.ndarray:
         """前 `options` 个码的 softmax 概率（选项顺序 = `codes` 顺序）。
@@ -449,8 +479,9 @@ class MudeChain:
         与厂商 `D3.probabilities` 的约定一致：越界码行在 softmax 前置 -inf（exp 为 0），
         因此等价于只在前 `options` 行上归一化。
         """
-        if not 1 <= options <= CODE_ROWS:
-            raise ValueError(f"options 必须在 1..{CODE_ROWS}，收到 {options}")
+        rows = 0 if self._readout is None else int(self._readout.shape[0])
+        if not 1 <= options <= rows:
+            raise ValueError(f"options 必须在 1..{rows}，收到 {options}")
         return softmax(logits[:options] / self._temperature)
 
     def _full_layer(
@@ -570,6 +601,7 @@ class MudeChain:
 def _artifact_source(
     store: WeightStore,
     *,
+    prefix: str,
     layer: int,
     role: AttentionRole,
     cout: int,
@@ -588,6 +620,7 @@ def _artifact_source(
     """
     return {
         "weights": store.fingerprint(),
+        "prefix": str(prefix),
         "layer": int(layer),
         "type": str(role),
         "cout": int(cout),
@@ -607,6 +640,7 @@ def _entry_array(entry: np.ndarray | tuple[np.ndarray, np.ndarray]) -> np.ndarra
 def _build_layer_program(
     store: WeightStore,
     *,
+    prefix: str,
     directory: Path,
     index: int,
     role: AttentionRole,
@@ -632,11 +666,12 @@ def _build_layer_program(
         # row-int8 检查点自带 int8 码，直接用；bf16 检查点没有码，这条路上现量化。
         entries: dict = ane_layer_quantized(
             store.read, lambda name: int8_parts(store, name),
-            layer=index, layer_type=role, hidden=hidden, ffn=ffn,
+            layer=index, layer_type=role, hidden=hidden, ffn=ffn, prefix=prefix,
         )
         actual = int(_entry_array(entries["proj"]).shape[0])
     else:
-        entries = ane_layer_weights(store.read, layer=index, layer_type=role, hidden=hidden, ffn=ffn)
+        entries = ane_layer_weights(store.read, layer=index, layer_type=role,
+                                    hidden=hidden, ffn=ffn, prefix=prefix)
         actual = int(entries["proj"].shape[0])
     if actual != cout:
         # `cout` 来自写死在 MSL 里的几何；权重形状与它对不上说明这个 checkpoint 不是
@@ -686,23 +721,30 @@ def _build_layer_program(
 # ---------------------------------------------------------------------- 权重
 
 
-def _load_json(path: Path) -> dict:
-    return json.loads(path.read_text()) if path.is_file() else {}
+def _readout(root: Path, descriptor: ModelDescriptor) -> np.ndarray | None:
+    """码表读出：`readout.safetensors` 的 `[rows, hidden]`，转 fp32。
 
-
-def _text_config(root: Path) -> dict:
-    config = _load_json(root / "config.json")
-    return config.get("text_config", config)
-
-
-def _readout(root: Path) -> np.ndarray:
-    """`readout.safetensors` 的 `[255, hidden]` 表，按配置的 readout_dtype 转 fp32。"""
-    handle = SafeTensorFile(root / "readout.safetensors")
+    只有 `code_rows` 有这张表。`pooled`（h2o）的读出是厂商的分池头 + selector，还没接
+    （票据 15 的 G6）—— 这时返回 `None`，链仍然能装、能跑逐层 hidden，`logits()` 会明确报错，
+    而不是拿一张不存在的表算出一堆看似正常的数。
+    """
+    plan = descriptor.readout
+    if plan.kind != "code_rows":
+        return None
+    if not plan.file or not plan.weight:
+        raise ConfigError("code_rows 读出缺少 file / weight", kind=plan.kind)
+    handle = SafeTensorFile(root / plan.file)
     try:
-        weight = handle.read("weight")
+        weight = handle.read(plan.weight)
     finally:
         handle.close()
-    return np.asarray(weight, np.float32)
+    table = np.asarray(weight, np.float32)
+    if table.ndim != 2 or (plan.rows is not None and table.shape[0] != plan.rows):
+        raise ConfigError(
+            "读出表的形状与 descriptor 不符",
+            shape=list(table.shape), rows=plan.rows, file=plan.file,
+        )
+    return table
 
 
 def _norm(weight: np.ndarray, offset: float) -> np.ndarray:
@@ -711,10 +753,10 @@ def _norm(weight: np.ndarray, offset: float) -> np.ndarray:
 
 
 def _layer_params(
-    store: WeightStore, index: int, role: AttentionRole, norm_offset: float
+    store: WeightStore, prefix: str, index: int, role: AttentionRole, norm_offset: float
 ) -> dict[str, np.ndarray]:
     """一层的 numpy 侧权重：各 norm、卷积、A_log / dt_bias。norm 的偏移由调用方给。"""
-    base = f"language_model.layers.{index}"
+    base = f"{prefix}.layers.{index}"
     params = {
         "input_norm": _norm(store.read(f"{base}.input_layernorm.weight"), norm_offset),
         "post_norm": _norm(store.read(f"{base}.post_attention_layernorm.weight"), norm_offset),

@@ -7,9 +7,11 @@ import pytest
 
 from sysone.domain.attention import AttentionRole
 from sysone.domain.work import ffn_segments
+from sysone.devices.apple import blobplan
 from sysone.models.families import mude
 
 HIDDEN, FFN = 2048, 6144
+PREFIX = "language_model"
 
 
 def _fake_read(shapes: dict[str, tuple[int, ...]]):
@@ -70,8 +72,8 @@ def _linear_shapes_4b(layer: int) -> dict[str, tuple[int, ...]]:
 
 
 def test_linear_layer_projection_is_8224_rows():
-    entries = mude.ane_layer_weights(_fake_read(_linear_shapes(0)), layer=0,
-                                     layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN)
+    entries = blobplan.ane_layer_weights(_fake_read(_linear_shapes(0)), layer=0,
+                                     layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN, prefix=PREFIX)
     assert entries["proj"].shape == (8224, HIDDEN), "qkv 6144 + z 2048 + a 16 + b 16"
     assert entries["o"].shape == (HIDDEN, HIDDEN)
     assert entries["gate"].shape == entries["up"].shape == (FFN, HIDDEN)
@@ -81,8 +83,8 @@ def test_linear_layer_projection_is_8224_rows():
 
 
 def test_full_layer_projection_is_5120_rows():
-    entries = mude.ane_layer_weights(_fake_read(_full_shapes(3)), layer=3,
-                                     layer_type=AttentionRole.FULL, hidden=HIDDEN, ffn=FFN)
+    entries = blobplan.ane_layer_weights(_fake_read(_full_shapes(3)), layer=3,
+                                     layer_type=AttentionRole.FULL, hidden=HIDDEN, ffn=FFN, prefix=PREFIX)
     assert entries["proj"].shape == (5120, HIDDEN), "q 4096（含门控）+ k 512 + v 512"
     assert entries["o"].shape == (HIDDEN, HIDDEN)
     assert set(entries) == {"proj", "o", "gate", "up", "down0", "down1", "down2"}
@@ -92,8 +94,8 @@ def test_down_is_split_along_k_axis_in_order():
     """三段 down 按列拼回去必须等于原矩阵，顺序不能乱。"""
     read = _fake_read(_linear_shapes(0))
     down = read("language_model.layers.0.mlp.down_proj.weight")
-    entries = mude.ane_layer_weights(read, layer=0, layer_type=AttentionRole.LINEAR,
-                                     hidden=HIDDEN, ffn=FFN)
+    entries = blobplan.ane_layer_weights(read, layer=0, layer_type=AttentionRole.LINEAR,
+                                     hidden=HIDDEN, ffn=FFN, prefix=PREFIX)
     rebuilt = np.concatenate([entries["down0"], entries["down1"], entries["down2"]], axis=1)
     np.testing.assert_array_equal(rebuilt, down)
 
@@ -117,8 +119,9 @@ def test_quantized_layer_takes_the_containers_codes():
         codes = np.where((np.arange(rows)[:, None] + np.arange(cols)[None, :]) % 2 == 0, 1, -1)
         return codes.astype(np.int8), np.full(rows, 0.0625, dtype=np.float32)
 
-    entries = mude.ane_layer_quantized(
-        read, parts, layer=0, layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN
+    entries = blobplan.ane_layer_quantized(
+        read, parts, layer=0, layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN,
+        prefix=PREFIX,
     )
     codes, scales = entries["down0"]
     assert codes.shape == (HIDDEN, HIDDEN) and codes.dtype == np.int8
@@ -142,8 +145,9 @@ def test_quantized_layer_re_quantizes_what_the_container_keeps_as_is():
     """容器里按 16 bit 存的张量（`parts` 给 None）在这里现量化，码不再是棋盘格。"""
     shapes = _linear_shapes(0)
     read = _fake_read(shapes)
-    entries = mude.ane_layer_quantized(
-        read, _no_parts, layer=0, layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN
+    entries = blobplan.ane_layer_quantized(
+        read, _no_parts, layer=0, layer_type=AttentionRole.LINEAR, hidden=HIDDEN, ffn=FFN,
+        prefix=PREFIX,
     )
     codes, scales = entries["gate"]
     assert codes.shape == (FFN, HIDDEN)
@@ -176,8 +180,8 @@ def test_4b_geometry_splits_the_ffn_into_three_full_parts_and_a_tail():
     assert [columns.stop - columns.start for columns in segments] == [2560, 2560, 2560, 1536]
     assert [columns.start for columns in segments] == [0, 2560, 5120, 7680]
     assert segments[-1].stop == 9216
-    entries = mude.ane_layer_weights(_fake_read(_linear_shapes_4b(0)), layer=0,
-                                     layer_type=AttentionRole.LINEAR, hidden=2560, ffn=9216)
+    entries = blobplan.ane_layer_weights(_fake_read(_linear_shapes_4b(0)), layer=0,
+                                     layer_type=AttentionRole.LINEAR, hidden=2560, ffn=9216, prefix=PREFIX)
     assert entries["down3"].shape == (2560, 1536)
     rebuilt = np.concatenate([entries[f"down{i}"] for i in range(4)], axis=1)
     np.testing.assert_array_equal(rebuilt, _fake_read(_linear_shapes_4b(0))(

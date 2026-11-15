@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from ..domain.attention import AttentionRole
 from ..errors import ConfigError
+from .descriptor import ModelDescriptor
 
 
 @dataclass(frozen=True)
@@ -80,3 +81,22 @@ def plan_layers(
 ) -> LayerPlan:
     """`plan_blocks` 的完整版（含角色列表）。"""
     return LayerPlan(blocks=plan_blocks(layer_types, ring), roles=layer_types)
+
+
+@dataclass(frozen=True)
+class WeightPlan:
+    """一份检查点交给设备层的东西：全部是纯数据，没有函数。
+
+    `descriptor` 是**形状的唯一来源**（`Geometry.from_descriptor` 只吃它）。另外三项是
+    "这份检查点怎么存的"：张量名的前缀（h2o 是 `model.language_model`，mude 是
+    `language_model`）、norm 的存法偏移（两个出货模型都是零中心存、真值 `w + 1`）、
+    以及 RoPE 的角基（`rope_parameters.rope_theta`，设备层据此建 cos/sin 表）。
+
+    为什么在 `models` 而不是 `devices`：这四项都是**模型配置/checkpoint 的事实**，
+    与用不用 ANE 无关；设备层只消费它们。家族负责填（`families/*.weight_plan`）。
+    """
+
+    descriptor: ModelDescriptor
+    prefix: str
+    norm_offset: float
+    rope_theta: float

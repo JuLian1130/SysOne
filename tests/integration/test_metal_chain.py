@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sysone.models.families.mude import NORM_OFFSET
+from sysone.models.families import mude
 
 MUDE = os.environ.get("SYS1_MUDE_WEIGHTS")
 pytestmark = pytest.mark.skipif(
@@ -27,7 +27,7 @@ PREFIXES = (0, 4)
 
 
 def _chains():
-    from sysone.devices.apple.chain import MudeChain
+    from sysone.devices.apple.chain import SplitChain
     from sysone.devices.apple.metal import available as metal_available
     from sysone.devices.apple.runtime import AneRuntime
 
@@ -37,15 +37,16 @@ def _chains():
         pytest.skip(f"ANE dylib 不可用：{exc}")
     if not metal_available():
         pytest.skip("Metal dylib 不可用")
-    return MudeChain
+    return SplitChain
 
 
 @pytest.fixture(scope="module")
 def chains():
-    MudeChain = _chains()
-    cpu = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S)
+    SplitChain = _chains()
+    weights = mude.weight_plan(Path(MUDE))
+    cpu = SplitChain.load(MUDE, weights=weights, s=S)
     try:
-        gpu = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S, metal=True)
+        gpu = SplitChain.load(MUDE, weights=weights, s=S, metal=True)
     except BaseException:
         cpu.close()
         raise
@@ -59,8 +60,9 @@ def chains():
 @pytest.fixture(scope="module")
 def chunked():
     """桶宽只有 S/4 的链：同一个 256 列的缓冲要分四段算，用来钉住"桶宽 / 缓冲宽"这条分界。"""
-    MudeChain = _chains()
-    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S // 4, width=S, metal=True)
+    SplitChain = _chains()
+    weights = mude.weight_plan(Path(MUDE))
+    chain = SplitChain.load(MUDE, weights=weights, s=S // 4, width=S, metal=True)
     try:
         yield chain
     finally:
@@ -73,8 +75,9 @@ def packed():
 
     槽宽 128（尾巴 ≤ 128 token）、每桶 2 格，所以四条尾巴正好一个桶、两条桶的打包区。
     """
-    MudeChain = _chains()
-    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S, width=S + 2 * S, metal=True)
+    SplitChain = _chains()
+    weights = mude.weight_plan(Path(MUDE))
+    chain = SplitChain.load(MUDE, weights=weights, s=S, width=S + 2 * S, metal=True)
     try:
         yield chain
     finally:
@@ -84,8 +87,9 @@ def packed():
 @pytest.fixture(scope="module")
 def windowed():
     """带待命窗口（`--W 4`）的桶 64 链：共享前缀的按块形状必须能在换窗里跑完。"""
-    MudeChain = _chains()
-    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S // 4, width=S, metal=True, resident=4)
+    SplitChain = _chains()
+    weights = mude.weight_plan(Path(MUDE))
+    chain = SplitChain.load(MUDE, weights=weights, s=S // 4, width=S, metal=True, resident=4)
     try:
         yield chain
     finally:
@@ -131,8 +135,9 @@ def test_chunked_bucket_matches_the_single_bucket_run(chains, chunked) -> None:
 @pytest.fixture(scope="module")
 def windowed():
     """待命窗口 W=4 的链：只在块边界换常驻，其余与 `gpu` 完全一样。"""
-    MudeChain = _chains()
-    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S, metal=True, resident=4)
+    SplitChain = _chains()
+    weights = mude.weight_plan(Path(MUDE))
+    chain = SplitChain.load(MUDE, weights=weights, s=S, metal=True, resident=4)
     try:
         yield chain
     finally:

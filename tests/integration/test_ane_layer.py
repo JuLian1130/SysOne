@@ -28,7 +28,7 @@ from sysone.devices.apple.compile import (
 )
 from sysone.devices.apple.runtime import AneRuntime
 from sysone.domain.attention import AttentionRole
-from sysone.models.families.mude import ane_layer_segments
+from sysone.devices.apple.blobplan import ane_layer_segments
 from sysone.weights.packing import ane_blob
 from sysone.weights.store import SafeTensorFile
 
@@ -171,13 +171,13 @@ def test_out_projection_at_the_4b_width_matches_numpy(tmp_path: Path) -> None:
 def test_the_4b_layer_program_runs_with_an_uneven_ffn_split(tmp_path: Path) -> None:
     """h2o 的整层 program 在 ANE 上真跑一遍：12352 行投影、`[4096|2560]` out、四段 FFN。
 
-    条目表用**生产路径的那一份**（`mude.ane_layer_segments`），所以这条同时钉住三件事：
+    条目表用**生产路径的那一份**（`blobplan.ane_layer_segments`），所以这条同时钉住三件事：
     4B 的 9216/2560 真的切成了 2560/2560/2560/1536、最后一段的窄 conv 被 ANE 接受、
     四段分别算完累加出来的就是 `down @ h`。权重是合成的（h2o 整链还装不进 `MudeChain`）。
     """
     hidden, ffn, core_out, cout = 2560, 9216, 4096, 12352
     segments = ane_layer_segments(layer=0, layer_type=AttentionRole.LINEAR,
-                                 hidden=hidden, ffn=ffn)
+                                 hidden=hidden, ffn=ffn, prefix="language_model")
     down = {name: columns[0][1] for name, columns in segments.items()
             if name.startswith("down")}
     assert [columns.stop - columns.start for columns in down.values()] == [2560, 2560, 2560, 1536]
