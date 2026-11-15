@@ -494,6 +494,7 @@ class SplitChain:
         sin: np.ndarray,
         prefix: int,
         causal: bool,
+        debug: dict | None = None,
     ) -> np.ndarray:
         """全注意力层：q|gate 交错投影 → q/k 各做 head_dim 的 RMSNorm → 半维 RoPE → GQA → 门控。"""
         xn = _rms(x, params["input_norm"])
@@ -509,6 +510,10 @@ class SplitChain:
         key = rms_norm(p[:length, q_rows:q_rows + k_rows].reshape(length, kv_heads, head_dim),
                        params["k_norm"])
         value = p[:length, q_rows + k_rows:q_rows + 2 * k_rows].reshape(length, kv_heads, head_dim)
+        if debug is not None:
+            # RoPE 会就地覆盖 `query` / `key`，所以旋转前的值先留一份。
+            debug.update(xn=xn, p=p, query_normed=query.copy(), gate=gate,
+                         key_normed=key.copy(), value=value)
         query = apply_rotary(query, cos, sin, rotary_dim=self._geometry.rotary_dim)
         key = apply_rotary(key, cos, sin, rotary_dim=self._geometry.rotary_dim)
         repeat = heads // kv_heads
@@ -521,8 +526,12 @@ class SplitChain:
         keys = np.arange(length)[None, :]
         mask = keys <= queries if causal else (queries >= prefix) | (keys < prefix)
         context = attention(query, key, value, mask).reshape(length, heads * head_dim)
+        if debug is not None:
+            debug.update(query=query, key=key, context=context)
         y, _ = layer.output(_place(context * sigmoid(gate), self._geometry.core_out, self._s), x)
         xn2 = _rms(y, params["post_norm"])
+        if debug is not None:
+            debug.update(y=y, xn2=xn2)
         return layer.feed_forward(xn2, y)[0]
 
     def _linear_layer(
