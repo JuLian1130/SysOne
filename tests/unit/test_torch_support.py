@@ -52,18 +52,45 @@ class _FakeStore:
         return self._payload[name + "__q"], self._payload[name + "__s"]
 
 
+class _TinyModel(torch.nn.Module):
+    """与真实检查点同样的命名：视觉塔在 `model.visual` 下（`skip_prefixes` 认的就是这个前缀）。
+
+    `get_output_embeddings` 是 `PreTrainedModel` 的接口，手写模块要自己补上 —— 少了它
+    `output_weight` 的第一条路就走不通，而这两条路本来都该被测到。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        body = torch.nn.Module()
+        body.layers = torch.nn.ModuleList([torch.nn.Module()])
+        body.layers[0].q_proj = torch.nn.Linear(4, 4)
+        body.embed_tokens = torch.nn.Embedding(8, 4)
+        body.norm = torch.nn.LayerNorm(4)
+        self.model.language_model = body
+        self.model.visual = torch.nn.Module()
+        self.model.visual.patch_embed = torch.nn.Linear(3, 5)
+        self.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+    # 真模型的 `language_model` 与 `visual` 都在 `model` 下；测试里换个短名字方便读，
+    # 所以这里给出两个便捷属性，而不是把断言写成 `filled.model.language_model`。
+    @property
+    def language_model(self) -> torch.nn.Module:
+        return self.model.language_model
+
+    @property
+    def visual(self) -> torch.nn.Module:
+        return self.model.visual
+
+    def get_input_embeddings(self) -> torch.nn.Module:
+        return self.model.language_model.embed_tokens
+
+    def get_output_embeddings(self) -> torch.nn.Module | None:
+        return None      # 真模型里是 `lm_head`；`output_weight` 的第二条路
+
+
 def _tiny_model() -> torch.nn.Module:
-    model = torch.nn.Module()
-    body = torch.nn.Module()
-    body.layers = torch.nn.ModuleList([torch.nn.Module()])
-    body.layers[0].q_proj = torch.nn.Linear(4, 4)
-    body.embed_tokens = torch.nn.Embedding(8, 4)
-    body.norm = torch.nn.LayerNorm(4)
-    model.language_model = body
-    model.lm_head = torch.nn.Linear(4, 8, bias=False)
-    model.visual = torch.nn.Module()
-    model.visual.patch_embed = torch.nn.Linear(3, 5)
-    return model
+    return _TinyModel()
 
 
 def test_int8_linear_matches_float_linear() -> None:
@@ -82,28 +109,31 @@ def test_int8_linear_matches_float_linear() -> None:
 
 
 def test_fill_model_replaces_int8_linears_and_ties() -> None:
-    model = _tiny_model()
+    # 真装载也是先 `with torch.device("meta")` 建壳再就地填（`build_model`），
+    # 所以这里同样从 meta 起：视觉塔"没被填到"才会保持在 meta 上。
+    with torch.device("meta"):
+        model = _tiny_model()
     entries = {
-        "language_model.layers.0.q_proj.weight": _FakeEntry(
-            "language_model.layers.0.q_proj.weight", "int8", (4, 4)
+        "model.language_model.layers.0.q_proj.weight": _FakeEntry(
+            "model.language_model.layers.0.q_proj.weight", "int8", (4, 4)
         ),
-        "language_model.layers.0.q_proj.bias": _FakeEntry(
-            "language_model.layers.0.q_proj.bias", "keep", (4,)
+        "model.language_model.layers.0.q_proj.bias": _FakeEntry(
+            "model.language_model.layers.0.q_proj.bias", "keep", (4,)
         ),
-        "language_model.embed_tokens.weight": _FakeEntry(
-            "language_model.embed_tokens.weight", "keep", (8, 4)
+        "model.language_model.embed_tokens.weight": _FakeEntry(
+            "model.language_model.embed_tokens.weight", "keep", (8, 4)
         ),
-        "language_model.norm.weight": _FakeEntry("language_model.norm.weight", "keep", (4,)),
-        "language_model.norm.bias": _FakeEntry("language_model.norm.bias", "keep", (4,)),
+        "model.language_model.norm.weight": _FakeEntry("model.language_model.norm.weight", "keep", (4,)),
+        "model.language_model.norm.bias": _FakeEntry("model.language_model.norm.bias", "keep", (4,)),
         "lm_head.weight": _FakeEntry("lm_head.weight", "keep", (8, 4)),
     }
     payload = {
-        "language_model.layers.0.q_proj.weight__q": np.zeros((4, 4), dtype=np.int8),
-        "language_model.layers.0.q_proj.weight__s": np.ones((4,), dtype=np.float32),
-        "language_model.layers.0.q_proj.bias": np.zeros((4,), dtype=np.float32),
-        "language_model.embed_tokens.weight": np.zeros((8, 4), dtype=np.float32),
-        "language_model.norm.weight": np.ones((4,), dtype=np.float32),
-        "language_model.norm.bias": np.zeros((4,), dtype=np.float32),
+        "model.language_model.layers.0.q_proj.weight__q": np.zeros((4, 4), dtype=np.int8),
+        "model.language_model.layers.0.q_proj.weight__s": np.ones((4,), dtype=np.float32),
+        "model.language_model.layers.0.q_proj.bias": np.zeros((4,), dtype=np.float32),
+        "model.language_model.embed_tokens.weight": np.zeros((8, 4), dtype=np.float32),
+        "model.language_model.norm.weight": np.ones((4,), dtype=np.float32),
+        "model.language_model.norm.bias": np.zeros((4,), dtype=np.float32),
         "lm_head.weight": np.zeros((8, 4), dtype=np.float32),
     }
     config = SimpleNamespace(tie_word_embeddings=True)
@@ -121,6 +151,63 @@ def test_fill_model_replaces_int8_linears_and_ties() -> None:
     # tied：lm_head 与 embedding 共用同一个 Parameter
     embed = filled.language_model.embed_tokens._parameters["weight"]
     assert filled.lm_head._parameters["weight"] is embed
+
+
+class _Rope(torch.nn.Module):
+    """模拟 transformers 的 rope 模块：派生 buffer 由构造器自己算，权重文件里没有。"""
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+        freqs = 1.0 / (float(config.theta) ** (torch.arange(0, 4, 2, dtype=torch.float) / 4.0))
+        self.register_buffer("inv_freq", freqs, persistent=False)
+        self.register_buffer("original_inv_freq", freqs.clone(), persistent=False)
+
+
+def test_meta_rope_buffers_are_materialized() -> None:
+    """派生 buffer 留在 meta 上是必然的崩溃点：静态 rope 从不重算它们（票据 12）。"""
+    from sysone.models.vendors.torch_support import _materialize_derived
+
+    holder = torch.nn.Module()
+    with torch.device("meta"):
+        holder.rope = _Rope(SimpleNamespace(theta=10_000.0))
+    assert holder.rope.inv_freq.device.type == "meta"
+    _materialize_derived(holder, device=torch.device("cpu"))
+    reference = _Rope(SimpleNamespace(theta=10_000.0)).inv_freq
+    assert holder.rope.inv_freq.device.type == "cpu"
+    assert holder.rope.inv_freq.dtype == torch.float32
+    assert torch.equal(holder.rope.inv_freq, reference)
+    assert torch.equal(holder.rope.original_inv_freq, reference)
+
+
+def test_a_real_buffer_is_left_alone() -> None:
+    """没有 meta buffer 的模块不该被重建（`__init__` 都不该被调用）。"""
+    from sysone.models.vendors.torch_support import _materialize_derived
+
+    class _Exploding(_Rope):
+        def __init__(self, config) -> None:  # pragma: no cover - 被调用就是失败
+            raise AssertionError("不该重建一个已经实化的模块")
+
+    holder = torch.nn.Module()
+    holder.rope = _Rope(SimpleNamespace(theta=10_000.0))
+    holder.exploding = _Exploding.__new__(_Exploding)
+    torch.nn.Module.__init__(holder.exploding)
+    holder.exploding.config = SimpleNamespace(theta=1.0)
+    holder.exploding.register_buffer("inv_freq", torch.ones(2), persistent=False)
+    _materialize_derived(holder, device=torch.device("cpu"))
+    assert torch.equal(holder.exploding.inv_freq, torch.ones(2))
+
+
+def test_a_meta_buffer_without_a_config_is_an_error() -> None:
+    from sysone.errors import MissingTensorError  # noqa: F401  断言类型
+    from sysone.models.vendors.torch_support import _materialize_derived
+
+    holder = torch.nn.Module()
+    with torch.device("meta"):
+        holder.register_buffer("loose", torch.zeros(3), persistent=False)
+    with pytest.raises(Exception) as info:
+        _materialize_derived(holder, device=torch.device("cpu"))
+    assert "meta buffer" in str(info.value)
 
 
 def test_output_weight_prefers_tied_embedding() -> None:

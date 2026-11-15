@@ -170,8 +170,41 @@ def fill_model(
             _assign(module, name, _to(store.read_raw(full), device, buf.dtype), param=False)
             handled.add(full)
 
+    _materialize_derived(model, device=device)
     _tie_embeddings(model, config, dtype)
     return model
+
+
+def _materialize_derived(model: torch.nn.Module, *, device: torch.device) -> None:
+    """把派生 buffer（rotary 的 `inv_freq` / `original_inv_freq`）从 meta 变成真实值。
+
+    它们是 `persistent=False`，权重文件里没有，装载时只能由模块自己算出来 —— meta 建出来的
+    只是个空壳。留着它在 meta 上不是"省一次计算"，是**必然的崩溃点**：
+    `Qwen3_5TextRotaryEmbedding` 只在序列超过 `max_seq_len_cached`（= `max_position_embeddings`）
+    时才重算（`dynamic_frequency_update` 的增长分支），静态 rope 永远走不到那条分支，于是
+    前向里的 `inv_freq` 还是 meta 张量。实测的症状不指向这里：torchcast 的厂商引擎在
+    `autocast(bf16)` 里跑前向，meta 张量没被 autocast 转换、真实张量被转了，报出来的是
+    "expected scalar type torch.float32 but found torch.bfloat16"（`meta_bmm` 的 dtype 校验）。
+
+    做法是最小的一步：用模块自己的构造器在真实设备上再建一个同类实例，把它算出来的同名
+    buffer 拷过来。这样连 rope 的具体公式都不必知道，跟着 transformers 的版本走。
+    """
+    for module_path, module in list(model.named_modules()):
+        pending = [name for name, buffer in module._buffers.items()
+                   if buffer is not None and buffer.device.type == "meta"]
+        if not pending:
+            continue
+        config = getattr(module, "config", None)
+        if config is None:
+            raise MissingTensorError("模块留有 meta buffer 且无 config 可重建",
+                                     module=module_path, buffers=pending)
+        fresh = type(module)(config)
+        for name in pending:
+            built = fresh._buffers.get(name)
+            if built is None:
+                raise MissingTensorError("重建的模块没有同名 buffer", module=module_path,
+                                         buffer=name)
+            module._buffers[name] = built.detach().to(device)
 
 
 def _tie_embeddings(model: torch.nn.Module, config: object, dtype: torch.dtype) -> None:

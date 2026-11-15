@@ -117,11 +117,6 @@ class TorchcastBridge:
             raise NotReadyError("厂商桥预热前向产生了非法概率", bridge=self.name, probs=list(probs))
         if abs(sum(probs) - 1.0) > 1e-3:
             raise NotReadyError("厂商桥预热前向概率未归一", bridge=self.name, total=sum(probs))
-        return CompilationTimes(
-            load_s=self._load_s,
-            compile_s=0.0,
-            warmup_s=time.perf_counter() - started,
-        )
 
     # ---------------------------------------------------------------- decide
     def decide(self, state: str, question: dict, *, mode: MaskMode) -> VendorAnswer:
