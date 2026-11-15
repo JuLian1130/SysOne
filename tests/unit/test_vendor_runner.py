@@ -207,3 +207,64 @@ def test_engine_config_is_frozen() -> None:
     config = _config()
     with pytest.raises(dataclasses.FrozenInstanceError):
         config.service.port = 1  # type: ignore[misc]
+
+
+# ---- 票据 12：`attention_mode` 是逐请求的，双向开关是进程级的 --------------------------
+
+
+def test_the_h2o_bridge_can_leave_bidirectional_mode() -> None:
+    """双向开关要能关：否则一条 `noncausal_full` 之后所有 `causal` 请求都实际跑双向。
+
+    jeff 只给 `enable()`；这里用假 backbone 核对"置回 `is_causal` + 清模式标记"这一步，
+    它正是 jeff 自己的 `causal()` 上下文管理器做的事。
+    """
+    pytest.importorskip("torch")            # 桥在模块级 import torch
+    from sysone.models.vendors.h2o_bridge import H2OBridge
+
+    class _Attention:
+        def __init__(self) -> None:
+            self.is_causal = False
+
+    class _Layer:
+        def __init__(self) -> None:
+            self.self_attn = _Attention()
+
+    class _Backbone:
+        def __init__(self) -> None:
+            self.layers = [_Layer(), _Layer()]
+            self._jev_bidirectional = "full"
+
+    bridge = object.__new__(H2OBridge)          # 不装载权重：只测状态机
+    bridge._backbone = _Backbone()
+    bridge._bidir = True
+
+    bridge._apply_mode(MaskMode.CAUSAL)
+    assert [layer.self_attn.is_causal for layer in bridge._backbone.layers] == [True, True]
+    assert bridge._backbone._jev_bidirectional is None
+    assert bridge._bidir is False
+
+    bridge._leave_bidirectional()               # 幂等：没开的时候什么都不做
+    assert bridge._bidir is False
+
+
+def test_option_descriptions_survive_the_trip_to_a_vendor() -> None:
+    """协议把选项拼成 `"<键>: <描述>"`；厂商的 criteria 要的是**两个字段**（票据 12）。
+
+    不拆的话厂商看到的是「键: 键」—— 判据描述整个丢掉，真实题集上 h2o 有 7/105、torchcast 有
+    6/105 条判词因此不同。
+    """
+    from sysone.models.vendors.base import question_spec
+
+    composed = Question(
+        text="Which option?",
+        options=("approve: pay 45 days after the survey", "deny: sensitive goods"),
+    )
+    spec = question_spec(composed)
+    assert spec["criteria"] == {
+        "approve": "pay 45 days after the survey",
+        "deny": "sensitive goods",
+    }
+    # 没有描述时两侧相同（旧行为），noul 没有选项
+    bare = Question(text="Which option?", options=("admit", "deny_score"))
+    assert question_spec(bare)["criteria"] == {"admit": "admit", "deny_score": "deny_score"}
+    assert question_spec(Question(text="Does it hold?", kind="noul"))["criteria"] == {}

@@ -198,8 +198,18 @@ class H2OBridge:
 
     # ---------------------------------------------------------------- 内部
     def _apply_mode(self, mode: MaskMode) -> None:
-        """双向读法靠 jeff 的 bidir 把全注意力层改成无因果掩码。"""
+        """双向读法靠 jeff 的 bidir 把全注意力层改成无因果掩码；causal 要能**切回去**。
+
+        这个开关是进程级状态（`is_causal` 写在层上），而 `attention_mode` 是逐请求的：只开不关
+        的话，一条 `noncausal_full` 之后所有 `causal` 请求实际都跑双向，而且 `provenance` 还
+        报 `causal` —— 静默错。（票据 12 的探针里撞到过：先跑完 105 题双向再跑 causal，
+        同一批题里 3/24 的判词对不上自己的"原装问法"。）
+
+        jeff 只提供 `enable()`，没有 `disable()`；把它自己的 `causal()` 上下文管理器做的事
+        原样做一遍：把 `is_causal` 置回真、清掉模式标记。
+        """
         if mode is MaskMode.CAUSAL:
+            self._leave_bidirectional()
             return
         if mode is not MaskMode.NONCAUSAL_FULL:
             raise UnsupportedModeError("h2o 桥只支持 causal / noncausal_full", mode=mode.value)
@@ -215,6 +225,17 @@ class H2OBridge:
             ) from exc
         bidir.enable(self._backbone, "full")
         self._bidir = True
+
+    def _leave_bidirectional(self) -> None:
+        """把全注意力层改回因果（jeff 的 `causal()` 上下文管理器在被调用时做的事）。"""
+        if not self._bidir:
+            return
+        for layer in getattr(self._backbone, "layers", ()):
+            attention = getattr(layer, "self_attn", None)
+            if attention is not None and getattr(attention, "is_causal", True) is False:
+                attention.is_causal = True
+        self._backbone._jev_bidirectional = None
+        self._bidir = False
 
     def _label_ids(self, prompt: str, ids: list[int], labels: list[str]) -> torch.Tensor:
         """每个选项标签在回答槽上的单 token id（必须是恰好一个新 token）。"""
