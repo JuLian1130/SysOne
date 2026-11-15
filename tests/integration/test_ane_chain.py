@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from sysone.devices.apple.chain import MudeChain
+from sysone.models.families.mude import NORM_OFFSET
 
 MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
 WEIGHTS = MUDE_DIR / "model.safetensors"
@@ -31,7 +32,7 @@ def _skip_reason() -> str | None:
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
 def test_chain_probabilities_and_repeat(tmp_path: Path) -> None:
     """最省的一次前向：形状对、概率归一，而且第二次调用与第一次逐位相同。"""
-    chain = MudeChain.load(MUDE_DIR, s=256, scratch_dir=tmp_path / "programs")
+    chain = MudeChain.load(MUDE_DIR, norm_offset=NORM_OFFSET, s=256, scratch_dir=tmp_path / "programs")
     try:
         tokens = [1, 2, 3, 4]
         probabilities = chain.forward(tokens, options=3)

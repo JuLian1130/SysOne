@@ -56,11 +56,6 @@ def build_layer_plan(descriptor: ModelDescriptor, config: EngineConfig) -> Layer
     return qwen35.layer_plan(descriptor, config)
 
 
-def normalize_norm(weight: np.ndarray) -> np.ndarray:
-    """norm 权重补 `+1`（`NORM_OFFSET` 的说明见上）。"""
-    return np.asarray(weight, dtype=np.float32) + NORM_OFFSET
-
-
 # ---------------------------------------------------------------------- 题面
 
 # 线格式（`d3-code-readout-v1`，见 mude-bench 的 `d3_format.py`）：每个选项前面挂一个单 token

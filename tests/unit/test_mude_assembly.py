@@ -80,10 +80,13 @@ def test_down_is_split_along_k_axis_in_order():
     np.testing.assert_array_equal(rebuilt, down)
 
 
-def test_norm_gets_plus_one():
-    raw = np.zeros(8, dtype=np.float16)
-    assert np.allclose(mude.normalize_norm(raw), 1.0)
-    assert mude.normalize_norm(raw).dtype == np.float32
+def test_the_checkpoint_needs_the_plus_one_norm_offset():
+    """这份 checkpoint 的 norm 是零中心存的，真值是 `w + 1`（README §10.22）。
+
+    这个数由家族递给设备层（`MudeChain.load` 的 `norm_offset`），设备层不再认识它；
+    改成 0 时第 0 层的 cos 会掉到 0.53，所以它是与权重文件绑定的契约，不是调参。
+    """
+    assert mude.NORM_OFFSET == 1.0
 
 
 def test_4b_geometry_is_rejected_by_the_shared_rule():

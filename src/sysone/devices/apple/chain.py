@@ -17,7 +17,7 @@ import numpy as np
 
 from ...domain.attention import AttentionRole
 from ...errors import ConfigError
-from ...models.families.mude import CODE_ROWS, ane_layer_weights, normalize_norm
+from ...models.families.mude import CODE_ROWS, ane_layer_weights
 from ...weights.packing.ane_blob import build as build_blob
 from ...weights.store import SafeTensorFile
 from .compile import (
@@ -146,6 +146,7 @@ class MudeChain:
         model_dir: str | Path,
         *,
         device: str = "ane",
+        norm_offset: float,
         s: int = S_NATIVE,
         width: int | None = None,
         quantize: bool = True,
@@ -168,6 +169,11 @@ class MudeChain:
         `resident` 是待命常驻的层数，`None` 表示 20 层全装（今天的行为）。给值时不能小于
         最大块长 —— `blocks()` 里一个块内的层是同时在飞的，整块必须常驻；窗口在块边界换窗、
         重装在线程上预取，省掉窗口之外的 ANE 权重，代价是每层约 66 ms（见 `residency.py`）。
+
+        `norm_offset` 是 norm 权重的**存法偏移**：真值是 `w + offset`。mude 这份 checkpoint
+        是零中心存的（`+1`；不补时第 0 层 cos 只有 0.53，见 `docs/ANE/README.md` §10.22），
+        标准 RMSNorm 是 0。它由家族递给设备层（`mude.NORM_OFFSET`），设备层不认识任何具体
+        checkpoint —— 所以这里**没有默认值**：默认零会让"忘了给"看起来像跑通了。
         """
         if device != "ane":
             raise ValueError(f"mude 链只有 ANE 设备，收到 {device!r}")
@@ -246,7 +252,8 @@ class MudeChain:
                                cout=max(geometry.cout_full, geometry.cout_gdn), s=s)
                     for _ in range(pool_slots(roles))]
         try:
-            params = [_layer_params(store, index, role) for index, role in enumerate(roles)]
+            params = [_layer_params(store, index, role, norm_offset)
+                      for index, role in enumerate(roles)]
             # 产物目录按 (模型名, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
             # 的测试就会把 `s=1024` 的缓存顶掉，下一次装载要多花 9 s 重算权重与量化。
             program_root = scratch / root.name / f"s{s}"
@@ -269,7 +276,7 @@ class MudeChain:
                 layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
                                        hidden=hidden, cout=cout, ffn=ffn, s=s, pool=pool,
                                        split_rows=split))
-            final_norm = normalize_norm(store.read("language_model.norm.weight"))
+            final_norm = _norm(store.read("language_model.norm.weight"), norm_offset)
             readout = _readout(root)
             temperature = float(decision.get("temperature", 1.0))
             cos, sin = _rope_table(theta, width, rotary_dim)
@@ -658,22 +665,30 @@ def _readout(root: Path) -> np.ndarray:
     return np.asarray(weight, np.float32)
 
 
-def _layer_params(store: SafeTensorFile, index: int, role: AttentionRole) -> dict[str, np.ndarray]:
-    """一层的 numpy 侧权重：各 norm、卷积、A_log / dt_bias。norm 都补 `+1`（零中心保存）。"""
+def _norm(weight: np.ndarray, offset: float) -> np.ndarray:
+    """norm 的真值：`w + offset`。偏移是 checkpoint 的存法，由家族给（见 `load`）。"""
+    return np.asarray(weight, np.float32) + offset
+
+
+def _layer_params(
+    store: SafeTensorFile, index: int, role: AttentionRole, norm_offset: float
+) -> dict[str, np.ndarray]:
+    """一层的 numpy 侧权重：各 norm、卷积、A_log / dt_bias。norm 的偏移由调用方给。"""
     base = f"language_model.layers.{index}"
     params = {
-        "input_norm": normalize_norm(store.read(f"{base}.input_layernorm.weight")),
-        "post_norm": normalize_norm(store.read(f"{base}.post_attention_layernorm.weight")),
+        "input_norm": _norm(store.read(f"{base}.input_layernorm.weight"), norm_offset),
+        "post_norm": _norm(store.read(f"{base}.post_attention_layernorm.weight"), norm_offset),
     }
     if role is AttentionRole.FULL:
         attn = f"{base}.self_attn"
-        params["q_norm"] = normalize_norm(store.read(f"{attn}.q_norm.weight"))
-        params["k_norm"] = normalize_norm(store.read(f"{attn}.k_norm.weight"))
+        params["q_norm"] = _norm(store.read(f"{attn}.q_norm.weight"), norm_offset)
+        params["k_norm"] = _norm(store.read(f"{attn}.k_norm.weight"), norm_offset)
     else:
         attn = f"{base}.linear_attn"
         params["conv"] = np.asarray(store.read(f"{attn}.conv1d.weight"), np.float32).reshape(-1, 4)
         params["a_log"] = np.asarray(store.read(f"{attn}.A_log"), np.float32)
         params["dt_bias"] = np.asarray(store.read(f"{attn}.dt_bias"), np.float32)
-        # `linear_attn.norm.weight` 不是零中心存的（`RMSNormGated` 的初始化是全 1），直接用。
+        # 这个 norm 不跟 `norm_offset` 走：`RMSNormGated` 的初始化是全 1，这份 checkpoint 里
+        # 它是按标准 RMSNorm 存的（零中心约定只覆盖上面那四个 HF norm），直接用。
         params["norm"] = np.asarray(store.read(f"{attn}.norm.weight"), np.float32)
     return params

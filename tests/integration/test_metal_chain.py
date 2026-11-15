@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from sysone.models.families.mude import NORM_OFFSET
+
 MUDE = os.environ.get("SYS1_MUDE_WEIGHTS")
 pytestmark = pytest.mark.skipif(
     not MUDE or not Path(MUDE).is_dir(),
@@ -41,9 +43,9 @@ def _chains():
 @pytest.fixture(scope="module")
 def chains():
     MudeChain = _chains()
-    cpu = MudeChain.load(MUDE, s=S)
+    cpu = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S)
     try:
-        gpu = MudeChain.load(MUDE, s=S, metal=True)
+        gpu = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S, metal=True)
     except BaseException:
         cpu.close()
         raise
@@ -58,7 +60,7 @@ def chains():
 def chunked():
     """桶宽只有 S/4 的链：同一个 256 列的缓冲要分四段算，用来钉住"桶宽 / 缓冲宽"这条分界。"""
     MudeChain = _chains()
-    chain = MudeChain.load(MUDE, s=S // 4, width=S, metal=True)
+    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S // 4, width=S, metal=True)
     try:
         yield chain
     finally:
@@ -72,7 +74,7 @@ def packed():
     槽宽 128（尾巴 ≤ 128 token）、每桶 2 格，所以四条尾巴正好一个桶、两条桶的打包区。
     """
     MudeChain = _chains()
-    chain = MudeChain.load(MUDE, s=S, width=S + 2 * S, metal=True)
+    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S, width=S + 2 * S, metal=True)
     try:
         yield chain
     finally:
@@ -83,7 +85,7 @@ def packed():
 def windowed():
     """带待命窗口（`--W 4`）的桶 64 链：共享前缀的按块形状必须能在换窗里跑完。"""
     MudeChain = _chains()
-    chain = MudeChain.load(MUDE, s=S // 4, width=S, metal=True, resident=4)
+    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S // 4, width=S, metal=True, resident=4)
     try:
         yield chain
     finally:
@@ -130,7 +132,7 @@ def test_chunked_bucket_matches_the_single_bucket_run(chains, chunked) -> None:
 def windowed():
     """待命窗口 W=4 的链：只在块边界换常驻，其余与 `gpu` 完全一样。"""
     MudeChain = _chains()
-    chain = MudeChain.load(MUDE, s=S, metal=True, resident=4)
+    chain = MudeChain.load(MUDE, norm_offset=NORM_OFFSET, s=S, metal=True, resident=4)
     try:
         yield chain
     finally:

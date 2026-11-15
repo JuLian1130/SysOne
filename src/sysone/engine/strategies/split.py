@@ -291,6 +291,8 @@ def mude_runner(
     def load_chain() -> ModelChain:
         return MudeChain.load(
             model_dir,
+            # 这份 checkpoint 的 norm 是零中心存的（真值 `w + 1`）：约定属于家族，设备层不猜。
+            norm_offset=mude_family.NORM_OFFSET,
             s=bucket_width,
             width=buffer_width,
             quantize=quantize,
