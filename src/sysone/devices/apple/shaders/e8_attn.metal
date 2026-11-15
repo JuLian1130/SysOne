@@ -97,6 +97,13 @@
 #define AT_NCHUNK (256u / AT_KC)   // staging chunks per 256-channel K or V block
 #define AT_LOG2E  1.4426950408889634f
 
+// Q 与输出累加器是**逐个命名的 32 个 8x8 分片**（`q_0..q_31` / `c_0..c_31`），偏移写死成
+// 0/8/…/248，也就是恰好 `E8_HEAD_DIM == 256`。别的头维不会报错，只会读错行、算出看似正常
+// 的错答案（实测 head_dim 128/64/32 与 numpy 差 96%–140%，256 时是 1e-3），所以在这里拦下。
+#if (E8_HEAD_DIM != 256)
+#error "k_attn: Q/累加器分片是按 E8_HEAD_DIM == 256 命名的（q_0..q_31 / c_0..c_31）"
+#endif
+
 // 8x8 fragment geometry: lane l holds elements (row, col) and (row, col+1), with
 //   row = ((l>>1)&3) | ((l>>4)&1)<<2        col = (l&1)<<1 | ((l>>3)&1)<<2
 // verified on this GPU by simdgroup_store of a known matrix through a lane dump.
