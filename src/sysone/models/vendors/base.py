@@ -47,17 +47,30 @@ class VendorBridge(Protocol):
         """释放权重。"""
 
 
+# 协议层把选项拼成 `"<key>: <描述>"`（`service/protocol._wire_question`），而厂商的线格式要的是
+# **两个字段**：选项键（它自己排 A/B/C 字母）与判据描述。`question_spec` 只拿到拼好的那一个
+# 字符串，所以这里按第一个 `": "` 拆回去 —— 不拆的话厂商看到的是「键: 键」，判据描述整个丢掉。
+_OPTION_SEPARATOR = ": "
+
+
 def question_spec(question: Question) -> dict:
     """把 domain 的 Question 转成厂商线格式的问题描述。
 
-    厂商自己的 `question_prompt` 会按 type 选模板；criteria 用「选项→判据」
-    的自然语言映射，选项本身即判据（与旧实现一致）。
+    厂商自己的 `question_prompt` 会按 type 选模板；criteria 是「选项键 → 判据描述」的映射。
+    没有描述（选项就是键本身）时两侧相同，与旧实现一致。
+
+    拆分的必要性是实测的（票据 12）：只给键不给描述时，h2o 在真实题集上与厂商自己的 harness
+    有 7/105 条判词不同（torchcast 6/105）；把厂商原装的 criteria 喂回去，这 13 条**全部**
+    复现 —— 也就是说差的不是权重、不是掩码、也不是 dtype，是选项行里少了判据描述。
     """
-    options = question.options or ()
+    criteria: dict[str, str] = {}
+    for option in question.options or ():
+        key, separator, description = option.partition(_OPTION_SEPARATOR)
+        criteria[key if separator else option] = description if separator else option
     return {
         "type": question.kind,
         "instructions": question.text,
-        "criteria": {option: option for option in options},
+        "criteria": criteria,
     }
 
 
