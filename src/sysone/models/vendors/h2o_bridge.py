@@ -1,9 +1,8 @@
 """H2O-Lightning-4B 桥：模板、读出与双向读法全部来自厂商自带代码。
 
-厂商包给的三个入口在这里被原样调用：
-- `h2o_lightning_shim.Contract(cfg)` 从 `serve_config.json` 读服务设置；
-- `Contract.question_prompt(state_text, q)` 渲染题面（包含选项标签与回答槽）；
-- `h2o_lightning_shim.format_answer(...)` 把答案槽上的 logprobs 转成线格式。
+厂商包给的入口由 `h2o_serve.Serve` 统一调用（题面渲染、标签落 token、`format_answer`），
+那条答面与 `engine/strategies/pooled.py` 的 ANE 链**共用同一份** —— 两条路要是各有各的
+模板，概率差多少都说不清是谁的问题。
 
 我们只负责：用 int8 码表把权重装进 transformers 的 Qwen3.5 结构，以及按请求的
 注意力模式决定要不要让全注意力层读双向。
@@ -18,8 +17,6 @@
 
 from __future__ import annotations
 
-import importlib.util
-import json
 import math
 import time
 from pathlib import Path
@@ -29,13 +26,12 @@ import torch
 
 from ...domain.attention import MaskMode
 from ...domain.work import CompilationTimes
-from ...errors import ConfigError, NotReadyError, ReadoutError, UnsupportedModeError
+from ...errors import NotReadyError, UnsupportedModeError
 from ...weights.packing.row_int8 import RowInt8Store
-from .base import VendorAnswer, wire_answer
+from .base import VendorAnswer
+from .h2o_serve import Serve
 from .torch_support import build_model, fill_model, text_backbone, torch_dtype
 
-_SHIM_FILE = "h2o_lightning_shim.py"
-_SERVE_FILE = "serve_config.json"
 # 预热题：只用两个选项，尽量便宜，目的只是把冷启动那次前向烧掉
 _WARMUP_STATE = "warmup"
 _WARMUP_QUESTION = {
@@ -56,18 +52,6 @@ _SKIP_PREFIXES = (
     _EMBED_NAME,                 # 词表整表：按行取（见 `_embed_rows` / `_option_rows`）
     "lm_head.",                  # tied，读出直接取词表行
 )
-
-
-def _load_shim(model_dir: Path):
-    path = model_dir / _SHIM_FILE
-    if not path.exists():
-        raise ConfigError("厂商目录缺少 shim", path=str(path))
-    spec = importlib.util.spec_from_file_location("h2o_lightning_shim", path)
-    if spec is None or spec.loader is None:
-        raise ConfigError("无法加载 shim", path=str(path))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _default_precision(device: torch.device) -> str:
@@ -102,9 +86,7 @@ class H2OBridge:
         self.device = torch.device(device)
         # 计算精度默认"跟随设备"（`_default_precision`）：加速器上 bf16，CPU 上 fp32。
         self.dtype = torch_dtype(precision or _default_precision(self.device))
-        self._shim = None
-        self._contract = None
-        self._tokenizer = None
+        self._serve = None
         self._model = None
         self._backbone = None
         self._store = None
@@ -114,18 +96,7 @@ class H2OBridge:
     # ------------------------------------------------------------------ load
     def load(self) -> None:
         started = time.perf_counter()
-        serve = self.dir / _SERVE_FILE
-        if not serve.exists():
-            raise ConfigError("厂商目录缺少 serve_config.json", path=str(serve))
-        cfg = json.loads(serve.read_text(encoding="utf-8"))
-        self._shim = _load_shim(self.dir)
-        try:
-            self._contract = self._shim.Contract(cfg)
-        except (ValueError, KeyError) as exc:
-            raise ConfigError("serve_config.json 与 shim 不匹配", reason=str(exc)) from exc
-        import transformers
-
-        self._tokenizer = transformers.AutoTokenizer.from_pretrained(str(self.dir))
+        self._serve = Serve.open(self.dir)
         self._store = RowInt8Store(self.dir)
         model, config = build_model(self.dir, dtype=self.dtype)
         self._model = fill_model(
@@ -174,12 +145,8 @@ class H2OBridge:
         started = time.perf_counter()
         self._apply_mode(mode)
 
-        state_text = self._shim.render_state(state, self._contract.state_compact)
-        prompt, names, descs, labels = self._contract.question_prompt(state_text, question)
-        ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        if not ids:
-            raise ReadoutError("渲染出的 prompt 是空的")
-        label_ids = self._label_ids(prompt, ids, labels)
+        prepared = self._serve.prepare(state, question)
+        ids = list(prepared.ids)
 
         attention_mask = torch.ones((1, len(ids)), dtype=torch.long, device=self.device)
         with torch.no_grad():
@@ -190,24 +157,13 @@ class H2OBridge:
                 return_dict=True,
             )
         hidden = out.last_hidden_state[:, -1].float()[0]
-        logprobs = (hidden @ self._option_rows(label_ids).T).detach().cpu().tolist()
+        logits = (hidden @ self._option_rows(prepared.label_ids).T).detach().cpu().tolist()
 
-        kind = question.get("type", "choice")
-        temperature = self._contract.temperature_by_type.get(kind, self._contract.temperature)
-        result = self._shim.format_answer(
-            kind,
-            names,
-            descs,
-            logprobs,
-            temperature,
-            self._contract.noul_floor,
-            self._shim.noul_threshold(question),
-        )
-        answer = wire_answer(result)
+        value, labels, probs = self._serve.answer(prepared, logits)
         return VendorAnswer(
-            value=answer[0],
-            labels=answer[1],
-            probs=answer[2],
+            value=value,
+            labels=labels,
+            probs=probs,
             input_tokens=len(ids),
             readout_s=time.perf_counter() - started,
         )
@@ -262,21 +218,6 @@ class H2OBridge:
                 attention.is_causal = True
         self._backbone._jev_bidirectional = None
         self._bidir = False
-
-    def _label_ids(self, prompt: str, ids: list[int], labels: list[str]) -> list[int]:
-        """每个选项标签在回答槽上的单 token id（必须是恰好一个新 token）。"""
-        base = len(ids)
-        picked: list[int] = []
-        for label in labels:
-            probe = self._tokenizer(prompt + " " + label, add_special_tokens=False)["input_ids"]
-            if len(probe) != base + 1:
-                raise ReadoutError(
-                    "选项标签不是单 token，无法在回答槽上读出",
-                    label=label,
-                    tokens=len(probe) - base,
-                )
-            picked.append(int(probe[-1]))
-        return picked
 
     # ------------------------------------------------------------ 词表按行取
     def _embed_rows(self, ids: list[int]) -> torch.Tensor:

@@ -1,0 +1,153 @@
+"""`Serve` 的答面接线：题面怎么渲染、标签怎么落到 token、logits 怎么交给厂商判。
+
+不依赖 transformers / torch：shim、`serve_config` 契约与分词器都是假的。真 shim 与真分词器
+在 `.scratch` 的对拍里跑（那里两边都用同一份厂商代码）。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from sysone.errors import ConfigError, ReadoutError
+from sysone.models.vendors.h2o_serve import Serve
+
+CONFIG = {
+    "labels": ["A", "B", "C"],
+    "max_options": 3,
+    "temperature": {"choice": 0.5, "noul": 2.0, "score": 1.0},
+    "noul_floor": 0.0,
+}
+
+
+class FakeContract:
+    """`serve_config.json` 的等价物：只留 `Serve` 用到的那几项。"""
+
+    def __init__(self, cfg: dict) -> None:
+        self.state_compact = True
+        self.temperature_by_type = dict(cfg["temperature"])
+        self.temperature = self.temperature_by_type["choice"]
+        self.noul_floor = float(cfg["noul_floor"])
+        self.labels = list(cfg["labels"])
+
+    def question_prompt(self, state_text: str, spec: dict):
+        """把选项按字母排好：名字原样，标签取 CONFIG 里的前 n 个。"""
+        names = list(spec["criteria"])
+        descs = [spec["criteria"][name] for name in names]
+        labels = self.labels[: len(names)]
+        prompt = f"{state_text}|{'/'.join(labels)}|Answer:"
+        return prompt, names, descs, labels
+
+
+class FakeShim:
+    """最小 shim：题面原样返回 state，答案用 `probabilities`（softmax 除温度）。"""
+
+    Contract = FakeContract
+
+    def render_state(self, state: str, compact: bool) -> str:
+        assert compact is True
+        return state
+
+    def noul_threshold(self, spec: dict):
+        return None
+
+    def format_answer(self, typ, names, descs, logprobs, temperature, noul_floor, threshold):
+        scaled = [value / temperature for value in logprobs]
+        top = max(scaled)
+        weights = [pow(2.718281828459045, value - top) for value in scaled]
+        total = sum(weights)
+        probs = [value / total for value in weights]
+        best = max(range(len(probs)), key=probs.__getitem__)
+        return {
+            "type": "choice",
+            "choice": names[best],
+            "probabilities": {name: value for name, value in zip(names, probs)},
+            "confidence": probs[best],
+        }
+
+
+class FakeTokenizer:
+    """空格直接丢掉，其余逐字符成 token —— 于是 `prompt + " " + 单字符标签` 恰好多一个 token。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __call__(self, text: str, *, add_special_tokens: bool):
+        assert add_special_tokens is False
+        self.calls.append(text)
+        return {"input_ids": [ord(char) for char in text if char != " "]}
+
+
+def spec(options=("A", "B"), instructions="pick one") -> dict:
+    return {
+        "type": "choice",
+        "instructions": instructions,
+        "criteria": {option: f"description of {option}" for option in options},
+    }
+
+
+def serve(**kwargs) -> tuple[Serve, FakeTokenizer]:
+    tokenizer = FakeTokenizer()
+    return Serve(CONFIG, FakeShim(), tokenizer, **kwargs), tokenizer
+
+
+# ------------------------------------------------------------------ prepare
+def test_prepare_carries_prompt_labels_and_temperature():
+    """题面、回答槽上的标签 token、每题型的温度 —— 都是厂商契约给的，不许在别处重算。"""
+    subject, _ = serve()
+    prepared = subject.prepare("record", spec(options=("A", "B")))
+
+    assert prepared.ids == tuple(ord(char) for char in "record|A/B|Answer:")
+    # 标签落在回答槽上那一个 token：ord("A") / ord("B")
+    assert prepared.label_ids == (ord("A"), ord("B"))
+    assert prepared.labels == ("A", "B")
+    assert prepared.names == ("A", "B")
+    assert prepared.descs == ("description of A", "description of B")
+    assert prepared.temperature == 0.5
+    assert prepared.kind == "choice"
+
+
+def test_prepare_uses_the_type_specific_temperature():
+    subject, _ = serve()
+    noul = spec(options=("true", "false"))
+    noul["type"] = "noul"
+    assert subject.prepare("record", noul).temperature == 2.0
+
+
+def test_prepare_refuses_a_label_that_is_not_one_token():
+    """多 token 的标签在回答槽上读不出来：宁可报错，也不要退化成读最后一个子 token。
+
+    标签来自厂商契约（`serve_config.json` 的 `labels`），不来自选项名 —— h2o 就是拿这份
+    字母表去问"回答槽上落的是哪个字母"。
+    """
+    config = {**CONFIG, "labels": ["A", "BB"]}
+    subject = Serve(config, FakeShim(), FakeTokenizer())
+    with pytest.raises(ReadoutError):
+        subject.prepare("record", spec(options=("A", "B")))
+
+
+# ------------------------------------------------------------------- answer
+def test_answer_hands_the_raw_logits_to_the_vendor():
+    """`answer` 不再自己归一化：温度是厂商的，我们只负责把 logits 原样递过去。"""
+    subject, _ = serve()
+    prepared = subject.prepare("record", spec(options=("A", "B")))
+    value, labels, probs = subject.answer(prepared, [1.0, 0.0])
+
+    # T=0.5 下的 softmax([1, 0]) = softmax([2, 0])
+    assert value == "A"
+    assert labels == ("A", "B")
+    assert probs[0] == pytest.approx(0.8807970779778823, rel=1e-12)
+    assert sum(probs) == pytest.approx(1.0, rel=1e-12)
+
+
+def test_answer_rejects_a_logit_count_that_does_not_match_the_labels():
+    subject, _ = serve()
+    prepared = subject.prepare("record", spec(options=("A", "B")))
+    with pytest.raises(ReadoutError):
+        subject.answer(prepared, [1.0])
+
+
+# --------------------------------------------------------------------- open
+def test_open_needs_the_vendor_serve_config(tmp_path):
+    """目录里没有 `serve_config.json` 就报配置错，而不是拿空的标签表去跑。"""
+    with pytest.raises(ConfigError):
+        Serve.open(tmp_path, tokenizer=FakeTokenizer())
