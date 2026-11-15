@@ -94,6 +94,17 @@ class Geometry:
         """注意力的 `1/√head_dim`，即 `e8_common.h` 里的 `E8_HEAD_SCALE` 的来源。"""
         return float(self.head_dim) ** -0.5
 
+    @property
+    def gdn_scratch_halves(self) -> int:
+        """`k_gdn` 家族每个 token 一行 scratch 的步长，单位 half。
+
+        行内容 = `[qn | kn | v | g | beta]`，需要 `2*qk_dim + value_dim + 2*l_v_heads`；
+        按 1024 half 向上取整，且不低于 8192 —— 8192 是 2B 的既有刻度，出货路径的行距
+        不为省几 KB 而改（`shaders/e8_gdn.metal` 的 `E8G_S_ROW` 必须与这里算出同一个数）。
+        """
+        need = 2 * self.qk_dim + self.value_dim + 2 * self.l_v_heads
+        return max(8192, (need + 1023) // 1024 * 1024)
+
     # ---- Metal 源码的宏 -------------------------------------------------
 
     def defines(self) -> Mapping[str, int]:
@@ -110,6 +121,7 @@ class Geometry:
             "E8_QK_DIM": self.qk_dim,
             "E8_KV_PROJ": self.kv_proj,
             "E8_L_HEADS": self.l_v_heads,
+            "E8_L_K_HEADS": self.l_k_heads,
             "E8_L_KD": self.l_k_dim,
             "E8_L_VD": self.l_v_dim,
             "E8_CONV_K": self.conv_k,

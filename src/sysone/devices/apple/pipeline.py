@@ -217,7 +217,9 @@ class MudePipeline:
         # `kv` 仍是整窗缓存 —— 非因果注意力每个 query 都要读整条 kv，这一条没变。
         self.qg = rt.alloc(2 * geom.qg_rows * self._ring)
         self.kv = rt.alloc(2 * geom.kv_rows * width)
-        self.gscratch = rt.alloc(2 * 8192 * bucket)
+        # 一个 token 一行，行距由几何算（`Geometry.gdn_scratch_halves`），与 `e8_gdn.metal` 的
+        # `E8G_S_ROW` 是同一个数：4B 的 v 段是 2B 的两倍，写死 8192 会少一半。
+        self.gscratch = rt.alloc(2 * geom.gdn_scratch_halves * bucket)
         # 快核不读 scratch，但 kernel 声明了 buffer(3)，必须绑定。全宽的参考核才要 (T,T)。
         self.attn_scratch = rt.alloc(32)
         # GDN 的递归状态与卷积尾巴**逐层独立**：波前里两层线性层的列段会交错执行，

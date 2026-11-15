@@ -90,6 +90,19 @@ def test_geometry_projection_matches_mude_hardcoding() -> None:
     assert Geometry.from_descriptor(mude.parse_config(FIXTURES / "mude")) == mude_geometry()
 
 
+def test_gdn_scratch_row_keeps_the_2b_pitch_and_widens_for_4b() -> None:
+    """`k_gdn` 的 scratch 行距：2B 保持 8192 的既有刻度，4B 因为 v 段翻倍而加宽。
+
+    `e8_gdn.metal` 的 `E8G_S_ROW` 用同一套公式算这个数，宿主按它分配 buffer；两边算不
+    一致就是越界写。运行时守卫是 `test_metal_gdn*.py` 的对拍，这里钉住数字本身。
+    """
+    assert mude_geometry().gdn_scratch_halves == 8192
+    four_b = Geometry.from_descriptor(h2o.parse_config(FIXTURES / "h2o"))
+    assert four_b.gdn_scratch_halves == 9216
+    need = 2 * four_b.qk_dim + four_b.value_dim + 2 * four_b.l_v_heads
+    assert four_b.gdn_scratch_halves >= need
+
+
 def test_missing_linear_geometry_is_a_config_error() -> None:
     """有线性层却缺几何时解析期就报错，不留到设备层分配缓冲那一步。"""
     descriptor = mude.parse_config(FIXTURES / "mude")

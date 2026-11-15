@@ -8,33 +8,40 @@
 // ---------------------------------------------------------------------------------------
 // Launch contract (9 buffers, identical list for all three kernels; args at buffer 30)
 // ---------------------------------------------------------------------------------------
-//   0 proj    (8224, Stile) half   ANE surface, channel-major, stride Stile (read only)
-//   1 state   (16*128*128) float   carried across tiles
-//   2 tail    (6144*3) half        pre-conv hangover, carried across tiles
-//   3 wconv   (6144*4) half
-//   4 A_log   (16) float
-//   5 dt_bias (16) float
-//   6 norm    (128) half
-//   7 out     (2*HID, Stile) half  only channels [0,2048) are touched
-//   8 scratch (8192*Stile) half    internal layout below
+//   0 proj    (COUT_GDN, Stile) half  ANE surface, channel-major, stride Stile (read only)
+//   1 state   (L_HEADS*L_KD*L_VD) float  carried across tiles, indexed [v head][dv][dk]
+//   2 tail    (CONV_DIM*3) half    pre-conv hangover, carried across tiles
+//   3 wconv   (CONV_DIM*4) half
+//   4 A_log   (L_HEADS) float
+//   5 dt_bias (L_HEADS) float
+//   6 norm    (L_VD) half
+//   7 out     (2*HID, Stile) half  only the first L_HEADS*L_VD rows are touched
+//   8 scratch (E8G_S_ROW*Stile) half   internal layout below
 //
-//   k_gdn_prep   grid = (16, ceil(Stile/E8G_TB))   tg = (128,)
-//   k_gdn        grid = (16, 4)                    tg = (128,)     (4 x 32 value rows)
-//   k_gdn_norm   grid = (ceil(Stile/4), 16)        tg = (128,)     (4 warps, warp = 1 token)
+//   k_gdn_prep   grid = (L_HEADS, ceil(Stile/E8G_TB))   tg = (128,)   one group per v head
+//   k_gdn_tail   grid = (L_HEADS, 1)                    tg = (128,)
+//   k_gdn        grid = (L_HEADS, 4)                    tg = (128,)  (4 x 32 value rows)
+//   k_gdn_norm   grid = (ceil(Stile/4), L_HEADS)        tg = (128,)  (4 warps, warp = 1 token)
 //
-//   driver: one `e8_mtl.a_gdn(Stile, s0, T, first)` for all three, one commit+wait per tile.
+//   2B draws L_HEADS == L_K_HEADS == 16 and the numbers above are the familiar
+//   2048/4096/6144/8192.  4B keeps 16 k heads but has 32 v heads, so q and k are addressed by
+//   the k head `h / E8G_R` while v, g and beta are addressed by the v head `h`; that is the
+//   `repeat_interleave(q, E8G_R, dim=heads)` of the reference implementation, done by indexing
+//   instead of by materialising an expanded vector.
+//
+//   driver: one `e8_mtl.a_gdn(Stile, s0, T, first)` for all of them, one commit+wait per tile.
 //   `e8_gdn_check.launch()` is the helper I timed.
 //
-// `scratch` layout: one 8192-half row per token, so every access the GPU kernels make is
+// `scratch` layout: one E8G_S_ROW-half row per token, so every access the GPU kernels make is
 // coalesced along the row (that is the point of the redesign):
 //
-//   row = t * 8192
-//   [   0, 2048)  qn[h*128 + dk]   fp16-rounded L2-normalized q   (inv^2 folded in)
-//   [2048, 4096)  kn[h*128 + dk]   fp16-rounded L2-normalized k   (inv folded in)
-//   [4096, 6144)  v[h*128 + dv]    SiLU(conv) of the v part
-//   [6144, 6160)  g[h]             per-token decay
-//   [6160, 6176)  beta[h]          per-token beta
-//   [6176, 8192)  padding
+//   row = t * E8G_S_ROW        (QK_DIM/CONV_DIM/Z_DIM are the geometry macros)
+//   [           0,        QK_DIM)  qn[kh*128 + dk]  fp16-rounded L2-normalized q (inv^2 in)
+//   [       QK_DIM,      2*QK_DIM)  kn[kh*128 + dk]  fp16-rounded L2-normalized k (inv in)
+//   [     2*QK_DIM, 2*QK_DIM+Z_DIM)  v[h*128 + dv]   SiLU(conv) of the v part
+//   [2*QK_DIM+Z_DIM,     +L_HEADS)  g[h]           per-token decay
+//   [   the next,        +L_HEADS)  beta[h]        per-token beta
+//   rest                          padding; the stride rounds up and never goes below 8192
 //
 // ---------------------------------------------------------------------------------------
 // Why this split, and what it measures (all numbers from `python e8_gdn_check.py`)
@@ -77,7 +84,8 @@
 //   norm   qn = inv^2 * conv_q * rsqrt(mean(conv_q^2) + eps*inv^2)   (fp16-rounded)
 //          kn = inv   * conv_k * rsqrt(mean(conv_k^2) + eps*inv^2)   (fp16-rounded)
 //   gate   g = exp(-exp(A_log[h]) * softplus(a_h + dt_bias[h])) ; beta = sigmoid(b_h)
-//          with a_h = proj[8208+h][s] and b_h = proj[8192+h][s]   (one channel per head)
+//          with a_h = proj[COUT_GDN - L_HEADS + h][s] and
+//               b_h = proj[COUT_GDN - 2*L_HEADS + h][s]        (one channel per head)
 //   delta  S[dv][:] *= g ;  kv_mem = S[dv] . kn ;  delta = (v[dv] - kv_mem) * beta
 //          S[dv][:] += kn * delta ;  y[dv] = S[dv] . qn
 //   out    yh = fp16(y) ; o = yh * rsqrt(mean_dv(yh^2) + eps) * SiLU(z) * norm[dv]
@@ -96,13 +104,43 @@
 #define E8G_TPH    4             // threadgroups per head (= E8G_D / E8G_ROWS)
 #define E8G_TB     8             // tokens per prep threadgroup
 
-// scratch row layout, in halves
-#define E8G_S_ROW  8192
-#define E8G_S_QN   0
-#define E8G_S_KN   2048
-#define E8G_S_V    4096
-#define E8G_S_G    6144
-#define E8G_S_BETA 6160
+// `k_gdn` 的线程几何是按 `E8G_D = 128` 排出来的（32 个 state 元素/线程、4 个 lane 共享一行、
+// 4 个 threadgroup 覆盖一个头）。换头维就要换一套线程几何，不在这里悄悄将就。
+#if (E8_L_KD != 128) || (E8_L_VD != 128)
+#error "k_gdn: 线程几何只对 q/k 与 v 头维都等于 128 的模型排过（E8G_L/E8G_M/E8G_ROWS）"
+#endif
+
+// v 头数可以是 k 头数的整数倍：4B 是 32 对 16，同一个 k 头的 qn/kn 由它下面 E8G_R 个 v 头
+// 共享——这就是参考实现里 `repeat_interleave(q, E8G_R, dim=heads)` 的展开，在这里由寻址
+// 隐含完成，不另存一份展开后的向量。
+#define E8G_R      (E8_L_HEADS / E8_L_K_HEADS)
+#if ((E8_L_HEADS % E8_L_K_HEADS) != 0) || (E8_L_HEADS < E8_L_K_HEADS)
+#error "k_gdn: v 头数必须是 k 头数的整数倍（E8G_R 是 repeat_interleave 的步长）"
+#endif
+
+// scratch row layout, in halves: [qn | kn | v | g | beta]。q/k 两段按 k 头编号，v/g/beta 按
+// v 头编号，所以 4B 的行比 2B 宽（8256 对 6176）。步长向上取整到 1024 且不低于 8192，必须与
+// `Geometry.gdn_scratch_halves` 算出同一个数——宿主按它分配 buffer。
+#define E8G_S_NEED  (2 * E8_QK_DIM + E8_Z_DIM + 2 * E8_L_HEADS)
+#define E8G_S_ROUND ((E8G_S_NEED + 1023) / 1024 * 1024)
+#define E8G_S_ROW   (E8G_S_ROUND < 8192 ? 8192 : E8G_S_ROUND)
+#define E8G_S_QN    0
+#define E8G_S_KN    (E8_QK_DIM)
+#define E8G_S_V     (2 * E8_QK_DIM)
+#define E8G_S_G     (2 * E8_QK_DIM + E8_Z_DIM)
+#define E8G_S_BETA  (2 * E8_QK_DIM + E8_Z_DIM + E8_L_HEADS)
+
+// `proj` 的通道起点（共 COUT_GDN 行）：qkv 在 [0, conv_dim)，z 紧贴其后。**不要拿
+// E8_HID / E8_FFN 顶替它们**：2B 恰好 hidden == qk_dim（2048）、ffn == conv_dim（6144），
+// 4B 不是（2560 对 2048、9216 对 8192），顶错了就是默默读到别的通道。
+#define E8G_CQ(kh, d)  ((kh) * E8G_D + (d))
+#define E8G_CK(kh, d)  (E8_QK_DIM + (kh) * E8G_D + (d))
+#define E8G_CV(h, dv)  (2u * E8_QK_DIM + (h) * E8G_D + (dv))
+#define E8G_CZ(h, dv)  (E8_CONV_DIM + (h) * E8G_D + (dv))
+#define E8G_CA(h)      (E8_COUT_GDN - E8_L_HEADS + (h))       // in_proj_a
+#define E8G_CB(h)      (E8_COUT_GDN - 2 * E8_L_HEADS + (h))   // in_proj_b（在 a 之前）
+// 这个 v 头 h 属于哪个 k 头
+#define E8G_KH(h)      ((h) / E8G_R)
 
 // Sum across the E8G_L lanes that share one value row (they are consecutive lanes).
 inline float e8g_rowsum(float v) {
@@ -152,11 +190,17 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     threadgroup float sc[2 * E8G_TB];          // q scales then k scales
     threadgroup float tg_gt[E8G_TB], tg_bt[E8G_TB];
 
-    const uint cq = h * E8G_D + tid;
-    const uint ck = E8_HID + cq;
-    const uint cv = 2u * E8_HID + cq;
-    float4 wq = float4(float(wconv[(ulong)cq * 4u + 0u]), float(wconv[(ulong)cq * 4u + 1u]),
-                       float(wconv[(ulong)cq * 4u + 2u]), float(wconv[(ulong)cq * 4u + 3u]));
+    // 本组 v 头 h 对应的 k 头 kh。q/k 只由每个 k 头的"代表组"（h % E8G_R == 0）写进
+    // scratch；同一 k 头下其余组算出的 qn/kn 一律丢弃，qn/kn 两段因此被 E8G_R 个 v 头共享。
+    // 2B 的 E8G_R 是 1，"代表组"恒真、kh == h，这一层判断被编译器整段消掉。
+    const uint kh  = E8G_KH(h);
+    const bool rep = ((h % E8G_R) == 0u);
+    const uint cqk = E8G_CQ(kh, tid);            // q 通道 + qn 槽（按 k 头编号）
+    const uint cq  = h * E8G_D + tid;            // v 通道 + v 槽（按 v 头编号）
+    const uint ck  = E8G_CK(kh, tid);
+    const uint cv  = E8G_CV(h, tid);
+    float4 wq = float4(float(wconv[(ulong)cqk * 4u + 0u]), float(wconv[(ulong)cqk * 4u + 1u]),
+                       float(wconv[(ulong)cqk * 4u + 2u]), float(wconv[(ulong)cqk * 4u + 3u]));
     float4 wk = float4(float(wconv[(ulong)ck * 4u + 0u]), float(wconv[(ulong)ck * 4u + 1u]),
                        float(wconv[(ulong)ck * 4u + 2u]), float(wconv[(ulong)ck * 4u + 3u]));
     float4 wv = float4(float(wconv[(ulong)cv * 4u + 0u]), float(wconv[(ulong)cv * 4u + 1u]),
@@ -170,21 +214,21 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
     for (int i = 0; i < 3; i++) {
         int tc = t0 - 3 + i;
         if (tc >= 0) {
-            rq[i] = float(proj[(ulong)cq * sp + (ulong)so + (ulong)tc]);
+            rq[i] = float(proj[(ulong)cqk * sp + (ulong)so + (ulong)tc]);
             rk[i] = float(proj[(ulong)ck * sp + (ulong)so + (ulong)tc]);
             rv[i] = float(proj[(ulong)cv * sp + (ulong)so + (ulong)tc]);
         } else if (a.first) {
             rq[i] = 0.0f; rk[i] = 0.0f; rv[i] = 0.0f;
         } else {
             uint ti = (uint)(tc + 3);
-            rq[i] = float(tail[(ulong)cq * 3u + ti]);
+            rq[i] = float(tail[(ulong)cqk * 3u + ti]);
             rk[i] = float(tail[(ulong)ck * 3u + ti]);
             rv[i] = float(tail[(ulong)cv * 3u + ti]);
         }
     }
     if ((sp & 7ul) == 0ul && (so & 7u) == 0u && t0 + E8G_TB <= St) {
-        vec<half, 8> hq = *(device const vec<half, 8> *)(proj + (ulong)cq * sp + (ulong)so
-                                                        + (ulong)t0);
+        vec<half, 8> hq = *(device const vec<half, 8> *)(proj + (ulong)cqk * sp + (ulong)so
+                                                         + (ulong)t0);
         vec<half, 8> hk = *(device const vec<half, 8> *)(proj + (ulong)ck * sp + (ulong)so
                                                         + (ulong)t0);
         vec<half, 8> hv = *(device const vec<half, 8> *)(proj + (ulong)cv * sp + (ulong)so
@@ -197,7 +241,7 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
         #pragma unroll
         for (int i = 0; i < E8G_TB; i++) {
             int tc = min(t0 + i, St - 1);
-            rq[i + 3] = float(proj[(ulong)cq * sp + (ulong)so + (ulong)tc]);
+            rq[i + 3] = float(proj[(ulong)cqk * sp + (ulong)so + (ulong)tc]);
             rk[i + 3] = float(proj[(ulong)ck * sp + (ulong)so + (ulong)tc]);
             rv[i + 3] = float(proj[(ulong)cv * sp + (ulong)so + (ulong)tc]);
         }
@@ -224,10 +268,8 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
         if (tid >= 64u && tid < 64u + (uint)E8G_TB) {          // one thread per token: gate
             uint tokn = tid - 64u;
             int  tc = min(t0 + int(tokn), St - 1);
-            float av = float(proj[((ulong)(E8_COUT_GDN - 16u) + h) * sp + (ulong)so
-                                  + (ulong)tc]);
-            float bv = float(proj[((ulong)(E8_COUT_GDN - 32u) + h) * sp + (ulong)so
-                                  + (ulong)tc]);
+            float av = float(proj[(ulong)E8G_CA(h) * sp + (ulong)so + (ulong)tc]);
+            float bv = float(proj[(ulong)E8G_CB(h) * sp + (ulong)so + (ulong)tc]);
             tg_gt[tokn] = exp(-exp(A_log[h]) * e8_softplus0(av + dtb[h]));
             tg_bt[tokn] = 1.0f / (1.0f + exp(-bv));
         }
@@ -251,9 +293,11 @@ kernel void k_gdn_prep(device const half  *proj   [[buffer(0)]],
         int t = t0 + i;
         if (t < St) {
             ulong row = (ulong)(so + t) * E8G_S_ROW;
-            scr[row + E8G_S_QN + cq] = half(float(cq8[i]) * sc[i]);
-            scr[row + E8G_S_KN + cq] = half(float(ck8[i]) * sc[E8G_TB + i]);
-            scr[row + E8G_S_V  + cq] = cv8[i];
+            if (rep) {   // 同一 k 头的其余 v 头不算 qn/kn，因此也不写（避免同址互写）
+                scr[row + E8G_S_QN + cqk] = half(float(cq8[i]) * sc[i]);
+                scr[row + E8G_S_KN + cqk] = half(float(ck8[i]) * sc[E8G_TB + i]);
+            }
+            scr[row + E8G_S_V + cq] = cv8[i];
         }
     }
     if (tid < (uint)E8G_TB) {
@@ -304,15 +348,20 @@ kernel void k_gdn_tail(device const half  *proj   [[buffer(0)]],
     const uint  ncol = a.cols ? a.cols : a.Stile;
     const uint  so   = a.src_s0;
     if (ncol < 3u || h >= (uint)E8_L_HEADS || tid >= (uint)E8G_D) return;
-    const uint cq = h * E8G_D + tid;
-    const uint ck = E8_HID + cq;
-    const uint cv = 2u * E8_HID + cq;
+    const uint kh   = E8G_KH(h);
+    const bool rep  = ((h % E8G_R) == 0u);
+    const uint cqk  = E8G_CQ(kh, tid);
+    const uint ck   = E8G_CK(kh, tid);
+    const uint cv   = E8G_CV(h, tid);
     const ulong c0 = (ulong)(ncol - 3u);
     #pragma unroll
     for (int k = 0; k < 3; k++) {
-        tail[(ulong)cq * 3u + (uint)k] = proj[(ulong)cq * sp + so + c0 + (ulong)k];
-        tail[(ulong)ck * 3u + (uint)k] = proj[(ulong)ck * sp + so + c0 + (ulong)k];
-        tail[(ulong)cv * 3u + (uint)k] = proj[(ulong)cv * sp + so + c0 + (ulong)k];
+        const uint kk = (uint)k;
+        if (rep) {   // q/k 的尾巴按 k 头只存一份，同一 k 头的 E8G_R 个 v 头共用
+            tail[(ulong)cqk * 3u + kk] = proj[(ulong)cqk * sp + so + c0 + (ulong)kk];
+            tail[(ulong)ck * 3u + kk]  = proj[(ulong)ck * sp + so + c0 + (ulong)kk];
+        }
+        tail[(ulong)cv * 3u + kk] = proj[(ulong)cv * sp + so + c0 + (ulong)kk];
     }
 }
 
@@ -359,9 +408,10 @@ kernel void k_gdn(device const half  *proj   [[buffer(0)]],
     }
     const int   St    = int(a.cols ? a.cols : a.Stile);
     const uint  so    = a.src_s0;                        // ticket 10: first source column
-    const ulong qbase = E8G_S_QN + h * E8G_D + tq;   // this lane's 32 qn halves within a row
-    const ulong kbase = E8G_S_KN + h * E8G_D + tq;
-    const ulong vbase = E8G_S_V  + h * E8G_D + dv;
+    const uint  kh    = E8G_KH(h);                   // q/k 槽按 k 头编号，v 槽按 v 头编号
+    const ulong qbase = E8G_S_QN + kh * E8G_D + tq;  // this lane's 32 qn halves within a row
+    const ulong kbase = E8G_S_KN + kh * E8G_D + tq;
+    const ulong vbase = E8G_S_V  + h  * E8G_D + dv;
 
     for (int j = 0; j < St; j++) {
         const ulong row  = (ulong)(so + j) * E8G_S_ROW;
@@ -452,7 +502,7 @@ kernel void k_gdn_norm(device const half  *proj   [[buffer(0)]],
     const uint  dv  = lane * 4u;
     const ulong off = (ulong)(h * E8G_D + dv) * osp + os0 + (ulong)s;
     device half *o = out + off;
-    device const half *z = proj + (ulong)(E8_FFN + h * E8G_D + dv) * sp + (ulong)a.src_s0
+    device const half *z = proj + (ulong)E8G_CZ(h, dv) * sp + (ulong)a.src_s0
                                 + (ulong)s;
     float y[4];
     float sq = 0.0f;

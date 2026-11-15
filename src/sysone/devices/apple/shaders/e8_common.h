@@ -62,7 +62,8 @@ using namespace metal;
 #define E8_ROTARY_DIM 64          // head_dim * partial_rotary_factor(0.25)
 #define E8_QK_DIM     2048        // Q_HEADS * HEAD_DIM
 #define E8_KV_PROJ    512         // KV_HEADS * HEAD_DIM
-#define E8_L_HEADS    16
+#define E8_L_HEADS    16          // GDN 的 v 头数
+#define E8_L_K_HEADS  16          // GDN 的 q/k 头数；v 头数可以是它的整数倍（4B 是 2 倍）
 #define E8_L_KD       128
 #define E8_L_VD       128
 #define E8_CONV_K     4

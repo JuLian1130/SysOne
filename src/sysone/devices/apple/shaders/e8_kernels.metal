@@ -363,6 +363,10 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
     if (ndv != D) return;
     const int s0 = int(a.src_s0);
     device float *st = state + (ulong)h * D * D + (ulong)dv * D;
+    // q/k 按 k 头编号、v 按 v 头编号：4B 是 32 个 v 头对 16 个 k 头，同一个 k 头的 qn/kn
+    // 被它下面 E8G_R 个 v 头共享（参考实现的 repeat_interleave，在这里由寻址展开）。
+    const uint kh  = h / (E8_L_HEADS / E8_L_K_HEADS);
+    const bool rep = ((h % (E8_L_HEADS / E8_L_K_HEADS)) == 0u);
 
     const float inv = rsqrt(float(D));
     const float rms_eps = a.eps * inv * inv;
@@ -376,11 +380,11 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
         float qv[E8_L_KD], kv[E8_L_KD], vv = 0.0f;
         float sumq = 0.0f, sumk = 0.0f;
         for (uint d = 0; d < D; d++) {
-            uint cq = h * D + d;                       // q channel
-            uint ck = E8_HID + cq;                     // k channel
+            uint cqk = kh * D + d;                     // q channel（按 k 头）
+            uint ck  = E8_QK_DIM + cqk;                // k channel
             float pq = 0.0f, pk = 0.0f;
             for (uint k = 0; k < E8_CONV_K; k++) {
-                pq += float(e8_gdn_raw(proj, tail, a, cq, t - 3 + (int)k)) * float(wconv[(ulong)cq * E8_CONV_K + k]);
+                pq += float(e8_gdn_raw(proj, tail, a, cqk, t - 3 + (int)k)) * float(wconv[(ulong)cqk * E8_CONV_K + k]);
                 pk += float(e8_gdn_raw(proj, tail, a, ck, t - 3 + (int)k)) * float(wconv[(ulong)ck * E8_CONV_K + k]);
             }
             half hq = half(pq), hk = half(pk);
@@ -390,7 +394,7 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
             sumq += cqv * cqv; sumk += ckv * ckv;
         }
         {
-            uint cv = 2u * E8_HID + h * D + dv;        // v channel
+            uint cv = 2u * E8_QK_DIM + h * D + dv;     // v channel（按 v 头）
             float pv = 0.0f;
             for (uint k = 0; k < E8_CONV_K; k++)
                 pv += float(e8_gdn_raw(proj, tail, a, cv, t - 3 + (int)k)) * float(wconv[(ulong)cv * E8_CONV_K + k]);
@@ -402,8 +406,8 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
         float sk = inv * rsqrt(sumk / float(D) + rms_eps);
         // ---- gate / beta
         // a / b are ONE CHANNEL PER LINEAR HEAD (16 channels each, not 16 wide shared)
-        float av = float(proj[(ulong)(E8_COUT_GDN - 16u + h) * a.Stile + j]);
-        float bv = float(proj[(ulong)(E8_COUT_GDN - 32u + h) * a.Stile + j]);
+        float av = float(proj[(ulong)(E8_COUT_GDN - E8_L_HEADS + h) * a.Stile + j]);
+        float bv = float(proj[(ulong)(E8_COUT_GDN - 2 * E8_L_HEADS + h) * a.Stile + j]);
         float g   = e8_gdn_gate(av, A_log[h], dtb[h]);
         float beta = 1.0f / (1.0f + exp(-bv));
 
@@ -429,7 +433,7 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
         // it is a ~10% error, not a rounding one).
         float yh = float(half(y));
         float n = rsqrt(e8_tg_sum(yh * yh, red, dv, ndv) / float(D) + a.eps);
-        float z = float(proj[(ulong)(E8_FFN + h * D + dv) * a.Stile + j]);
+        float z = float(proj[(ulong)(E8_CONV_DIM + h * D + dv) * a.Stile + j]);
         float o = yh * n * (z / (1.0f + exp(-z))) * float(norm[dv]);
         const uint osp = a.out_stride ? a.out_stride : a.Stile;
         out[(ulong)(h * D + dv) * osp + a.out_s0 + j] = half(o);
@@ -440,11 +444,14 @@ kernel void k_gdn_ref(device const half  *proj   [[buffer(0)]],
         for (uint k = 0; k < 3u; k++) {
             int t = s0 + int(ncol) - 3 + int(k);
             if (t < 0) continue;
-            uint cq = h * D + dv;
-            tail[(ulong)cq * 3 + k]              = e8_gdn_raw(proj, tail, a, cq, t);
-            tail[(ulong)(E8_HID + cq) * 3 + k]   = e8_gdn_raw(proj, tail, a, E8_HID + cq, t);
-            tail[(ulong)(2u * E8_HID + cq) * 3 + k] =
-                e8_gdn_raw(proj, tail, a, 2u * E8_HID + cq, t);
+            uint cqk = kh * D + dv;                    // q/k 通道按 k 头
+            uint cv  = 2u * E8_QK_DIM + h * D + dv;    // v 通道按 v 头
+            if (rep) {   // q/k 的尾巴只存一份，同一 k 头的 v 头共用
+                tail[(ulong)cqk * 3 + k] = e8_gdn_raw(proj, tail, a, cqk, t);
+                tail[(ulong)(E8_QK_DIM + cqk) * 3 + k] =
+                    e8_gdn_raw(proj, tail, a, E8_QK_DIM + cqk, t);
+            }
+            tail[(ulong)cv * 3 + k] = e8_gdn_raw(proj, tail, a, cv, t);
         }
     }
 }
