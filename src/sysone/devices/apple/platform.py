@@ -4,9 +4,10 @@ M2.0 只把"平台是什么"讲清楚，并把 ANE 运行时接上；真正按�
 M2.1（ANE 投影/FFN）与 M2.2（Metal 注意力/GDN）落 `backend()`，所以这里现在返回
 `None`——`selector.select` 会因此报 `NoKernelError`，不会静默回退到 CPU。
 
-几何包络：旧引擎只在 mude 的 20 层 / hidden 2048 / ffn 6144 上验证过
-（docs/ANE/README.md 的 §10 系列）。4B 的 32 层 / 2560 / 9216 是 M4 的拆层实验，
-现在跑它只会得到"看起来像结果"的错误数字，所以在加载期就拒绝，等 M4 实测后再放开。
+几何白名单：旧引擎只在 mude 的 20 层 / hidden 2048 / ffn 6144 上**端到端**跑通过
+（docs/ANE/README.md 的 §10 系列）。4B 的 32 层 / 2560 / 9216 是 M4 的拆层实验：ANE 已经
+收下它的 program 形状（票据 15 §11），但数值还没有真实权重对拍，现在跑它只会得到
+"看起来像结果"的错误数字 —— 所以加载期放行的是**实测白名单**里的几何，不是某个尺寸上限。
 """
 
 from __future__ import annotations
@@ -23,11 +24,14 @@ from ...models.descriptor import ModelDescriptor
 from ..base import Capabilities, MemoryInfo, Placement, Shape
 from .runtime import AneRuntime
 
-# 实测包络（旧引擎的全部数字都落在这个范围里）。
-MAX_HIDDEN = 2048
-MAX_FFN = 6144
+# 实测白名单：**端到端**跑通过（numpy 逐位对拍 + 真权重）的 (hidden, ffn)。加一项要拿证据
+# —— 票据 15 §11 的形状探针只证明 ANE 收下这些 program，不证明数值对，所以 4B 的
+# (2560, 9216) 要等真权重单层对拍之后才进这张表。
+MEASURED_GEOMETRIES: frozenset[tuple[int, int]] = frozenset({(2048, 6144)})
 # 一个 ANE program 的原生 S 上限约 4096（16k 在旧引擎里是 4 × 4096 分块跑的）。
 MAX_TILE = 4096
+# 平台愿意服务的最大 token 数（16k = 4 × 4096 分块）。它是**能力声明**，不是加载期拒绝的
+# 理由：模型自报的 `max_position` 是上限，我们只会用得更少（mude 自报 262144，出货跑 16k）。
 MAX_SEQ = 16384
 
 _LIBC = "/usr/lib/libSystem.B.dylib"
@@ -85,21 +89,16 @@ class ApplePlatform:
     def verify_model(self, descriptor: ModelDescriptor) -> None:
         if not any(role is AttentionRole.FULL for role in descriptor.layer_types):
             raise ConfigError("模型没有全注意力层", model=descriptor.model_id)
-        if descriptor.hidden > MAX_HIDDEN or descriptor.ffn > MAX_FFN:
+        if (descriptor.hidden, descriptor.ffn) not in MEASURED_GEOMETRIES:
             raise ConfigError(
-                "模型几何超出 Apple 的实测包络",
+                "模型几何不在 Apple 的实测白名单里",
                 model=descriptor.model_id,
                 hidden=descriptor.hidden,
                 ffn=descriptor.ffn,
-                limits={"hidden": MAX_HIDDEN, "ffn": MAX_FFN},
-                hint="4B 几何（2560/9216）的 ANE 拆层是 M4 的实验",
-            )
-        if descriptor.max_position > MAX_SEQ:
-            raise ConfigError(
-                "模型上下文超过 M2 的服务上限",
-                model=descriptor.model_id,
-                max_position=descriptor.max_position,
-                limit=MAX_SEQ,
+                measured=[{"hidden": hidden, "ffn": ffn}
+                          for hidden, ffn in sorted(MEASURED_GEOMETRIES)],
+                hint="白名单只收端到端跑通过的几何（见 platform.py 顶部注释）；"
+                     "ANE 收下 program 形状还不算数",
             )
 
     def verify_quant(self, quant: QuantSpec) -> None:
