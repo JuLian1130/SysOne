@@ -90,8 +90,12 @@ STANDBY_AT_LOAD: dict = {}
 
 
 @pytest.fixture(scope="module")
-def windowed():
-    """带待命窗口（`--W 4`）的桶 64 链：共享前缀的按块形状必须能在换窗里跑完。"""
+def windowed_chunked():
+    """待命窗口 **加** 分桶（桶 S/4、缓冲 S）：共享前缀的按块形状必须能在换窗里跑完。
+
+    与下面 `windowed` 的区别只在这条链**多瓦片**（桶 64 对 156 token 的 prefix+tail）——
+    "共享前缀的槽位会不会被换窗打断"只有多瓦片才问得出来（一个桶里没有块间的交错）。
+    """
     SplitChain = _chains()
     weights = mude.weight_plan(Path(MUDE))
     chain = SplitChain.load(MUDE, weights=weights, s=S // 4, width=S, metal=True, resident=4)
@@ -353,9 +357,16 @@ def test_batched_tails_under_an_unaligned_prefix(packed) -> None:
         assert int(np.argmax(row)) == int(np.argmax(ref)), f"第 {index} 题的答案变了"
 
 
-def test_forward_shared_under_a_resident_window(windowed) -> None:
-    """`--W 4`：按块交错的形状要能在换窗里跑完，且与逐题整趟逐位相同。"""
-    _shared_vs_single(windowed, 150, (6, 4))
+def test_forward_shared_under_a_resident_window(windowed_chunked) -> None:
+    """`--W 4` + 桶 S/4：按块交错的形状要能在换窗里跑完，且与逐题整趟相同。
+
+    用**多瓦片**的链：前缀 150 + 尾巴 6/4 在桶 64 下跨 3 段，块间交错与换窗撞在一起时才
+    能问出"共享前缀的槽位有没有被换窗打断"。单桶链（`windowed`）问不出来 —— 这条断言把
+    那个前提钉住：这条链曾经被一个同名 fixture 遮住，于是测试名说"按块交错"、跑的却是
+    单桶（2026-11-16 修）。
+    """
+    assert windowed_chunked._s < windowed_chunked._width, "这条用例要的是多瓦片的链"
+    _shared_vs_single(windowed_chunked, 150, (6, 4))
 
 
 # ---- M3：causal 路径 -------------------------------------------------------------------
