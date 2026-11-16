@@ -7,6 +7,7 @@
 import pytest
 
 from sysone.devices.apple.residency import Residency, targets_for
+from sysone.errors import ConfigError
 from sysone.devices.apple.schedule import blocks
 from sysone.domain.attention import AttentionRole
 
@@ -135,3 +136,39 @@ def test_unload_refuses_while_an_eval_is_in_flight() -> None:
     layer.name = "fake"
     with pytest.raises(NotReadyError):
         AneLayer.unload(layer)
+
+
+# ---------------------------------------------------------------- 32 层（h2o）
+H2O_ROLES = [AttentionRole.FULL if i in (3, 7, 11, 15, 19, 23, 27, 31) else AttentionRole.LINEAR
+             for i in range(32)]
+
+
+def test_h2o_blocks_split_at_every_full_attention_layer():
+    """h2o 的 8 个全注意力层各起一个新块：`[0,1,2] [3..6] … [31]`，共 9 块。"""
+    groups = blocks(H2O_ROLES)
+    assert len(groups) == 9
+    assert groups[0] == (0, 1, 2)
+    assert all(group[0] in (3, 7, 11, 15, 19, 23, 27, 31) for group in groups[1:])
+    assert max(len(group) for group in groups) == 4
+
+
+def test_h2o_window_cannot_be_shorter_than_its_largest_block():
+    """一个块里的层同时在飞，窗口比块短就是构造期错误 —— h2o 的最小窗口因此是 4。"""
+    with pytest.raises(ConfigError):
+        targets_for(blocks(H2O_ROLES), 32, 3)
+    windows = targets_for(blocks(H2O_ROLES), 32, 4)
+    assert windows[0] == (0, 1, 2, 3)          # 待命集
+    assert windows[-1] == (31,)                # 尾巴块裁到模型末尾
+
+
+def test_h2o_window_stays_at_standby_after_one_pass():
+    """一轮 32 层跑完落在待命窗口上，峰值不超过 2W（当前窗口 + 正在到达的下一块）。"""
+    layers = [FakeLayer(i) for i in range(32)]
+    windows = targets_for(blocks(H2O_ROLES), 32, 4)
+    residency = Residency(layers, windows)
+    for k in range(len(windows)):
+        residency.begin(k)
+        residency.end(k)
+    residency.finish()
+    assert residency.stats()["resident_layers"] == list(windows[0])
+    assert residency.peak_resident <= 8

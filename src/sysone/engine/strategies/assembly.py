@@ -34,12 +34,12 @@ _BUILDERS: dict[str, Callable[..., object]] = {
     "pooled": h2o_runner,
 }
 
-# 每条策略**认**哪些参数。`resident` 是 Metal 流水线的待命窗口：pooled 今天走 numpy 那侧，
-# 没有换窗这回事，所以不认它。给了不认的参数要报错 —— 静默丢掉一个用户显式给的旋钮，
-# 会让"我设了窗口"和"它没生效"同时成立。
+# 每条策略**认**哪些参数（`resident` 是 Metal 流水线的待命窗口，两条策略都有 Metal 形态）。
+# 给了不认的参数要报错 —— 静默丢掉一个用户显式给的旋钮，会让"我设了窗口"和"它没生效"
+# 同时成立。
 _OPTIONS: dict[str, frozenset[str]] = {
     "split": frozenset({"bucket", "width", "resident"}),
-    "pooled": frozenset({"bucket", "width"}),
+    "pooled": frozenset({"bucket", "width", "resident"}),
 }
 
 

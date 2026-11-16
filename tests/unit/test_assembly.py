@@ -82,9 +82,17 @@ def test_a_strategy_without_a_builder_says_which_ones_exist(tmp_path, builders):
     assert caught.value.context["ready"] == ["pooled", "split"]
 
 
-def test_an_option_the_strategy_does_not_take_is_refused(tmp_path, builders):
-    """`resident` 是 Metal 流水线的待命窗口：pooled 不认它，也不许悄悄丢掉。"""
+def test_both_strategies_take_the_standby_window(tmp_path, builders):
+    """`resident` 是 Metal 流水线的待命窗口；两条策略都有 Metal 形态，所以都认它。"""
     _split, pooled = builders
+    assembly.assemble(make_mude_checkpoint(tmp_path), "h2o", backend="pooled", resident=4)
+    assert pooled.calls[-1]["resident"] == 4
+
+
+def test_an_option_the_strategy_does_not_take_is_refused(tmp_path, builders, monkeypatch):
+    """给了不认的参数要报错，不许悄悄丢：否则"我设了窗口"和"它没生效"会同时成立。"""
+    _split, pooled = builders
+    monkeypatch.setitem(assembly._OPTIONS, "pooled", frozenset({"bucket", "width"}))
     with pytest.raises(ConfigError) as caught:
         assembly.assemble(tmp_path, "h2o", backend="pooled", resident=4)
     assert caught.value.context["refused"] == ["resident"]

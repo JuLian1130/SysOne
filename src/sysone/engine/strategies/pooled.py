@@ -198,6 +198,7 @@ def h2o_runner(
     scratch_dir: str | Path | None = None,
     tokenizer: object | None = None,
     metal: bool = True,
+    resident: int | None = None,
 ) -> PooledRunner:
     """装一条 h2o 的 pooled 链：厂商答面 + 词表行按需取 + ANE 链。
 
@@ -207,9 +208,11 @@ def h2o_runner(
 
     `metal=True` 默认开：h2o 的 `(2560, 9216)` 已经做过 numpy vs Metal 的逐位对拍
     （票据 15 §24：桶 256、64/128 token、两种读法，hidden relL2 1.3e-3、logits 3e-4 量级、
-    argmax 全同），注意力与 GDN 走 GPU 快 3~10 倍。这条路上**不收 `resident`**：待命窗口是
-    Metal 流水线换窗的机制，但 h2o 的 32 层权重（≈3.33 GiB ANE 常驻）还没做窗口化
-    （票据 15 的 A3），所以这里不给这个旋钮，免得"设了窗口"和"没生效"同时成立。
+    argmax 全同），注意力与 GDN 走 GPU 快 3~10 倍。
+
+    `resident` 是待命常驻的层数（`None` = 32 层全装）。h2o 的 32 层 blob 合计 ≈3.33 GiB，
+    是这条链最大的一笔常驻；给 4 就是"一个块"，换窗代价见票据 15 §25。它只在 `metal=True`
+    时才有意义（窗口是流水线的机制），`metal=False` 传它会退化成"全装"。
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
@@ -237,6 +240,8 @@ def h2o_runner(
             quantize=quantize,
             metal=metal,
             scratch_dir=scratch_dir,
+            # numpy 那条路没有流水线，也就没有块边界可换窗：`resident` 只对 Metal 有意义。
+            resident=resident if metal else None,
         )
 
     def rows(label_ids: Sequence[int]) -> np.ndarray:

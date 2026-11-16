@@ -33,6 +33,8 @@ _SPLIT_WIDTH = SchedulerConfig().max_len
 # 待命常驻窗口的默认值 = 一个块（4 层）。出货形态（T 16884 / P 16384）上换窗的代价 ≈ +1 %
 # （三轮暖配对 +0.8 / +1.3 / +0.6 %），代价落在短请求上（200 token 2.52×、1k +139 %）；出货形态
 # 是长请求，所以默认取窗口。0 保留给"全装"的对照形态（换算与对账见 docs/sysone/plan.md 第 10/11 片）。
+# h2o 同口径（票据 15 §25）：待命 3406 → 426 MiB（8×），142 token 上窗口慢 2.2×，长 prompt 上
+# 这笔 0.41 s 的固定开销摊薄（按 16k 外推 ≈ +3%）。
 _RESIDENT_W = 4
 # 后端不给 `--model` 时的默认家族。mude 维持原样；pooled 只有 h2o。
 _DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o"}
@@ -60,7 +62,9 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument("--width", type=int, default=0, help=f"split：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
     common.add_argument(
         "--W", type=int, default=_RESIDENT_W, dest="resident",
-        help=f"split：待命常驻的层数（默认 {_RESIDENT_W} = 一个块；0 = 全部 20 层常驻）",
+        help=f"待命常驻的层数（默认 {_RESIDENT_W} = 一个块；0 = 全部常驻）。"
+             "实测代价：h2o 32 层在 142 token 上窗口比全装慢 2.2×（票据 15 §25），"
+             "长 prompt 上这笔固定开销摊薄",
     )
     return common
 
@@ -185,10 +189,10 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
         width = int(args.width or _SPLIT_WIDTH)
         # 形状与执行器都由注册表装配（`engine.strategies.assembly`）：CLI 不认识任何家族名，
         # 也不认识哪条链该配哪套题面 —— 那是家族自己声明的策略。
-        # 待命窗口是 Metal 流水线的事；pooled 今天走 numpy 那侧，传它只会被拒绝。
-        options: dict[str, int | None] = {"bucket": args.bucket or None, "width": width}
-        if args.backend == "split":
-            options["resident"] = args.resident or None
+        options: dict[str, int | None] = {
+            "bucket": args.bucket or None, "width": width,
+            "resident": args.resident or None,
+        }
         assembled = assemble(args.weights, name, backend=args.backend, **options)
         descriptor = assembled.descriptor
         config = EngineConfig(
