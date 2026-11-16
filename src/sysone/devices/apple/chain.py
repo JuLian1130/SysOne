@@ -12,6 +12,7 @@ bf16 参照不会逐位相同；链路里也不能出现 torch（`src/` 只用 n
 from __future__ import annotations
 
 import tempfile
+import time
 from itertools import count
 from pathlib import Path
 from typing import Sequence
@@ -110,7 +111,11 @@ class SplitChain:
         pool: list[SurfaceSet] | None = None,
         own_metal: bool = False,
         metal_runtime: object | None = None,
+        load_s: float = 0.0,
+        compile_s: float = 0.0,
     ) -> None:
+        self._load_s = float(load_s)
+        self._compile_s = float(compile_s)
         self._runtime = runtime
         self._own_runtime = own_runtime
         self._pipeline = pipeline
@@ -135,6 +140,22 @@ class SplitChain:
         # GPU 侧缓冲的列数（= 一轮要算的 token 总数）；numpy 链把它当画布宽度用。
         self._width = int(width)
         self._closed = False
+
+    # ------------------------------------------------------------------ 装载耗时
+
+    @property
+    def load_s(self) -> float:
+        """这次装载花了几秒，**不含**产物编译的那部分。"""
+        return self._load_s
+
+    @property
+    def compile_s(self) -> float:
+        """这次装载里有多少秒花在**从头构建产物**上；产物全部命中缓存时是 0。
+
+        它和 `load_s` 是两段、不重叠：冷产物目录上编译是分钟级、装载只有一秒量级，
+        第二次启动反过来。分开报是为了让"首启慢"这件事能归因到编译（`plan.md` R6）。
+        """
+        return self._compile_s
 
     # ------------------------------------------------------------------ 加载
 
@@ -183,6 +204,9 @@ class SplitChain:
         `pooled`）没有码表，这条链就只提供逐层 hidden，`logits()` 会报
         `NotReadyError` 指出来（pooled 读出还没实现，票据 15 的 G6）。
         """
+        started = time.perf_counter()
+        # 产物从头构建的那一段单独累计：它是"首启 vs 二次启动"差异的全部来源。
+        compile_s = 0.0
         if device != "ane":
             raise ValueError(f"这条链只有 ANE 设备，收到 {device!r}")
         root = Path(model_dir)
@@ -246,11 +270,13 @@ class SplitChain:
                 )
                 files = cached_program(directory, source=source, s=s)
                 if files is None:
+                    building = time.perf_counter()
                     files = _build_layer_program(
                         store, prefix=prefix, directory=directory, index=index, role=role,
                         cout=cout, core_out=geometry.core_out, hidden=hidden, ffn=ffn, s=s,
                         quantize=quantize, source=source, split=split,
                     )
+                    compile_s += time.perf_counter() - building
                 layer = AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
                                  hidden=hidden, core_out=geometry.core_out,
                                  cout=cout, ffn=ffn, s=s, pool=pool,
@@ -295,6 +321,7 @@ class SplitChain:
             geometry=geometry, s=s, width=width,
             own_runtime=own_runtime, pipeline=pipeline, pool=pool,
             own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
+            load_s=time.perf_counter() - started - compile_s, compile_s=compile_s,
         )
 
     # ------------------------------------------------------------------ 前向

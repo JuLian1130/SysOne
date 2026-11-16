@@ -18,6 +18,7 @@ import pytest
 from sysone.domain.attention import MaskMode
 from sysone.domain.decision import Answer, DecisionResult, Provenance, Usage
 from sysone.domain.quant import QuantSpec
+from sysone.domain.work import CompilationTimes
 from sysone.errors import ConfigError, NotReadyError
 from sysone.service import app as service_app
 
@@ -71,7 +72,7 @@ def start_server():
     def start(*, load=None, engine=None, api_key=None, queue=2, workers=1, debug=False):
         decider = None if load else _decider(engine)
         server, gate = service_app.serve(
-            load=load or (lambda: (decider, object())),
+            load=load or (lambda: (decider, CompilationTimes(0.0, 0.0, 0.0))),
             host="127.0.0.1",
             port=0,
             api_key=api_key,
@@ -322,7 +323,7 @@ def test_not_ready_is_503_with_retry_after(start_server) -> None:
 
     def load():
         release.wait(10.0)
-        return _decider(), object()
+        return _decider(), CompilationTimes(0.0, 0.0, 0.0)
 
     server, gate = start_server(load=load)
     for path, body in (("/health", None), ("/v1/systemone", CHOICE), ("/v1/models", None)):
@@ -425,3 +426,17 @@ def test_content_length_and_chunked_together_is_400(start_server) -> None:
     response = _raw(server, request)
     assert _status_line(response) == 400
     assert b"either Content-Length" in response
+
+
+# ---------------------------------------------------------------------- 启动报告
+
+
+def test_ready_line_reports_the_startup_breakdown() -> None:
+    """就绪行带三段拆分。冷产物目录上编译占掉绝大部分、第二次启动它接近 0，只印总耗时
+    看不出这个差异（`plan.md` R6 要的就是这一条）。"""
+    note = service_app._startup_report(
+        CompilationTimes(load_s=0.85, compile_s=10.62, warmup_s=0.57)
+    )
+    assert note == " (load 0.85s, compile 10.62s, warmup 0.57s)"
+    # 装载还没结束时 `Gate.startup` 是 None：不印假的 0.00，宁可什么都不加。
+    assert service_app._startup_report(None) == ""

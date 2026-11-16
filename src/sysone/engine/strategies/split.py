@@ -29,12 +29,20 @@ _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one"
 
 
 class ModelChain(Protocol):
-    """`SplitChain` 只需要这两件事：一次整链前向与卸载。"""
+    """`SplitChain` 只需要这几件事：一次整链前向、卸载，以及装载耗时拆分。"""
 
     def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0,
                 causal: bool = False) -> object: ...
 
     def close(self) -> None: ...
+
+    @property
+    def load_s(self) -> float:
+        """装载耗时（秒），不含产物编译。"""
+
+    @property
+    def compile_s(self) -> float:
+        """产物编译耗时（秒）；产物全部命中缓存时是 0。"""
 
 
 class Prompter(Protocol):
@@ -65,7 +73,6 @@ class SplitRunner:
         self._prompter = prompter
         self._max_len = int(max_len)
         self._chain: ModelChain | None = None
-        self._load_s = 0.0
         self._warm_ok = False
 
     # ------------------------------------------------------------------ 生命周期
@@ -75,9 +82,7 @@ class SplitRunner:
         return None
 
     def load_weights(self) -> None:
-        started = time.perf_counter()
         self._chain = self._load_chain()
-        self._load_s = time.perf_counter() - started
 
     def artifact_bytes(self) -> int:
         """编译产物落在链自己的 scratch 目录；这里不计（产物预算默认不设上限）。"""
@@ -88,9 +93,10 @@ class SplitRunner:
             raise ConfigError("split 策略尚未装载权重", strategy="split")
         started = time.perf_counter()
         self._warm()
+        # 装载与编译的拆分由链自己量（只有它知道哪几层是从头构建的）；预热是这里量的。
         return CompilationTimes(
-            load_s=self._load_s,
-            compile_s=0.0,
+            load_s=self._chain.load_s,
+            compile_s=self._chain.compile_s,
             warmup_s=time.perf_counter() - started,
         )
 

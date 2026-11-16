@@ -35,6 +35,10 @@ def test_chain_probabilities_and_repeat(tmp_path: Path) -> None:
     chain = SplitChain.load(MUDE_DIR, weights=mude.weight_plan(MUDE_DIR), s=256,
                             scratch_dir=tmp_path / "programs")
     try:
+        # 冷产物目录（`tmp_path` 是新的）：编译那一段真的花了时间，且与装载分开记。
+        # 这两条是"启动报告"在真链上的落点 —— 少了它们，`compile_s` 又可以是恒 0 的摆设。
+        assert chain.compile_s > 0.0
+        assert chain.load_s > 0.0
         tokens = [1, 2, 3, 4]
         probabilities = chain.forward(tokens, options=3)
         assert probabilities.shape == (3,)

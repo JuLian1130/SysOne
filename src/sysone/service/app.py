@@ -21,12 +21,27 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
+from ..domain.work import CompilationTimes
 from ..errors import NotReadyError, SysOneError
 from . import protocol
 from .admission import Admission
 
 IDLE_SECONDS = 120
 RETRY_AFTER_SECONDS = 1
+
+
+def _startup_report(times: CompilationTimes | None) -> str:
+    """`ready in` 那一行的后缀：装载 / 编译 / 预热三段（秒）。
+
+    只印总耗时看不出首启为什么要等那么久：冷产物目录上编译占掉绝大部分，第二次启动它
+    接近 0，两次的 `ready in` 差一个数量级却看不出原因（`plan.md` 的 R6）。
+    """
+    if times is None:
+        return ""
+    return (
+        f" (load {times.load_s:.2f}s, compile {times.compile_s:.2f}s,"
+        f" warmup {times.warmup_s:.2f}s)"
+    )
 
 
 class EngineDecider:
@@ -78,7 +93,7 @@ class Gate:
         self._status = "loading"
         self._error: BaseException | None = None
         self._decider: EngineDecider | None = None
-        self.startup: object | None = None
+        self.startup: CompilationTimes | None = None
 
     @property
     def status(self) -> str:
@@ -97,7 +112,7 @@ class Gate:
                 raise NotReadyError("引擎尚未装载完成", status=self._status)
             return self._decider
 
-    def start(self, load: Callable[[], tuple[EngineDecider, object]]) -> None:
+    def start(self, load: Callable[[], tuple[EngineDecider, CompilationTimes]]) -> None:
         """后台装载：`load()` 返回 (decider, CompilationTimes)；失败记下错误并置为 failed。"""
         thread = threading.Thread(target=self._load, args=(load,), name="sysone-load", daemon=True)
         thread.start()
@@ -107,7 +122,7 @@ class Gate:
         self._ready.wait(timeout)
         return self.status == "ready"
 
-    def _load(self, load: Callable[[], tuple[EngineDecider, object]]) -> None:
+    def _load(self, load: Callable[[], tuple[EngineDecider, CompilationTimes]]) -> None:
         try:
             decider, startup = load()
         except BaseException as exc:  # noqa: BLE001 - 装载失败要作为状态回出去
@@ -359,7 +374,7 @@ class SystemOneHandler(BaseHTTPRequestHandler):
 
 def serve(
     *,
-    load: Callable[[], tuple[EngineDecider, object]],
+    load: Callable[[], tuple[EngineDecider, CompilationTimes]],
     host: str = "127.0.0.1",
     port: int = 8000,
     api_key: str | None = None,
@@ -386,7 +401,7 @@ def serve(
 
 def run(
     *,
-    load: Callable[[], tuple[EngineDecider, object]],
+    load: Callable[[], tuple[EngineDecider, CompilationTimes]],
     host: str = "127.0.0.1",
     port: int = 8000,
     api_key: str | None = None,
@@ -426,7 +441,11 @@ def run(
                 raise error
             raise NotReadyError("引擎装载失败", reason=repr(error))
         if announce:
-            print(f"sysone serve: ready in {time.perf_counter() - started:.2f}s", flush=True)
+            elapsed = time.perf_counter() - started
+            print(
+                f"sysone serve: ready in {elapsed:.2f}s{_startup_report(gate.startup)}",
+                flush=True,
+            )
         threading.Event().wait()  # 交给 Ctrl-C
     except KeyboardInterrupt:
         pass

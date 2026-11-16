@@ -52,6 +52,10 @@ class FakeTokenizer:
 class FakeChain:
     """只记账、按 `options` 给均匀概率；`shares` 可覆盖成不等概率。"""
 
+    # runner 从链上取这两段装载耗时（真链由 ANE 侧量），个别测试会改成别的数。
+    load_s = 0.0
+    compile_s = 0.0
+
     def __init__(self, *, shares: tuple[float, ...] | None = None) -> None:
         self.calls: list[tuple[tuple[int, ...], int, int]] = []
         self.closed = False
@@ -395,6 +399,17 @@ def test_shutdown_closes_the_chain_and_requires_load() -> None:
     runner.shutdown()
     assert chain.closed is True
     assert runner.check_health() is False
+
+
+def test_startup_times_come_from_the_chain() -> None:
+    """装载/编译由链自己量（只有它知道哪几层是从头构建的产物），预热由 runner 量。"""
+    chain = FakeChain()
+    chain.load_s, chain.compile_s = 1.25, 9.5
+    runner = _runner(chain)
+    runner.load_weights()
+    times = runner.compile_or_warm_up()
+    assert (times.load_s, times.compile_s) == (1.25, 9.5)
+    assert times.warmup_s > 0.0
 
 
 def test_execute_is_not_the_split_entry() -> None:
