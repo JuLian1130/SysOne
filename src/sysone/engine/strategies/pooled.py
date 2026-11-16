@@ -196,7 +196,6 @@ def h2o_runner(
     width: int | None = None,
     quantize: bool = True,
     scratch_dir: str | Path | None = None,
-    resident: int | None = None,
     tokenizer: object | None = None,
 ) -> PooledRunner:
     """装一条 h2o 的 pooled 链：厂商答面 + 词表行按需取 + ANE 链。
@@ -207,7 +206,9 @@ def h2o_runner(
 
     今天**不走 Metal**：`metal=True` 那条路（注意力/GDN 上 GPU）只在 mude 的
     `(2048, 6144)` 上做过逐位对拍，h2o 的 `(2560, 9216)` 还没有证据，所以这条路先用
-    numpy 那侧算注意力与 GDN —— 与票据 15 §20 里对过拍的形态一致。
+    numpy 那侧算注意力与 GDN —— 与票据 15 §20 里对过拍的形态一致。因此这里**也不收
+    `resident`**：待命窗口是 Metal 流水线换窗的机制，在 numpy 路上传它只会在
+    `SplitChain.load` 里换来一句"常驻窗口只在 Metal 流水线上有意义"。
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
@@ -235,7 +236,6 @@ def h2o_runner(
             quantize=quantize,
             metal=False,
             scratch_dir=scratch_dir,
-            resident=resident,
         )
 
     def rows(label_ids: Sequence[int]) -> np.ndarray:

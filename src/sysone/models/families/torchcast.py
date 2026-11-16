@@ -31,4 +31,5 @@ def build_layer_plan(descriptor: ModelDescriptor, config: EngineConfig) -> Layer
     return qwen35.layer_plan(descriptor, config)
 
 
-register_family("torchcast", parse_config, build_layer_plan, source=__name__)
+register_family("torchcast", parse_config, build_layer_plan,
+                strategy="vendor", source=__name__)

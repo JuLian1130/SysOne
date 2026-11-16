@@ -14,7 +14,8 @@ from .devices.reference import CharEncoder, ReferencePlatform, ReferenceRunner
 from .domain.attention import MaskMode
 from .domain.decision import DecisionRequest, Question
 from .engine.engine import Engine
-from .engine.strategies.split import mude_runner
+from .engine.strategies.assembly import BACKENDS as STRATEGY_BACKENDS
+from .engine.strategies.assembly import assemble
 from .env import read as read_env
 from .errors import ConfigError, SysOneError
 from .models import families as _family_modules  # noqa: F401  导入即注册
@@ -33,6 +34,8 @@ _SPLIT_WIDTH = SchedulerConfig().max_len
 # （三轮暖配对 +0.8 / +1.3 / +0.6 %），代价落在短请求上（200 token 2.52×、1k +139 %）；出货形态
 # 是长请求，所以默认取窗口。0 保留给"全装"的对照形态（换算与对账见 docs/sysone/plan.md 第 10/11 片）。
 _RESIDENT_W = 4
+# 后端不给 `--model` 时的默认家族。mude 维持原样；pooled 只有 h2o。
+_DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o"}
 
 
 def _model_flags() -> argparse.ArgumentParser:
@@ -41,10 +44,14 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument(
         "--backend",
         default="reference",
-        choices=("reference", "split"),
-        help="执行路径：reference（M0 语义裁判，只做全注意力层）/ split（mude 整链）",
+        choices=("reference",) + STRATEGY_BACKENDS,
+        help="执行路径：reference（M0 语义裁判，只做全注意力层）/ split（码表读出，mude）"
+             "/ pooled（标签行读出，h2o）",
     )
-    common.add_argument("--model", default=None, choices=families(), help="split 路径的家族（默认 mude）")
+    common.add_argument(
+        "--model", default=None, choices=families(),
+        help="家族（默认按后端取：split → mude、pooled → h2o）",
+    )
     common.add_argument("--descriptor", type=Path, default=None, help="descriptor JSON；reference 路径必填")
     common.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
     common.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
@@ -173,21 +180,28 @@ def _platform_report(target: str) -> dict[str, object]:
 
 def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
     """按 `--backend` 装配引擎：参考后端（M0 语义裁判）或 mude 的 ANE+GPU 链。"""
-    if args.backend == "split":
-        name = args.model or "mude"
+    if args.backend in STRATEGY_BACKENDS:
+        name = args.model or _DEFAULT_FAMILY[args.backend]
         width = int(args.width or _SPLIT_WIDTH)
-        descriptor = family(name).parse_config(args.weights)
+        # 形状与执行器都由注册表装配（`engine.strategies.assembly`）：CLI 不认识任何家族名，
+        # 也不认识哪条链该配哪套题面 —— 那是家族自己声明的策略。
+        # 待命窗口是 Metal 流水线的事；pooled 今天走 numpy 那侧，传它只会被拒绝。
+        options: dict[str, int | None] = {"bucket": args.bucket or None, "width": width}
+        if args.backend == "split":
+            options["resident"] = args.resident or None
+        assembled = assemble(args.weights, name, backend=args.backend, **options)
+        descriptor = assembled.descriptor
         config = EngineConfig(
             model=ModelSelection(name=args.weights.name, dir=args.weights),
             scheduler=SchedulerConfig(attention_mode=mode, max_len=width),
             service=ServiceConfig(debug_timings=bool(args.debug_timings)),
         )
         config.validate()
-        # 编码器只是 Engine 的必填位：split 不排 MaskPlan，真正渲染在 `mude_runner` 的题面里。
+        # 编码器只是 Engine 的必填位：这两条策略都不排 MaskPlan，题面由家族自己的 Prompter
+        # 或厂商答面渲染。
         return Engine(
             descriptor=descriptor,
-            runner=mude_runner(args.weights, bucket=args.bucket or None, width=width,
-                               resident=args.resident or None),
+            runner=assembled.runner,
             encoder=CharEncoder(vocab=descriptor.vocab),
             config=config,
         )

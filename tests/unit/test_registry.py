@@ -27,5 +27,14 @@ def test_unknown_family_reports_available() -> None:
 
 def test_double_registration_is_an_error() -> None:
     with pytest.raises(RegistrationError):
-        register_family("temp", lambda path: load_tiny_descriptor(), _noop_plan)
-        register_family("temp", lambda path: load_tiny_descriptor(), _noop_plan)
+        register_family("temp", lambda path: load_tiny_descriptor(), _noop_plan,
+                        strategy="split")
+        register_family("temp", lambda path: load_tiny_descriptor(), _noop_plan,
+                        strategy="split")
+
+
+def test_a_family_must_declare_its_readout_strategy() -> None:
+    """不声明策略就注册不了：装配时"没人认领这个家族"比早退难查得多。"""
+    with pytest.raises(RegistrationError):
+        register_family("no-strategy", lambda path: load_tiny_descriptor(), _noop_plan,
+                        strategy="")
