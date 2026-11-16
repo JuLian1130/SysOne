@@ -1,14 +1,21 @@
 """`Serve` 的答面接线：题面怎么渲染、标签怎么落到 token、logits 怎么交给厂商判。
 
 不依赖 transformers / torch：shim、`serve_config` 契约与分词器都是假的。真 shim 与真分词器
-在 `.scratch` 的对拍里跑（那里两边都用同一份厂商代码）。
+在 `.scratch` 的对拍里跑（那里两边都用同一份厂商代码）——包括分词器换掉之后那一次逐位对照
+（`.scratch/c2_tokenizer_parity.py`，105 道真题 + 三档合成拉伸）。
 """
 
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
+
 import pytest
 
 from sysone.errors import ConfigError, ReadoutError
+from sysone.models.tokenizer import ChatTokenizer
+from sysone.models.vendors import h2o_serve
 from sysone.models.vendors.h2o_serve import Serve
 
 CONFIG = {
@@ -151,3 +158,45 @@ def test_open_needs_the_vendor_serve_config(tmp_path):
     """目录里没有 `serve_config.json` 就报配置错，而不是拿空的标签表去跑。"""
     with pytest.raises(ConfigError):
         Serve.open(tmp_path, tokenizer=FakeTokenizer())
+
+
+def _write_tokenizer(directory: Path) -> None:
+    """一个词表级的小分词器：`tokenizer.json` + `tokenizer_config.json`（模板留空）。"""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "record": 1, "A/B": 2}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    backend.save(str(directory / "tokenizer.json"))
+    (directory / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": ""}), encoding="utf-8"
+    )
+
+
+def test_open_reads_the_tokenizer_file_without_transformers(tmp_path, monkeypatch):
+    """答面只要"文本 → id"：走目录里的 `tokenizer.json`，不为它装 transformers。
+
+    `transformers` 为这件事要多装 ≈0.28 GB 的底座（`models/tokenizer.py` 的实测），而这条
+    答面一次也没用到它的模板与解码 —— 模板是厂商 shim 自己渲染的。换成与 mude 出货路径
+    同一个 `ChatTokenizer` 之后，h2o 的出货路径才进得了没有 transformers 的门禁。
+    """
+    (tmp_path / "serve_config.json").write_text(json.dumps(CONFIG), encoding="utf-8")
+    _write_tokenizer(tmp_path)
+    monkeypatch.setattr(h2o_serve, "_load_shim", lambda root: FakeShim)
+    monkeypatch.setitem(sys.modules, "transformers", None)      # 真导入会炸
+
+    subject = Serve.open(tmp_path)
+
+    assert isinstance(subject._tokenizer, ChatTokenizer)
+    # 与 `tokenizer.json` 直编逐位相同（也就是"真用了那个文件"，而不是回落到别的东西）
+    from tokenizers import Tokenizer
+
+    expected = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    assert subject._ids("record A/B") == tuple(expected.encode("record A/B").ids)
+
+
+def test_open_names_the_missing_tokenizer_file(tmp_path, monkeypatch):
+    """目录里没有 `tokenizer.json` 就指名道姓地报，不要静默退化成"按字符切"。"""
+    (tmp_path / "serve_config.json").write_text(json.dumps(CONFIG), encoding="utf-8")
+    monkeypatch.setattr(h2o_serve, "_load_shim", lambda root: FakeShim)
+    with pytest.raises(ConfigError, match="tokenizer.json"):
+        Serve.open(tmp_path)

@@ -1,4 +1,4 @@
-"""无 torch 门禁：core 与参考后端只依赖 numpy。"""
+"""无 torch 门禁：core 与参考后端只依赖 numpy；h2o 的答面连 transformers 也不需要。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ import sysone
 import sysone.config, sysone.domain.attention, sysone.engine.engine
 import sysone.devices.reference
 import sysone.models.families
+import sysone.models.tokenizer, sysone.models.vendors.h2o_serve
 assert "torch" not in sys.modules, sorted(m for m in sys.modules if m == "torch")
+assert "transformers" not in sys.modules, sorted(m for m in sys.modules if m == "transformers")
 print("ok")
 """
 

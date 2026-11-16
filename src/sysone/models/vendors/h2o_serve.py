@@ -5,6 +5,10 @@
 - `vendors/h2o_bridge.py`：厂商自己的 torch 模型；
 - `engine/strategies/pooled.py`：我们的 ANE 链。
 
+也**不需要 `transformers`**：这条面只做"文本 → id"，用的是与 mude 出货路径同一个
+`ChatTokenizer`（`tokenizer.json` 直连，见 `models/tokenizer.py`）。要厂商的模型结构时才装
+它（`h2o_bridge` 的前向），那时它已经在环境里。
+
 共用不是省事，而是对拍的前提：两条路要是各有各的模板，概率差多少都说不清是谁的问题
 （票据 12 量过，只给选项键不给判据描述时 105 题里 7 题判词不同，把厂商原装的 criteria
 喂回去这 7 题全部复现 —— 差的不是权重，是题面）。
@@ -24,6 +28,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ...errors import ConfigError, ReadoutError
+from ..tokenizer import ChatTokenizer
 from .base import wire_answer
 
 SHIM_FILE = "h2o_lightning_shim.py"
@@ -73,16 +78,14 @@ class Serve:
 
     @classmethod
     def open(cls, model_dir: Path | str, tokenizer: object | None = None) -> Serve:
-        """从厂商目录装：`serve_config.json`、shim、分词器（不给就用 transformers 装）。"""
+        """从厂商目录装：`serve_config.json`、shim、分词器（不给就读目录里的 `tokenizer.json`）。"""
         root = Path(model_dir)
         serve = root / SERVE_FILE
         if not serve.exists():
             raise ConfigError("厂商目录缺少 serve_config.json", path=str(serve))
         config = json.loads(serve.read_text(encoding="utf-8"))
         if tokenizer is None:
-            import transformers
-
-            tokenizer = transformers.AutoTokenizer.from_pretrained(str(root))
+            tokenizer = ChatTokenizer.load(root)
         return cls(config, _load_shim(root), tokenizer)
 
     # ---------------------------------------------------------------- 题面

@@ -58,8 +58,10 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
     common.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
     common.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
-    common.add_argument("--bucket", type=int, default=0, help="split：ANE program 的列宽（默认 1024）")
-    common.add_argument("--width", type=int, default=0, help=f"split：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
+    common.add_argument("--bucket", type=int, default=0,
+                        help="split / pooled：ANE program 的列宽（默认 1024）")
+    common.add_argument("--width", type=int, default=0,
+                        help=f"split / pooled：GPU 缓冲的列数（默认 {_SPLIT_WIDTH}）")
     common.add_argument(
         "--W", type=int, default=_RESIDENT_W, dest="resident",
         help=f"待命常驻的层数（默认 {_RESIDENT_W} = 一个块；0 = 全部常驻）。"
