@@ -197,6 +197,7 @@ def h2o_runner(
     quantize: bool = True,
     scratch_dir: str | Path | None = None,
     tokenizer: object | None = None,
+    metal: bool = True,
 ) -> PooledRunner:
     """装一条 h2o 的 pooled 链：厂商答面 + 词表行按需取 + ANE 链。
 
@@ -204,11 +205,11 @@ def h2o_runner(
     `ffn` 是 9216、`hidden` 是 2560，两个 program 都比 mude 大，所以这两项由调用方说清楚，
     不在这里猜。
 
-    今天**不走 Metal**：`metal=True` 那条路（注意力/GDN 上 GPU）只在 mude 的
-    `(2048, 6144)` 上做过逐位对拍，h2o 的 `(2560, 9216)` 还没有证据，所以这条路先用
-    numpy 那侧算注意力与 GDN —— 与票据 15 §20 里对过拍的形态一致。因此这里**也不收
-    `resident`**：待命窗口是 Metal 流水线换窗的机制，在 numpy 路上传它只会在
-    `SplitChain.load` 里换来一句"常驻窗口只在 Metal 流水线上有意义"。
+    `metal=True` 默认开：h2o 的 `(2560, 9216)` 已经做过 numpy vs Metal 的逐位对拍
+    （票据 15 §24：桶 256、64/128 token、两种读法，hidden relL2 1.3e-3、logits 3e-4 量级、
+    argmax 全同），注意力与 GDN 走 GPU 快 3~10 倍。这条路上**不收 `resident`**：待命窗口是
+    Metal 流水线换窗的机制，但 h2o 的 32 层权重（≈3.33 GiB ANE 常驻）还没做窗口化
+    （票据 15 的 A3），所以这里不给这个旋钮，免得"设了窗口"和"没生效"同时成立。
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
@@ -234,7 +235,7 @@ def h2o_runner(
             s=bucket_width,
             width=buffer_width,
             quantize=quantize,
-            metal=False,
+            metal=metal,
             scratch_dir=scratch_dir,
         )
 

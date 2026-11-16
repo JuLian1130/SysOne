@@ -25,9 +25,11 @@ from ..base import Capabilities, MemoryInfo, Placement, Shape
 from .runtime import AneRuntime
 
 # 实测白名单：**端到端**跑通过（numpy 逐位对拍 + 真权重）的 (hidden, ffn)。加一项要拿证据
-# —— 票据 15 §11 的形状探针只证明 ANE 收下这些 program，不证明数值对，所以 4B 的
-# (2560, 9216) 要等真权重单层对拍之后才进这张表。
-MEASURED_GEOMETRIES: frozenset[tuple[int, int]] = frozenset({(2048, 6144)})
+# —— 形状探针只证明 ANE 收下这些 program，不证明数值对。
+#
+# (2560, 9216) 是 h2o：真权重单层对拍（票据 15 §20，全部结构性中间量 = 3.6e-04 的投影地板）、
+# 整链对厂商 6.3e-3（§21）、numpy 链对 Metal 流水线 1.3e-3（§24，两种读法、64/128 token）。
+MEASURED_GEOMETRIES: frozenset[tuple[int, int]] = frozenset({(2048, 6144), (2560, 9216)})
 # 一个 ANE program 的原生 S 上限约 4096（16k 在旧引擎里是 4 × 4096 分块跑的）。
 MAX_TILE = 4096
 # 平台愿意服务的最大 token 数（16k = 4 × 4096 分块）。它是**能力声明**，不是加载期拒绝的

@@ -1021,6 +1021,15 @@ class MudePipeline:
         view = self._last.array(np.float16, (self._hidden, self._width))
         return np.asarray(view[:, length - 1], np.float32)
 
+    def hidden_rows(self, length: int) -> np.ndarray:
+        """最后一层的**全部** `length` 个位置（`[length, hidden]` fp32）。
+
+        `_last` 是整张 `[hidden, width]` 画布，所以整段都在，只是平时只取末位。逐位置对拍
+        （numpy 链 vs Metal 链）与逐层 trace 需要这一份；numpy 那条路本来给的就是整段。
+        """
+        view = self._last.array(np.float16, (self._hidden, self._width))
+        return np.asarray(view[:, :length].T, np.float32)
+
     def close(self) -> None:
         residency, self._residency = getattr(self, "_residency", None), None
         if residency is not None:

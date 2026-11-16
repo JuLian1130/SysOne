@@ -36,17 +36,19 @@ def test_capabilities_are_the_apple_ones():
 
 
 def test_verify_model_accepts_a_measured_geometry():
-    """白名单里唯一有端到端证据的几何：mude 的 (2048, 6144)。"""
+    """两个有端到端证据的几何：mude 的 (2048, 6144) 与 h2o 的 (2560, 9216)。"""
     ApplePlatform().verify_model(mude.parse_config(FIXTURES / "mude"))
+    ApplePlatform().verify_model(dataclasses.replace(load_tiny_descriptor(), hidden=2560,
+                                                  ffn=9216))
 
 
 def test_verify_model_rejects_a_geometry_outside_the_whitelist():
     """白名单是**精确集合**，不是尺寸上限：小几何没实测过也一样拒绝。"""
-    descriptor = dataclasses.replace(load_tiny_descriptor(), hidden=2560, ffn=9216)
+    descriptor = dataclasses.replace(load_tiny_descriptor(), hidden=2560, ffn=8192)
     with pytest.raises(ConfigError) as excinfo:
         ApplePlatform().verify_model(descriptor)
     context = excinfo.value.context
-    assert (context["hidden"], context["ffn"]) == (2560, 9216)
+    assert (context["hidden"], context["ffn"]) == (2560, 8192)
     assert context["measured"] == [
         {"hidden": hidden, "ffn": ffn} for hidden, ffn in sorted(MEASURED_GEOMETRIES)
     ]

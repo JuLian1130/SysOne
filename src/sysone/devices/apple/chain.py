@@ -368,7 +368,10 @@ class SplitChain:
             embed = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid,
                            self._width)
             self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix, causal=causal)
-            return self._pipeline.last_hidden(length).copy()
+            # 与 numpy 那条路同形：`[length, hidden]`（末位就是读出要的那一行）。以前这条
+            # 分支只返回末位的一维向量，与自己的 docstring 不符 —— 逐位置对拍与
+            # `PooledRunner` 的形状自检都会撞上。
+            return rms_norm(self._pipeline.hidden_rows(length), self._final_norm)
         x = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid, self._width)
         if trace is not None:
             trace.append(x[:, length - 1].copy())

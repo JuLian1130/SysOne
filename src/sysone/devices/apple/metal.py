@@ -386,12 +386,24 @@ class MetalRuntime:
 
 
 def available(e8_dir: str | os.PathLike | None = None) -> bool:
-    """能否在这台机器上跑 Metal 计算（非 macOS 或缺 dylib 都算不能）。"""
+    """能否在这台机器上跑 Metal 计算（非 macOS 或缺 dylib 都算不能）。
+
+    **不构造运行时**：`MetalRuntime` 是进程级单例，构造一次就按当时给的几何编译了 kernel
+    库，而且它把"编译过的几何"钉死 —— 之后任何别的几何都会撞
+    `ConfigError("同进程的 Metal 运行时已经按另一套几何编译过")`。只问"能不能用"就把
+    默认（mude）几何编进去，等于让**一次探测**决定整个进程只能跑 mude：A1 的
+    h2o `(2560, 9216)` 对拍就是这么被自己挡住的（2026-11-16）。
+
+    所以这里只做无副作用的两件事：dylib 在不在、符号全不全。真正的编译留给
+    `MetalRuntime(geometry=...)` 的调用方 —— 它才知道该编哪套几何。
+    """
     if sys.platform != "darwin":
         return False
-    try:
-        runtime = MetalRuntime(path=None if e8_dir is None else Path(e8_dir) / MTL_DYLIB_NAME)
-    except NotReadyError:
+    path = Path(e8_dir) / MTL_DYLIB_NAME if e8_dir is not None else _dylib_path(None)
+    if not path.is_file():
         return False
-    runtime.close()
-    return True
+    try:
+        lib = ctypes.CDLL(str(path))
+    except OSError:
+        return False
+    return all(hasattr(lib, name) for name in _REQUIRED)
