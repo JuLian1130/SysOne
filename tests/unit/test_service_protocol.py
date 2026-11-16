@@ -370,9 +370,11 @@ def test_health_and_models_payloads() -> None:
 
 
 def test_routes_match_the_upstream_contract() -> None:
+    # 前三条是上游契约；`/metrics` 是我们自己的诊断口，像 `/health` 一样不要求 key。
     assert protocol.ROUTES == {
         "/health": "GET",
         "/v1/models": "GET",
+        "/metrics": "GET",
         "/v1/systemone": "POST",
     }
     assert protocol.PROTECTED == ("/v1/models", "/v1/systemone")

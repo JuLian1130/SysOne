@@ -35,6 +35,9 @@ class Admission:
         self._cond = threading.Condition()
         self._running = 0
         self._waiting = 0
+        # 累计计数（`snapshot` 那两个是瞬时值）：`/metrics` 要的是可聚合的这两笔。
+        self._entered = 0
+        self._rejected = 0
 
     @property
     def capacity(self) -> int:
@@ -45,6 +48,7 @@ class Admission:
         """拿一个执行位；容量已满（立刻）或等过 `timeout` 都返回 `False`（即 429）。"""
         with self._cond:
             if self._running + self._waiting >= self.capacity:
+                self._rejected += 1
                 return False
             self._waiting += 1
             deadline = time.monotonic() + self.timeout
@@ -52,10 +56,12 @@ class Admission:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     self._waiting -= 1
+                    self._rejected += 1
                     return False
                 self._cond.wait(remaining)
             self._waiting -= 1
             self._running += 1
+            self._entered += 1
             return True
 
     def leave(self) -> None:
@@ -67,3 +73,18 @@ class Admission:
         """(在跑, 在等)，给拒绝文案与日志用。"""
         with self._cond:
             return self._running, self._waiting
+
+    def stats(self) -> dict[str, int]:
+        """瞬时值加上累计计数，给 `/metrics` 用。
+
+        `entered` / `rejected` 是自启动以来的累计：拒绝**包括**"立刻满"与"排队超时"两种
+        （两者都回 429），所以它与 `entered` 一起就能算出被挡掉的比例。
+        """
+        with self._cond:
+            return {
+                "active": self._running,
+                "waiting": self._waiting,
+                "entered": self._entered,
+                "rejected": self._rejected,
+                "capacity": self.capacity,
+            }

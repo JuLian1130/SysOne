@@ -19,9 +19,11 @@ import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
+from ..domain.decision import DecisionRequest, DecisionResult
 from ..domain.work import CompilationTimes
+from ..engine.stats import RunStats
 from ..errors import NotReadyError, SysOneError
 from . import protocol
 from .admission import Admission
@@ -44,12 +46,20 @@ def _startup_report(times: CompilationTimes | None) -> str:
     )
 
 
+class EngineSource(Protocol):
+    """`EngineDecider` 从引擎要的两件事：跑一道请求、给三层统计。"""
+
+    def run(self, request: DecisionRequest) -> DecisionResult: ...
+
+    def stats(self) -> RunStats: ...
+
+
 class EngineDecider:
-    """把引擎包成前门要的形状：健康信息、模型信息、跑一道请求。"""
+    """把引擎包成前门要的形状：健康信息、模型信息、跑一道请求、报三层统计。"""
 
     def __init__(
         self,
-        engine: object,
+        engine: EngineSource,
         *,
         model_name: str,
         max_input_tokens: int,
@@ -66,6 +76,26 @@ class EngineDecider:
             max_input_tokens=self.max_input_tokens,
             authentication=authentication,
         )
+
+    def metrics(self) -> dict[str, Any]:
+        """引擎那三层的数字（`RunStats`）。准入的计数属于服务这一层，在 `_answer` 里合并。"""
+        stats = self.engine.stats()
+        return {
+            "request": {
+                "requests": stats.request.requests,
+                "questions": stats.request.questions,
+                "tokens": stats.request.tokens,
+            },
+            "stage": {
+                "prefill_s": round(stats.stage.prefill_s, 3),
+                "readout_s": round(stats.stage.readout_s, 3),
+            },
+            "startup": {
+                "load_s": round(stats.startup.load_s, 3),
+                "compile_s": round(stats.startup.compile_s, 3),
+                "warmup_s": round(stats.startup.warmup_s, 3),
+            },
+        }
 
     def models(self) -> dict[str, Any]:
         return protocol.models_payload(
@@ -281,6 +311,12 @@ class SystemOneHandler(BaseHTTPRequestHandler):
             return self.server.gate.decider.answer(self.parse(raw))
         if path == protocol.MODELS_PATH:
             return self.server.gate.decider.models()
+        if path == protocol.METRICS_PATH:
+            # 准入是服务这一层的账（引擎不知道门的存在），所以在这里合并两边的数字。
+            return {
+                "admission": self.server.admission.stats(),
+                "engine": self.server.gate.decider.metrics(),
+            }
         return self.server.gate.decider.health(authentication=self.server.key_digest is not None)
 
     def authorized(self) -> bool:

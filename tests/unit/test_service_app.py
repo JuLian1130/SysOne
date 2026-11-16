@@ -19,6 +19,7 @@ from sysone.domain.attention import MaskMode
 from sysone.domain.decision import Answer, DecisionResult, Provenance, Usage
 from sysone.domain.quant import QuantSpec
 from sysone.domain.work import CompilationTimes
+from sysone.engine.stats import RequestStats, RunStats, StageStats, StartupStats
 from sysone.errors import ConfigError, NotReadyError
 from sysone.service import app as service_app
 
@@ -58,8 +59,16 @@ class FakeEngine:
             ),
         )
 
+    def stats(self) -> RunStats:
+        """`/metrics` 要的三层数字；请求数就是跑过几道。"""
+        return RunStats(
+            request=RequestStats(requests=self.calls),
+            stage=StageStats(),
+            startup=StartupStats(),
+        )
 
-def _decider(engine: object | None = None) -> service_app.EngineDecider:
+
+def _decider(engine: FakeEngine | None = None) -> service_app.EngineDecider:
     return service_app.EngineDecider(
         engine or FakeEngine(), model_name="fake", max_input_tokens=16384
     )
@@ -326,7 +335,12 @@ def test_not_ready_is_503_with_retry_after(start_server) -> None:
         return _decider(), CompilationTimes(0.0, 0.0, 0.0)
 
     server, gate = start_server(load=load)
-    for path, body in (("/health", None), ("/v1/systemone", CHOICE), ("/v1/models", None)):
+    for path, body in (
+        ("/health", None),
+        ("/v1/systemone", CHOICE),
+        ("/v1/models", None),
+        ("/metrics", None),
+    ):
         status, headers, raw = _call(server, "POST" if body else "GET", path, body=body)
         assert status == 503, path
         assert headers["retry-after"] == "1"
@@ -440,3 +454,56 @@ def test_ready_line_reports_the_startup_breakdown() -> None:
     assert note == " (load 0.85s, compile 10.62s, warmup 0.57s)"
     # 装载还没结束时 `Gate.startup` 是 None：不印假的 0.00，宁可什么都不加。
     assert service_app._startup_report(None) == ""
+
+
+# ---------------------------------------------------------------------- /metrics
+
+
+def test_metrics_report_the_engine_layers_and_the_admission(start_server) -> None:
+    """一个诊断口，两块数字：准入是服务这一层的账，三层统计是引擎的。"""
+    server, gate = start_server()
+    assert gate.wait(5.0)
+    assert _call(server, "POST", "/v1/systemone", body=CHOICE)[0] == 200
+    assert _wait_until(lambda: server.admission.snapshot() == (0, 0))
+
+    status, _, raw = _call(server, "GET", "/metrics")
+    assert status == 200
+    payload = _json(raw)
+    # 默认 workers=1 + queue=2，一条请求进来跑完：在册数归零、累计 1、没有拒绝。
+    assert payload["admission"] == {
+        "active": 0,
+        "waiting": 0,
+        "entered": 1,
+        "rejected": 0,
+        "capacity": 3,
+    }
+    assert payload["engine"]["request"]["requests"] == 1
+    assert set(payload["engine"]["request"]) == {"requests", "questions", "tokens"}
+    assert set(payload["engine"]["stage"]) == {"prefill_s", "readout_s"}
+    assert set(payload["engine"]["startup"]) == {"load_s", "compile_s", "warmup_s"}
+
+
+def test_metrics_count_admission_refusals(start_server) -> None:
+    """被准入挡掉的那一条记进 `rejected`：429 是"门没让进"，不是"跑失败"。"""
+    hold = threading.Event()
+    server, gate = start_server(engine=FakeEngine(hold=hold), queue=0)
+    assert gate.wait(5.0)
+    running = threading.Thread(
+        target=lambda: _call(server, "POST", "/v1/systemone", body=CHOICE), daemon=True
+    )
+    running.start()
+    assert _wait_until(lambda: server.admission.snapshot()[0] == 1)
+
+    status, _, _ = _call(server, "POST", "/v1/systemone", body=CHOICE)
+    assert status == 429
+
+    hold.set()
+    running.join(5.0)
+    assert _wait_until(lambda: server.admission.snapshot() == (0, 0))
+    status, _, raw = _call(server, "GET", "/metrics")
+    assert status == 200
+    admission = _json(raw)["admission"]
+    assert admission["entered"] == 1
+    assert admission["rejected"] == 1
+    assert admission["capacity"] == 1
+    assert admission["active"] == 0

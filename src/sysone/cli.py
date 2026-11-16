@@ -13,6 +13,7 @@ from .devices.apple import ApplePlatform, measured
 from .devices.reference import CharEncoder, ReferencePlatform, ReferenceRunner
 from .domain.attention import MaskMode
 from .domain.decision import DecisionRequest, Question
+from .domain.work import CompilationTimes
 from .engine.engine import Engine
 from .engine.strategies.assembly import BACKENDS as STRATEGY_BACKENDS
 from .engine.strategies.assembly import assemble
@@ -262,7 +263,7 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
 def _serve(args: argparse.Namespace) -> int:
     """前台服务：先绑口、再在后台线程里装载引擎，装载期间探针拿到 503。"""
 
-    def load() -> tuple[EngineDecider, object]:
+    def load() -> tuple[EngineDecider, CompilationTimes]:
         engine = _build_engine(args, _parse_mode(args.attention_mode))
         startup = engine.start()
         return (

@@ -22,10 +22,16 @@ from ..domain.attention import MaskMode
 from ..domain.decision import Answer, DecisionRequest, DecisionResult, Question
 
 HEALTH_PATH = "/health"
+METRICS_PATH = "/metrics"
 MODELS_PATH = "/v1/models"
 SYSTEM_ONE_PATH = "/v1/systemone"
-ROUTES = {HEALTH_PATH: "GET", MODELS_PATH: "GET", SYSTEM_ONE_PATH: "POST"}
-# 需要 bearer key 的那两条；`/health` 永远开放给探针。
+ROUTES = {
+    HEALTH_PATH: "GET",
+    MODELS_PATH: "GET",
+    METRICS_PATH: "GET",
+    SYSTEM_ONE_PATH: "POST",
+}
+# 需要 bearer key 的那两条；`/health`（探针）与 `/metrics`（本机诊断）永远开放。
 PROTECTED = (MODELS_PATH, SYSTEM_ONE_PATH)
 KEY_VARIABLE = "DECISION_API_KEY"
 MEDIA_FIELDS = ("images", "videos")
