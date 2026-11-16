@@ -45,7 +45,9 @@ def test_h2o_geometry() -> None:
     assert descriptor.mtp_layers == 1
     assert descriptor.tied_embeddings is True
     assert descriptor.readout.kind == "pooled"
-    assert descriptor.default_mode is MaskMode.NONCAUSAL_FULL
+    # 两种读法都支持，但默认是因果：只有因果能分块 prefill（长 prompt 的 KV 不整段常驻）。
+    assert descriptor.default_mode is MaskMode.CAUSAL
+    assert descriptor.supported_modes == frozenset({MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL})
     assert descriptor.trained_modes == frozenset({MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL})
 
 

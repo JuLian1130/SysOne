@@ -24,7 +24,13 @@ PREFIX = "model.language_model"
 
 
 def parse_config(model_dir: Path) -> ModelDescriptor:
-    """读出方案是厂商的 pooled readout + selector，M1 由 vendor 策略实现。"""
+    """读出方案是厂商的 pooled readout + selector，M1 由 vendor 策略实现。
+
+    两种读法都训练过、都支持，**默认走因果**：它能分块 prefill（长 prompt 的 KV 不必整段
+    常驻），也是我们要优化到的那条路。双向是"整段一次看完"的读法，只在显式
+    `attention_mode=noncausal_full` 时才跑 —— 它要求整条 prompt 在一个桶里，而斜杠题面
+    动辄 8k~15k token。
+    """
     config = qwen35.load_json(model_dir / "config.json")
     modes = frozenset({MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL})
     return qwen35.descriptor_from(
@@ -34,7 +40,7 @@ def parse_config(model_dir: Path) -> ModelDescriptor:
         readout=ReadoutPlan(kind="pooled"),
         supported_modes=modes,
         trained_modes=modes,
-        default_mode=MaskMode.NONCAUSAL_FULL,
+        default_mode=MaskMode.CAUSAL,
     )
 
 
