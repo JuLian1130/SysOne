@@ -448,12 +448,12 @@ def test_content_length_and_chunked_together_is_400(start_server) -> None:
 def test_ready_line_reports_the_startup_breakdown() -> None:
     """就绪行带三段拆分。冷产物目录上编译占掉绝大部分、第二次启动它接近 0，只印总耗时
     看不出这个差异（`plan.md` R6 要的就是这一条）。"""
-    note = service_app._startup_report(
+    note = service_app.startup_report(
         CompilationTimes(load_s=0.85, compile_s=10.62, warmup_s=0.57)
     )
     assert note == " (load 0.85s, compile 10.62s, warmup 0.57s)"
     # 装载还没结束时 `Gate.startup` 是 None：不印假的 0.00，宁可什么都不加。
-    assert service_app._startup_report(None) == ""
+    assert service_app.startup_report(None) == ""
 
 
 # ---------------------------------------------------------------------- /metrics

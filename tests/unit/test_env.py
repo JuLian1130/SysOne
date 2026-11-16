@@ -1,4 +1,4 @@
-"""环境变量只登记两项，解析规则固定。"""
+"""环境变量只登记三项，解析规则固定。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pytest
 from sysone import env
 from sysone.errors import ConfigError
 
-_DEFAULTS = {"SYS1_LOG_LEVEL": "info", "DECISION_API_KEY": ""}
+_DEFAULTS = {"SYS1_LOG_LEVEL": "info", "DECISION_API_KEY": "", "SYS1_ARTIFACTS_DIR": ""}
 
 
 def test_default_is_used_when_unset() -> None:
@@ -15,9 +15,13 @@ def test_default_is_used_when_unset() -> None:
 
 
 def test_value_is_read() -> None:
-    assert env.read({"SYS1_LOG_LEVEL": "debug", "DECISION_API_KEY": "k"}) == {
+    assert env.read(
+        {"SYS1_LOG_LEVEL": "debug", "DECISION_API_KEY": "k",
+         "SYS1_ARTIFACTS_DIR": "/var/artifacts"}
+    ) == {
         "SYS1_LOG_LEVEL": "debug",
         "DECISION_API_KEY": "k",
+        "SYS1_ARTIFACTS_DIR": "/var/artifacts",
     }
 
 

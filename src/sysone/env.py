@@ -1,6 +1,7 @@
 """环境变量：唯一一处读环境的模块（注册表 + 类型校验）。
 
-M0 只有日志级别有真实消费者；其余调参项都走 `EngineConfig`，不在这里登记。
+登记的只有真正有消费者的三项：日志级别（`logging`）、服务的 bearer key（`service/app`）、
+产物落点（`cli`）。其余调参项都走 `EngineConfig`，不在这里登记。
 """
 
 from __future__ import annotations
@@ -27,6 +28,12 @@ REGISTRY: tuple[EnvSpec, ...] = (
         "str",
         "",
         "服务层的 bearer key；设了非空值后 /v1/models 与 /v1/systemone 必须带 Authorization",
+    ),
+    EnvSpec(
+        "SYS1_ARTIFACTS_DIR",
+        "str",
+        "",
+        "编译产物的落点（默认平台缓存目录）；`--artifacts` 优先于它",
     ),
 )
 

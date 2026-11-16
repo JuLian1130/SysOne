@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
 from typing import Sequence
@@ -182,9 +183,11 @@ class SplitChain:
         读权重的地方都不认识容器。
 
         `device` 目前只有 `"ane"`（这条链就是 ANE 链）；`scratch_dir` 放 MIL/blob 产物，
-        默认在系统临时目录，产物按内容哈希复用。`metal=True` 时额外建一条 GPU 流水线
-        （`MudePipeline`）：norm / 注意力 / GDN 走 Metal 核，中间量全程留在 IOSurface 上，
-        不再经 numpy 中转；此时 `logits()` 不提供逐层 trace。
+        `None` 表示系统临时目录（库与探针的方便默认，产物随重启消失）。`sysone serve` /
+        `sysone compile` 一律显式传持久目录：缓存命中与否就是首启 26 s 与 2 s 的差别。
+        `metal=True` 时额外建一条 GPU 流水线（`MudePipeline`）：norm / 注意力 / GDN 走
+        Metal 核，中间量全程留在 IOSurface 上，不再经 numpy 中转；此时 `logits()` 不提供
+        逐层 trace。
 
         `s` 是 ANE program 的列数（桶宽，受 program 的 S 上限约束）；`width` 是 GPU 侧缓冲
         的列数，默认等于 `s`（一桶跑完），16k 这类长序列要 `width = 16384, s = 4096`
@@ -234,8 +237,7 @@ class SplitChain:
         standby: frozenset[int] | None = frozenset(targets[0]) if targets else None
 
         store = open_checkpoint(root)
-        scratch = (Path(scratch_dir) if scratch_dir is not None
-                   else Path(tempfile.gettempdir()) / "sysone-mude-chain")
+        scratch = _artifacts_root(scratch_dir)
         # dylib 的 program 缓存按名字键，进程内允许多条链共存（对拍时 numpy 与 Metal 各一条），
         # 所以每条链的 program 名必须带自己的编号。
         chain_id = next(_CHAIN_IDS)
@@ -256,18 +258,17 @@ class SplitChain:
         try:
             params = [_layer_params(store, prefix, index, role, weights.norm_offset)
                       for index, role in enumerate(roles)]
-            # 产物目录按 (模型名, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
+            # 产物目录按 (模型, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
             # 的测试就会把 `s=1024` 的缓存顶掉，下一次装载要多花 9 s 重算权重与量化。
-            program_root = scratch / root.name / f"s{s}"
+            program_root = _program_root(scratch, weights, s=s)
+            # 逐层的 (目录, 身份) 先算成一份计划：目录键与身份都只在这里算一遍。
+            plan = _artifact_plan(store, weights=weights, program_root=program_root,
+                                  s=s, quantize=quantize)
             for index, role in enumerate(roles):
                 cout = geometry.cout_full if role is AttentionRole.FULL else geometry.cout_gdn
                 # 全注意力层把投影拆成 q 段 + kv 段（票据 06）：q 只活一个瓦片，`qg` 才能成环。
                 split = (geometry.qg_rows, geometry.kv_rows) if role is AttentionRole.FULL else None
-                directory = program_root / f"layer{index:02d}"
-                source = _artifact_source(
-                    store, prefix=prefix, layer=index, role=role, cout=cout,
-                    core_out=geometry.core_out, hidden=hidden, ffn=ffn, s=s, quantize=quantize,
-                )
+                directory, source = plan[index]
                 files = cached_program(directory, source=source, s=s)
                 if files is None:
                     building = time.perf_counter()
@@ -668,6 +669,57 @@ def _artifact_source(
         "s": int(s),
         "quantize": bool(quantize),
     }
+
+
+# ------------------------------------------------------------------ 产物落点与现状
+
+
+def _artifacts_root(artifacts_dir: str | Path | None) -> Path:
+    """产物的根目录。
+
+    调用方给了就用它：生产路径上 CLI 传的是持久目录（`StorageConfig.resolved_artifacts_dir`）。
+    没给时退回系统临时目录 —— 那是库与探针的方便默认，产物随重启消失，所以"首启要达标"的
+    入口（`serve` / `compile`）都不该落到这里。
+    """
+    if artifacts_dir is not None:
+        return Path(artifacts_dir)
+    return Path(tempfile.gettempdir()) / "sysone-mude-chain"
+
+
+def _program_root(artifacts_root: Path, weights: WeightPlan, *, s: int) -> Path:
+    """这份权重的产物目录：`<root>/<family>-<model>/s<s>`。
+
+    家族名进键是因为 `model_id` **只是目录名**（`models/families/*.py` 里都写
+    `model_id=model_dir.name`）：mude 与 h2o 的目录常常都叫 `model`，只用目录名会让两个
+    模型顶掉同一层目录，每次切换都重编一遍。桶宽进键是因为一次 `s=256` 的探针不该顶掉
+    `s=1024` 的缓存。
+    """
+    descriptor = weights.descriptor
+    return Path(artifacts_root) / f"{descriptor.family}-{descriptor.model_id}" / f"s{int(s)}"
+
+
+def _artifact_plan(
+    store: WeightStore,
+    *,
+    weights: WeightPlan,
+    program_root: Path,
+    s: int,
+    quantize: bool,
+) -> list[tuple[Path, dict]]:
+    """逐层的 (产物目录, 身份)。目录键与身份只在这里算一遍。"""
+    geometry = Geometry.from_descriptor(weights.descriptor)
+    plan: list[tuple[Path, dict]] = []
+    for index, role in enumerate(weights.descriptor.layer_types):
+        cout = geometry.cout_full if role is AttentionRole.FULL else geometry.cout_gdn
+        plan.append((
+            Path(program_root) / f"layer{index:02d}",
+            _artifact_source(
+                store, prefix=weights.prefix, layer=index, role=role, cout=cout,
+                core_out=geometry.core_out, hidden=geometry.hid, ffn=geometry.ffn,
+                s=s, quantize=quantize,
+            ),
+        ))
+    return plan
 
 
 def _entry_array(entry: np.ndarray | tuple[np.ndarray, np.ndarray]) -> np.ndarray:

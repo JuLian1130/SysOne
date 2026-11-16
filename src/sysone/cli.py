@@ -1,4 +1,4 @@
-"""命令行入口：`sysone inspect` / `sysone run` / `sysone doctor`。"""
+"""命令行入口：`sysone inspect` / `sysone run` / `sysone serve` / `sysone compile` / `sysone doctor`。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ import json
 import sys
 from pathlib import Path
 
-from .config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig
+from .config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig, StorageConfig
+from .config.storage import ARTIFACTS_VARIABLE, default_artifacts_dir
 from .devices.apple import ApplePlatform, measured
 from .devices.reference import CharEncoder, ReferencePlatform, ReferenceRunner
 from .domain.attention import MaskMode
@@ -23,7 +24,7 @@ from .models import families as _family_modules  # noqa: F401  导入即注册
 from .models.descriptor import ModelDescriptor
 from .models.registry import families, family
 from .service import app as service_app
-from .service.app import EngineDecider
+from .service.app import EngineDecider, startup_report
 from .service.protocol import KEY_VARIABLE
 from .weights.store import TensorStore
 
@@ -69,7 +70,20 @@ def _model_flags() -> argparse.ArgumentParser:
              "实测代价：h2o 32 层在 142 token 上窗口比全装慢 2.2×（票据 15 §25），"
              "长 prompt 上这笔固定开销摊薄",
     )
+    common.add_argument(
+        "--artifacts", type=Path, default=None,
+        help="编译产物的落点（默认平台缓存目录；SYS1_ARTIFACTS_DIR 也会被读到）。"
+             "清掉它等于下次启动重编一遍",
+    )
     return common
+
+
+def _artifacts_dir(explicit: Path | None = None) -> Path:
+    """产物落点：显式给的（`--artifacts`）> `SYS1_ARTIFACTS_DIR` > 平台缓存目录。"""
+    if explicit is not None:
+        return Path(explicit)
+    configured = str(read_env()[ARTIFACTS_VARIABLE])
+    return Path(configured) if configured else default_artifacts_dir()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -89,6 +103,11 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--queue", type=int, default=None, help="准入等待位（默认取 scheduler.queue）")
     serve.add_argument("--admit-timeout", type=float, default=120.0, help="排队超过这么多秒就 429")
     serve.add_argument("--name", default=None, help="回包里的 model 名（默认模型 id）")
+
+    sub.add_parser(
+        "compile", parents=[_model_flags()],
+        help="按给定形状预编译产物，不起服务（部署时跑一次，之后起服务不必再编）",
+    )
 
     doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
     doctor.add_argument("--platform", default="auto", choices=("auto", "reference", "apple"))
@@ -218,6 +237,7 @@ def _geometry_report(model: str, weights: Path | None) -> dict[str, object]:
 
 def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
     """按 `--backend` 装配引擎：参考后端（M0 语义裁判）或 mude 的 ANE+GPU 链。"""
+    artifacts = _artifacts_dir(args.artifacts)
     if args.backend in STRATEGY_BACKENDS:
         name = args.model or _DEFAULT_FAMILY[args.backend]
         width = int(args.width or _SPLIT_WIDTH)
@@ -227,11 +247,13 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
             "bucket": args.bucket or None, "width": width,
             "resident": args.resident or None,
         }
-        assembled = assemble(args.weights, name, backend=args.backend, **options)
+        assembled = assemble(args.weights, name, backend=args.backend,
+                             artifacts_dir=artifacts, **options)
         descriptor = assembled.descriptor
         config = EngineConfig(
             model=ModelSelection(name=args.weights.name, dir=args.weights),
             scheduler=SchedulerConfig(attention_mode=mode, max_len=width),
+            storage=StorageConfig(artifacts_dir=artifacts),
             service=ServiceConfig(debug_timings=bool(args.debug_timings)),
         )
         config.validate()
@@ -288,6 +310,30 @@ def _serve(args: argparse.Namespace) -> int:
     )
 
 
+def _compile(args: argparse.Namespace) -> int:
+    """预编译：走 `serve` 完全相同的装载闭包，只把服务层换掉（不绑端口、不建就绪门）。
+
+    R6 里"首启编译慢"的缓解手段就是它：部署时先跑一次，起服务时编译那一段就是 0 秒。
+    幂等由产物缓存本身保证 —— 全部命中时它只花装载与预热的时间。
+    """
+    if args.backend not in STRATEGY_BACKENDS:
+        raise ConfigError(
+            "compile 只对按需编译的路径有意义",
+            backend=args.backend,
+            available=list(STRATEGY_BACKENDS),
+            hint="给 --backend split（mude）或 pooled（h2o）；reference 后端不产生产物",
+        )
+    engine = _build_engine(args, _parse_mode(args.attention_mode))
+    try:
+        times = engine.start()
+    finally:
+        # 这条命令比服务寿命短：退出前把 ANE 程序与表面还回去（不还也只是进程退出）。
+        engine.shutdown()
+    print(f"sysone compile: {times.total_s:.2f}s{startup_report(times)}")
+    print(f"artifacts: {engine.config.storage.resolved_artifacts_dir()}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -314,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "serve":
             return _serve(args)
+        if args.command == "compile":
+            return _compile(args)
         engine = _build_engine(args, _parse_mode(args.attention_mode))
         engine.start()
         result = engine.run(_load_request(args.input))

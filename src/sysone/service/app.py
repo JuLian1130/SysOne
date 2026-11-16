@@ -32,8 +32,8 @@ IDLE_SECONDS = 120
 RETRY_AFTER_SECONDS = 1
 
 
-def _startup_report(times: CompilationTimes | None) -> str:
-    """`ready in` 那一行的后缀：装载 / 编译 / 预热三段（秒）。
+def startup_report(times: CompilationTimes | None) -> str:
+    """装载 / 编译 / 预热三段的括号后缀（秒），`serve` 的 ready 行与 `sysone compile` 共用。
 
     只印总耗时看不出首启为什么要等那么久：冷产物目录上编译占掉绝大部分，第二次启动它
     接近 0，两次的 `ready in` 差一个数量级却看不出原因（`plan.md` 的 R6）。
@@ -479,7 +479,7 @@ def run(
         if announce:
             elapsed = time.perf_counter() - started
             print(
-                f"sysone serve: ready in {elapsed:.2f}s{_startup_report(gate.startup)}",
+                f"sysone serve: ready in {elapsed:.2f}s{startup_report(gate.startup)}",
                 flush=True,
             )
         threading.Event().wait()  # 交给 Ctrl-C

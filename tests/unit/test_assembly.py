@@ -21,9 +21,10 @@ class FakeBuilder:
         self.label = label
         self.calls: list[dict] = []
 
-    def __call__(self, model_dir, *, bucket=None, width=None, resident=None):
+    def __call__(self, model_dir, *, bucket=None, width=None, resident=None, scratch_dir=None):
         self.calls.append(
-            {"dir": str(model_dir), "bucket": bucket, "width": width, "resident": resident}
+            {"dir": str(model_dir), "bucket": bucket, "width": width,
+             "resident": resident, "scratch_dir": scratch_dir}
         )
         return f"runner:{self.label}"
 
@@ -54,8 +55,20 @@ def test_assemble_builds_the_runner_the_family_declares(tmp_path, builders):
     assert assembled.runner == "runner:split"
     # 形状来自家族的 `parse_config`，不是从命令行拼的
     assert assembled.descriptor.model_id == root.name
-    assert split.calls == [{"dir": str(root), "bucket": 1024, "width": 2048, "resident": 4}]
+    assert split.calls == [{"dir": str(root), "bucket": 1024, "width": 2048,
+                            "resident": 4, "scratch_dir": None}]
     assert pooled.calls == []
+
+
+def test_artifacts_dir_reaches_the_executor(tmp_path, builders):
+    """产物的落点是调用方说的：装配层把它当执行器的 `scratch_dir` 递下去。"""
+    split, _ = builders
+    root = make_mude_checkpoint(tmp_path)
+    artifacts = tmp_path / "artifacts"
+
+    assembly.assemble(root, "mude", backend="split", artifacts_dir=artifacts)
+
+    assert split.calls[0]["scratch_dir"] == artifacts
 
 
 def test_a_backend_that_contradicts_the_family_is_refused(tmp_path, builders):

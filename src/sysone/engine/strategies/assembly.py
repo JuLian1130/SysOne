@@ -71,8 +71,13 @@ def assemble(
     bucket: int | None = None,
     width: int | None = None,
     resident: int | None = None,
+    artifacts_dir: str | Path | None = None,
 ) -> Assembly:
-    """按家族声明装配一条执行器；后端与声明不符、或该策略还没有执行器时抛出 `ConfigError`。"""
+    """按家族声明装配一条执行器；后端与声明不符、或该策略还没有执行器时抛出 `ConfigError`。
+
+    `artifacts_dir` 是编译产物的落点（部署概念）；执行器那一层叫它 `scratch_dir`，因为对链
+    来说那只是一处"把 MIL/blob 放哪"的目录 —— 只有 CLI 与配置层知道它应当持久。
+    """
     entry = family(name)
     # 先问"这个家族的策略装配得起来吗"，再问"你选的这个后端对不对"：反过来的话，一个只有
     # `vendor` 执行器的家族（torchcast 是这种）会先撞上"后端不符"，然后建议一个 `--backend`
@@ -111,7 +116,7 @@ def assemble(
     root = Path(model_dir)
     descriptor = entry.parse_config(root)
     options = {key: value for key, value in given.items() if key in accepted}
-    runner = builder(root, **options)
+    runner = builder(root, **options, scratch_dir=artifacts_dir)
     return Assembly(descriptor=descriptor, runner=runner, strategy=entry.strategy)
 
 
