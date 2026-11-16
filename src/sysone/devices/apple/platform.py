@@ -4,15 +4,30 @@ M2.0 只把"平台是什么"讲清楚，并把 ANE 运行时接上；真正按�
 M2.1（ANE 投影/FFN）与 M2.2（Metal 注意力/GDN）落 `backend()`，所以这里现在返回
 `None`——`selector.select` 会因此报 `NoKernelError`，不会静默回退到 CPU。
 
-几何白名单：旧引擎只在 mude 的 20 层 / hidden 2048 / ffn 6144 上**端到端**跑通过
-（docs/ANE/README.md 的 §10 系列）。4B 的 32 层 / 2560 / 9216 是 M4 的拆层实验：ANE 已经
-收下它的 program 形状（票据 15 §11），但数值还没有真实权重对拍，现在跑它只会得到
-"看起来像结果"的错误数字 —— 所以加载期放行的是**实测白名单**里的几何，不是某个尺寸上限。
+几何白名单：`MEASURED_GEOMETRIES` 只收**端到端数值对拍过**的 `(hidden, ffn)` —— ANE 收下
+`program` 的形状不证明数值对，所以形状探针不算证据。今天的两个（mude 见
+`docs/ANE/README.md` §10 系列，h2o 见票据 15 §20/§21/§24）都是真权重跑通、对过厂商或
+numpy 的。
+
+**这张表今天是"可见性检查"，不是门禁**（票据 15 §35）：出货路径（`split` / `pooled` 两个
+执行器工厂）在装链前调 `warn_if_unmeasured()`，不在表里就**告警一行**然后照常装 ——
+ANE 对形状很宽容，未测几何会编译成功、跑出数字，所以真正要防的不是崩溃，而是"没人知道你
+在用一个没验过的形状"。`sysone doctor --model … --weights …` 给同一个判据的查询形态。
+
+不拦的理由是证据：今天没有出货路径会走到表外的几何（换一个 config 不同的检查点才会），
+而把它挂成 `Engine.start()` 里的 `raise` 会拒掉测试夹具的小几何（M0 语义裁判那组测试），
+代价大于收益。
+
+表里只判 `(hidden, ffn)`，**不判层数与头数**，也**不判量化形态**：检查点存的是
+`per_row_sym_int8`（`stored_quant` 报的就是它），而 ANE 吃的是装载时派生的
+`per_channel_sym_int8` blob —— 拿 `verify_quant(descriptor.quant)` 去验会当场把 h2o 拒掉
+（票据 15 §35.2）。加一项到表里的条件仍然是"端到端数值对拍过"，形状探针不算数。
 """
 
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
 from pathlib import Path
 
@@ -35,6 +50,35 @@ MAX_TILE = 4096
 # 平台愿意服务的最大 token 数（16k = 4 × 4096 分块）。它是**能力声明**，不是加载期拒绝的
 # 理由：模型自报的 `max_position` 是上限，我们只会用得更少（mude 自报 262144，出货跑 16k）。
 MAX_SEQ = 16384
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def measured(descriptor: ModelDescriptor) -> bool:
+    """这个几何有没有**端到端数值对拍**的证据（判据只有 `(hidden, ffn)`）。
+
+    单点判据供两处共用：装链前的告警（`warn_if_unmeasured`）与 `sysone doctor` 的查询，
+    这样"哪套形状算验过"只有一处定义。
+    """
+    return (descriptor.hidden, descriptor.ffn) in MEASURED_GEOMETRIES
+
+
+def warn_if_unmeasured(descriptor: ModelDescriptor, *, strategy: str) -> None:
+    """装链前提示"这套几何没有做过数值对拍"；**不阻断**，理由见模块顶部说明。
+
+    出货路径上唯一会走到表外几何的方式是拿一个 config 不同的检查点，而那种情况下最糟的
+    结果不是崩溃：ANE 会编译、会跑，给出看起来合理的数字。所以这里出声，让日志里有据可查。
+    """
+    if measured(descriptor):
+        return
+    _LOGGER.warning(
+        "几何 hidden=%d ffn=%d 不在 Apple 的实测白名单里（strategy=%s）：ANE 会照常编译并"
+        "跑出数字，但这套形状没有做过数值对拍（%s），结果只能当实验读数",
+        descriptor.hidden,
+        descriptor.ffn,
+        strategy,
+        descriptor.model_id,
+    )
 
 _LIBC = "/usr/lib/libSystem.B.dylib"
 
@@ -91,7 +135,7 @@ class ApplePlatform:
     def verify_model(self, descriptor: ModelDescriptor) -> None:
         if not any(role is AttentionRole.FULL for role in descriptor.layer_types):
             raise ConfigError("模型没有全注意力层", model=descriptor.model_id)
-        if (descriptor.hidden, descriptor.ffn) not in MEASURED_GEOMETRIES:
+        if not measured(descriptor):
             raise ConfigError(
                 "模型几何不在 Apple 的实测白名单里",
                 model=descriptor.model_id,

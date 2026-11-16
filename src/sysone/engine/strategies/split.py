@@ -281,11 +281,15 @@ def mude_runner(
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
+    from ...devices.apple.platform import warn_if_unmeasured
     from ...models.families import mude as mude_family
 
+    # 形状检查放在分词器与检查点之前：它只读 config，却要在任何"看起来像结果"的运行之前
+    # 先出声。告警不拦（`platform.py` 顶部写明理由）。
+    weights = mude_family.weight_plan(Path(model_dir))
+    warn_if_unmeasured(weights.descriptor, strategy="split")
     codes = mude_family.read_codes(model_dir)
     prompter = mude_family.MudePrompter(_load_tokenizer(model_dir), codes)
-    weights = mude_family.weight_plan(Path(model_dir))
     bucket_width = int(S_NATIVE if bucket is None else bucket)
     buffer_width = int(bucket_width if width is None else width)
 

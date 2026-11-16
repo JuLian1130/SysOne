@@ -216,13 +216,18 @@ def h2o_runner(
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
+    from ...devices.apple.platform import warn_if_unmeasured
     from ...models.families import h2o as h2o_family
     from ...weights.checkpoint import open_checkpoint
 
+    # 形状检查放在开答面与检查点之前：它只读 config，却要在任何"看起来像结果"的运行之前
+    # 先出声。告警不拦（`platform.py` 顶部写明理由）—— ANE 对形状很宽容，未测几何也会
+    # 编译、会跑出数字，所以日志里必须有这条记录。
+    weights = h2o_family.weight_plan(Path(model_dir))
+    warn_if_unmeasured(weights.descriptor, strategy="pooled")
     serve = Serve.open(model_dir, tokenizer)
     store = open_checkpoint(Path(model_dir))
     embed_name = f"{h2o_family.PREFIX}.embed_tokens.weight"
-    weights = h2o_family.weight_plan(Path(model_dir))
     if not weights.descriptor.tied_embeddings:
         raise ConfigError(
             "h2o 的读出权重来自词表（tied），这份 checkpoint 却不是 tied",

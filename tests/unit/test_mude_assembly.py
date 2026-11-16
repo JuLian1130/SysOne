@@ -186,3 +186,34 @@ def test_4b_geometry_splits_the_ffn_into_three_full_parts_and_a_tail():
     rebuilt = np.concatenate([entries[f"down{i}"] for i in range(4)], axis=1)
     np.testing.assert_array_equal(rebuilt, _fake_read(_linear_shapes_4b(0))(
         "language_model.layers.0.mlp.down_proj.weight"))
+
+
+def test_the_shipping_factories_warn_before_they_touch_the_chain(caplog, monkeypatch):
+    """两个执行器工厂在装链之前就出声：形状不在实测白名单里 → 一行告警，然后照常继续。
+
+    这条钉的是"接上了"而不是"拦住了"：夹具缺 tokenizer / serve_config，工厂走到那一步会抛，
+    所以这里只要求告警在**失败之前**已经发出（顺序正是这条检查存在的理由 —— 它只读 config，
+    却要在任何"看起来像结果"的运行之前留痕）。
+    """
+    from helpers import FIXTURES
+
+    from sysone.devices.apple import platform as apple_platform
+    from sysone.engine.strategies.pooled import h2o_runner
+    from sysone.engine.strategies.split import mude_runner
+    from sysone.errors import SysOneError
+
+    monkeypatch.setattr(apple_platform, "MEASURED_GEOMETRIES", frozenset())
+    for factory, directory, strategy in (
+        (mude_runner, FIXTURES / "mude", "split"),
+        (h2o_runner, FIXTURES / "h2o", "pooled"),
+    ):
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="sysone.devices.apple.platform"):
+            try:
+                factory(directory)
+            except SysOneError:
+                pass  # 夹具没有分词器/答面配置：这里只关心告警已经发出
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("实测白名单" in message and strategy in message for message in messages), (
+            f"{strategy} 工厂装链前没有告警：{messages}"
+        )

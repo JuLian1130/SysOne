@@ -10,6 +10,8 @@ from sysone.devices.apple import (
     MAX_TILE,
     ApplePlatform,
     available,
+    measured,
+    warn_if_unmeasured,
 )
 from sysone.devices.base import Shape
 from sysone.domain.attention import MaskMode
@@ -52,6 +54,35 @@ def test_verify_model_rejects_a_geometry_outside_the_whitelist():
     assert context["measured"] == [
         {"hidden": hidden, "ffn": ffn} for hidden, ffn in sorted(MEASURED_GEOMETRIES)
     ]
+
+
+def test_measured_is_the_whitelist_predicate():
+    """白名单的判据只有 `(hidden, ffn)`，一处定义：`verify_model` 与装链前的告警共用它。"""
+    assert measured(mude.parse_config(FIXTURES / "mude")) is True
+    assert measured(dataclasses.replace(load_tiny_descriptor(), hidden=2560, ffn=9216)) is True
+    outside = dataclasses.replace(load_tiny_descriptor(), hidden=2560, ffn=8192)
+    assert measured(outside) is False
+
+
+def test_an_unmeasured_geometry_warns_without_refusing_to_run(caplog):
+    """出货路径的形态是**告警不拦**：ANE 会照常编译未测几何并跑出数字，所以让它留痕。
+
+    拦与不拦的分界是证据：今天没有出货路径会走到表外的几何，而挂成 `Engine.start()` 里的
+    raise 会拒掉测试夹具的小几何（`reference_tiny` 是 hidden 16 / ffn 32）。
+    """
+    outside = dataclasses.replace(load_tiny_descriptor(), hidden=2560, ffn=8192)
+    with caplog.at_level("WARNING", logger="sysone.devices.apple.platform"):
+        warn_if_unmeasured(outside, strategy="split")
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "2560" in message and "8192" in message and "split" in message
+    assert "数值对拍" in message
+
+
+def test_a_measured_geometry_does_not_warn(caplog):
+    with caplog.at_level("WARNING", logger="sysone.devices.apple.platform"):
+        warn_if_unmeasured(mude.parse_config(FIXTURES / "mude"), strategy="split")
+    assert caplog.records == []
 
 
 def test_a_long_advertised_context_is_the_capability_ceiling_not_a_rejection():

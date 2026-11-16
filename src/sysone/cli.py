@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from .config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig
-from .devices.apple import ApplePlatform
+from .devices.apple import ApplePlatform, measured
 from .devices.reference import CharEncoder, ReferencePlatform, ReferenceRunner
 from .domain.attention import MaskMode
 from .domain.decision import DecisionRequest, Question
@@ -91,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
     doctor.add_argument("--platform", default="auto", choices=("auto", "reference", "apple"))
+    doctor.add_argument(
+        "--model", default=None, choices=families(),
+        help="顺带检查这个模型：它的几何在不在 Apple 的实测白名单里（不装载权重）",
+    )
+    doctor.add_argument("--weights", type=Path, default=None, help="配合 --model 的模型目录")
     return parser
 
 
@@ -174,7 +179,7 @@ def _platform_report(target: str) -> dict[str, object]:
             "note": "M0 的语义裁判，只做全注意力层",
         }
     try:
-        return {"available": True, **ApplePlatform().probe()}
+        report = {"available": True, **ApplePlatform().probe()}
     except SysOneError as exc:
         return {
             "platform": "apple",
@@ -182,6 +187,32 @@ def _platform_report(target: str) -> dict[str, object]:
             "reason": exc.message,
             "context": exc.context,
         }
+    return report
+
+
+def _geometry_report(model: str, weights: Path | None) -> dict[str, object]:
+    """一个模型的几何是否在 Apple 的**实测白名单**里；解析失败也写成数据。
+
+    判据只有 `(hidden, ffn)`（`devices/apple/platform.measured`），不判层数、头数，也**不判
+    量化形态** —— 检查点存 per-row int8、ANE 吃装载时派生的 per-channel blob，拿检查点形态去
+    验会当场把 h2o 拒掉。`measured=False` 不是"不能跑"：ANE 会照常编译，只是数值没对拍过。
+    """
+    if model is None:
+        raise ConfigError("doctor --weights 需要 --model", weights=str(weights))
+    if weights is None:
+        raise ConfigError("doctor --model 需要 --weights", model=model)
+    descriptor = family(model).parse_config(weights)
+    report: dict[str, object] = {
+        "family": descriptor.family,
+        "model_id": descriptor.model_id,
+        "hidden": descriptor.hidden,
+        "ffn": descriptor.ffn,
+        "num_layers": descriptor.num_layers,
+        "measured": measured(descriptor),
+    }
+    if not report["measured"]:
+        report["note"] = "这套几何没有做过端到端数值对拍：ANE 会照常编译跑出数字，结果只能当实验读数"
+    return report
 
 
 def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
@@ -260,10 +291,21 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         if args.command == "doctor":
+            geometry = (
+                None
+                if args.model is None and args.weights is None
+                else _geometry_report(args.model, args.weights)
+            )
             if args.platform == "auto":
-                _print({name: _platform_report(name) for name in ("reference", "apple")})
+                payload: dict[str, object] = {
+                    name: _platform_report(name) for name in ("reference", "apple")
+                }
             else:
-                _print(_platform_report(args.platform))
+                payload = _platform_report(args.platform)
+            if geometry is not None:
+                # 挂在 apple 那一支下面：白名单是**这台机器**（ANE）的事实，不是模型的属性。
+                payload["geometry"] = geometry
+            _print(payload)
             return 0
         if args.command == "inspect":
             descriptor = family(args.model).parse_config(args.weights)
