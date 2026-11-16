@@ -16,6 +16,11 @@
 于是换窗 = 卸载（块排空后、后台线程上，~4 ms/层）+ 重装（预取线程，30 ms/层；身份哈希
 记过之后 ~1 ms，见 `compile.py` 的 `ProgramFiles.load`）。旧记录"`e8_load_fast` 在本机不可用
 （rc=7）"已过时：`e8_descriptor_hashes` rc=0、三个 64 字符哈希、`e8_load_fast` rc=0。
+
+"权重在 `load` 时就落地"那条只说明**卸载真的把内存还回来了**，不说明装载要一次性把每一层都
+拉起来：窗口外的层由 `SplitChain.load` 装一次就还回去（只为 aned 的 lowering 与身份哈希），
+所以启动那一刻设备上只有待命窗口加正在装的那一层。h2o 16k 上这条把"只装载"的整机 wired 增量
+从 +4.18 GB 压到 +0.87 GB（票据 02 §12.4）。
 """
 
 from __future__ import annotations
