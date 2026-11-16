@@ -162,7 +162,11 @@ def test_h2o_window_cannot_be_shorter_than_its_largest_block():
 
 
 def test_h2o_window_stays_at_standby_after_one_pass():
-    """一轮 32 层跑完落在待命窗口上，峰值不超过 2W（当前窗口 + 正在到达的下一块）。"""
+    """一轮 32 层跑完落在待命窗口上；同步驱动（块之间不留计算时间）时峰值是 2W。
+
+    真流水线上这是**下界式的理想值**而不是上界：长输入上一个块算得比卸载线程过得慢，
+    窗口外的层会多滞留几层（16k 实测 2.5W，`residency.Residency` 的类注释与票据 15 §26.6）。
+    """
     layers = [FakeLayer(i) for i in range(32)]
     windows = targets_for(blocks(H2O_ROLES), 32, 4)
     residency = Residency(layers, windows)
