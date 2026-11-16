@@ -137,10 +137,9 @@ def test_out_projection_matches_numpy(tmp_path: Path) -> None:
 def test_out_projection_at_the_4b_width_matches_numpy(tmp_path: Path) -> None:
     """4B 宽度的 out program（`[4096 | 2560] → 2560`）在 ANE 上真算一遍。
 
-    权重是**合成的**：h2o 的检查点虽然已经能按 row-int8 读（票据 15 §14），但整链还装不进
-    `MudeChain`（线性层的头扩张与 FFN 之外的装载假设未做），所以这条只钉 **program 形状与
-    切片语义**，不钉那份模型。参考口径与 mude 那条一样 —— 用 ANE 实际读到的那份反量化权重，
-    量化误差不混进来。
+    权重是**合成的**：这条只钉 **program 形状与切片语义**，不钉那份模型（真权重的整链证据在
+    票据 15 §22.2，那条要 5 GiB 级的检查点，不进闸门）。参考口径与 mude 那条一样 —— 用 ANE
+    实际读到的那份反量化权重，量化误差不混进来。
     """
     hidden, core_out = 2560, 4096
     rng = np.random.default_rng(29)
@@ -173,7 +172,8 @@ def test_the_4b_layer_program_runs_with_an_uneven_ffn_split(tmp_path: Path) -> N
 
     条目表用**生产路径的那一份**（`blobplan.ane_layer_segments`），所以这条同时钉住三件事：
     4B 的 9216/2560 真的切成了 2560/2560/2560/1536、最后一段的窄 conv 被 ANE 接受、
-    四段分别算完累加出来的就是 `down @ h`。权重是合成的（h2o 整链还装不进 `MudeChain`）。
+    四段分别算完累加出来的就是 `down @ h`。权重是合成的 —— 这条钉的是形状，真权重的整链
+    证据在票据 15 §22.2。
     """
     hidden, ffn, core_out, cout = 2560, 9216, 4096, 12352
     segments = ane_layer_segments(layer=0, layer_type=AttentionRole.LINEAR,

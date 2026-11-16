@@ -1,4 +1,4 @@
-"""4B 形状的线性层能不能装进 `MudeChain`：v 头数是 k 头数的两倍。
+"""4B 形状的线性层装进 `SplitChain`：v 头数是 k 头数的两倍。
 
 `tests/fixtures` 与 mude 都是 2B 的形状（`l_v_heads == l_k_heads`、`qk_dim == value_dim ==
 hidden`），所以"v 头 ≠ k 头"这条路上没有任何既有覆盖。这里用合成检查点造一个**形状关系与

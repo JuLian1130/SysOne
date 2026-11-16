@@ -165,7 +165,7 @@ def test_quantized_layer_re_quantizes_what_the_container_keeps_as_is():
 def test_the_checkpoint_needs_the_plus_one_norm_offset():
     """这份 checkpoint 的 norm 是零中心存的，真值是 `w + 1`（README §10.22）。
 
-    这个数由家族递给设备层（`MudeChain.load` 的 `norm_offset`），设备层不再认识它；
+    这个数由家族递给设备层（`WeightPlan.norm_offset`，`SplitChain` 从它取），设备层不再认识它；
     改成 0 时第 0 层的 cos 会掉到 0.53，所以它是与权重文件绑定的契约，不是调参。
     """
     assert mude.NORM_OFFSET == 1.0

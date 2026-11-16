@@ -12,7 +12,7 @@
 - 视觉塔 0.62 GiB：纯文本 prefill 走 `text_backbone`，一次都不碰它；
 - 词表整表 1.18 GiB（248 320 × 2 560 bf16）：前向只用 `ids` 那几行、读出只用选项标签
   那几行，`RowInt8Store.read_rows`（= `SafeTensorFile.read_rows`）就够了 —— mude 的
-  `MudeChain` 一直这么取词表行，vendor 侧此前把整表上设备。
+  `SplitChain` 一直这么取词表行，vendor 侧此前把整表上设备。
 """
 
 from __future__ import annotations

@@ -166,7 +166,7 @@ class RowInt8Store:
     def read_rows(self, name: str, rows: Sequence[int]) -> np.ndarray:
         """只读二维张量的若干行（词表这类整表用不到、按行够用的张量走这条）。
 
-        底下就是 `SafeTensorFile.read_rows` —— mude 的 `MudeChain` 一直用它取 embedding 行，
+        底下就是 `SafeTensorFile.read_rows` —— mude 的 `SplitChain` 一直用它取 embedding 行，
         这里把它透出来，vendor 侧才用得上（整表 248 320 × 2 560 上设备是 1.18 GiB 白占）。
         """
         for handle in self._files:
