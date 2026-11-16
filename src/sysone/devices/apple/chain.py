@@ -204,6 +204,10 @@ class SplitChain:
         width = int(s if width is None else width)
         if width < s:
             raise ValueError(f"缓冲宽度 {width} 小于桶宽 {s}：桶不能跨在缓冲之外")
+        # 待命窗口：只有这几层留在设备上。窗口外的层在装载时**装一次就卸**（下面循环里），
+        # 目的是让 aned 把 lowering 与身份哈希做好（之后的换窗是 `load_fast` ~1 ms），而不是
+        # 让它们常驻 —— 32 层同时落地是 3.6 GB 的瞬态峰值（票据 15 §36）。
+        standby: frozenset[int] | None = frozenset(targets[0]) if targets else None
 
         store = open_checkpoint(root)
         scratch = (Path(scratch_dir) if scratch_dir is not None
@@ -247,17 +251,22 @@ class SplitChain:
                         cout=cout, core_out=geometry.core_out, hidden=hidden, ffn=ffn, s=s,
                         quantize=quantize, source=source, split=split,
                     )
-                layers.append(AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
-                                       hidden=hidden, core_out=geometry.core_out,
-                                       cout=cout, ffn=ffn, s=s, pool=pool,
-                                       split_rows=split))
+                layer = AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
+                                 hidden=hidden, core_out=geometry.core_out,
+                                 cout=cout, ffn=ffn, s=s, pool=pool,
+                                 split_rows=split)
+                layers.append(layer)
+                if standby is not None and index not in standby:
+                    # 装载只为 aned 的 lowering 与身份哈希（下一次是 `load_fast`），装完就还回去：
+                    # 32 层一起落地是 3.6 GB 的瞬态，而它们要到后面的块才用得上。
+                    layer.unload()
             final_norm = _norm(store.read(f"{prefix}.norm.weight"), weights.norm_offset)
             temperature = float(weights.descriptor.readout.temperature or 1.0)
             cos, sin = _rope_table(weights.rope_theta, width, geometry.rotary_dim)
             if metal:
-                # 窗口在装完之后立刻落回待命集：20 层先装再卸是"两条路只能走一条"的代价，
-                # 省掉的是这一轮之外的时间里那 1.47 GB 的 ANE 权重（`residency.py`）。
-                residency = Residency(layers, targets) if targets else None
+                # 待命集已经由上面的循环保证：启动时刻在设备上的就是 `targets[0]` 那几层，
+                # 所以这里传 `resident` 而不是让窗口再卸一遍。
+                residency = Residency(layers, targets, resident=targets[0]) if targets else None
                 metal_runtime = MetalRuntime(geometry=geometry)
                 pipeline = MudePipeline(
                     runtime=metal_runtime, layers=layers, roles=roles, params=params,

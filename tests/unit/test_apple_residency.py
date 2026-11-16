@@ -37,8 +37,17 @@ class FakeLayer:
 
 
 def _window(w: int, n: int = 20) -> tuple[list[FakeLayer], Residency]:
+    """装好**待命窗口**那几层的形态 —— 与 `SplitChain.load` 现在交给窗口的一致。
+
+    出货路径不再"先装全部再卸"，所以 `FakeLayer` 的初始 `resident` 与窗口收到的
+    `resident=` 必须对得上；否则 `reload()` 的"不许重复装载"断言会先炸。
+    """
+    targets = targets_for(GROUPS, n, w)
+    standby = set(targets[0])
     layers = [FakeLayer(i) for i in range(n)]
-    return layers, Residency(layers, targets_for(GROUPS, n, w))
+    for index, layer in enumerate(layers):
+        layer.resident = index in standby
+    return layers, Residency(layers, targets, resident=targets[0])
 
 
 def test_targets_are_the_block_and_its_successors() -> None:
@@ -58,8 +67,26 @@ def test_window_starts_at_standby() -> None:
     layers, residency = _window(4)
     assert [layer.resident for layer in layers] == [True] * 4 + [False] * 16
     stats = residency.stats()
-    assert stats["resident"] == 4 and stats["unloads"] == 16
+    assert stats["resident"] == 4
     assert stats["peak_resident"] == 4      # 启动那一刻不能记成 20 层
+    # 启动那几次卸载是**链自己**做的（装一次就还回去），窗口不再补一遍 —— 否则就是同一批层
+    # 被卸两次，而那正是"先装全部再落回窗口"那条老路径（票据 15 §36）。
+    assert stats["unloads"] == 0
+
+
+def test_the_caller_can_declare_what_is_already_resident() -> None:
+    """`resident=` 是"调用方已经装好"的层：给定之后窗口不该再卸任何一层。"""
+    targets = targets_for(GROUPS, 20, 4)
+    layers = [FakeLayer(i) for i in range(20)]
+    for index, layer in enumerate(layers):
+        layer.resident = index in set(targets[0])
+    residency = Residency(layers, targets, resident=targets[0])
+    assert residency.stats()["unloads"] == 0
+    assert all(layer.unloads == 0 for layer in layers)
+    for index in range(len(GROUPS)):
+        residency.begin(index)
+        residency.end(index)
+    residency.finish()
 
 
 def test_every_block_is_resident_before_it_runs() -> None:
@@ -105,8 +132,10 @@ def test_a_pass_unloads_what_it_reloads() -> None:
         residency.begin(index)
         residency.end(index)
     residency.finish()
-    # 启动时卸掉 16 层，一轮里又卸掉 20 层（每块换窗卸掉被窗口挤出去的）
-    assert sum(layer.unloads for layer in layers) == 36
+    # 一轮里卸掉 20 次（每块换窗卸掉被窗口挤出去的）。启动那 16 次不再出现在这里：
+    # 窗口外层的装载是 `SplitChain.load` 做的"装一次就还回去"，不归窗口记账。
+    assert sum(layer.unloads for layer in layers) == 20
+    assert residency.stats()["unloads"] == 20
 
 
 def test_a_window_shorter_than_a_block_is_refused() -> None:

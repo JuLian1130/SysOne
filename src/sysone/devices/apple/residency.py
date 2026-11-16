@@ -69,7 +69,19 @@ class Residency:
     `AneLayer`、dylib 按名字持有 sidecar —— 换掉列表元素会让后者静默指向旧对象。
     """
 
-    def __init__(self, layers: Sequence, targets: Sequence[Sequence[int]]) -> None:
+    def __init__(
+        self,
+        layers: Sequence,
+        targets: Sequence[Sequence[int]],
+        *,
+        resident: Sequence[int] | None = None,
+    ) -> None:
+        """`resident` 是**调用方已经装好**的层：缺省按"全部已装"（旧路径，装完再落回窗口）。
+
+        出货路径改传 `targets[0]`：`SplitChain.load` 现在只让待命窗口的层留在设备上，窗口外
+        的层装载一次后立刻卸掉（`unloads` 因此不再包含启动那 28 次 —— 那是链自己做的事，
+        不归窗口记账）。
+        """
         if not targets:
             raise ValueError("窗口至少要有一个目标（待命集）")
         n = len(layers)
@@ -79,7 +91,7 @@ class Residency:
                 raise ValueError(f"窗口 {target} 越出层表 0..{n - 1}")
         self._layers = layers
         self._lock = threading.Lock()
-        self._resident = set(range(n))
+        self._resident = set(range(n)) if resident is None else {int(i) for i in resident}
         self._busy: set[int] = set()
         self._load_thread: threading.Thread | None = None
         self._evict_thread: threading.Thread | None = None
@@ -89,7 +101,8 @@ class Residency:
         self.load_ms = 0.0
         self.unload_ms = 0.0
         self.waits: list[float] = []
-        # 装完 20 层就落回待命窗口；峰值从**掉下去之后**开始算，否则启动那一刻会被记成 20 层。
+        # 装好但不在窗口里的层落回待命集（`resident` 已给定时这一句什么也不卸）；峰值从
+        # **掉下去之后**开始算，否则启动那一刻会被记成全装。
         self.evict_except(self.targets[0])
         self.peak_resident = len(self._resident)
 

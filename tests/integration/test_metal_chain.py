@@ -84,6 +84,11 @@ def packed():
         chain.close()
 
 
+# 装载那一刻的窗口读数。必须在 fixture 里就取：这个 fixture 是 module 级的，别的测试先跑完
+# 一轮之后 `loads`/`unloads` 已经被换窗改写（而"装载不留全装"说的正是**那一刻**）。
+STANDBY_AT_LOAD: dict = {}
+
+
 @pytest.fixture(scope="module")
 def windowed():
     """带待命窗口（`--W 4`）的桶 64 链：共享前缀的按块形状必须能在换窗里跑完。"""
@@ -138,6 +143,7 @@ def windowed():
     SplitChain = _chains()
     weights = mude.weight_plan(Path(MUDE))
     chain = SplitChain.load(MUDE, weights=weights, s=S, metal=True, resident=4)
+    STANDBY_AT_LOAD.update(chain._pipeline._residency.stats())   # 装载那一刻（见上面注释）
     try:
         yield chain
     finally:
@@ -165,10 +171,24 @@ def test_resident_window_returns_to_standby(windowed) -> None:
     stats = windowed._pipeline._residency.stats()
     assert stats["resident"] == 4
     assert stats["standby"] == [0, 1, 2, 3]
-    assert stats["peak_resident"] == 8       # 块 0 的窗口 + 块 1 的预取 = 2W
-    assert stats["loads"] >= 20              # 一轮要重装窗口外的层（每轮一次全量）
+    assert stats["peak_resident"] == 8       # 块 0 的窗口 + 下一块的预取 = 2W
+    assert stats["loads"] >= 16              # 一轮要重装窗口外的层（每轮一次全量）
     assert windowed._runtime.programs == before
     assert windowed._runtime.pending is False
+
+
+def test_load_leaves_only_the_standby_window_on_the_device(windowed) -> None:
+    """装载不能"20 层全落地再卸"：启动那一刻设备上只该有待命窗口那几层。
+
+    老路径先把每层 `e8_load` 一遍、等所有层常驻之后才由窗口卸掉窗口外的 —— 那几 GB 只是
+    瞬态，却正好落在启动这条最容易被别的进程撞上的时刻（票据 15 §36）。现在窗口外的层
+    装一次就还回去（为的是 aned 的 lowering 与身份哈希），窗口建起来时不需要再卸任何层。
+    """
+    stats = STANDBY_AT_LOAD
+    assert stats["resident"] == 4
+    assert stats["unloads"] == 0            # 窗口没补卸一遍：链已经卸过了
+    assert stats["loads"] == 0              # 也没补装
+    assert stats["peak_resident"] == 4      # 启动峰值就是待命窗口，不是全装
 
 
 def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> None:
