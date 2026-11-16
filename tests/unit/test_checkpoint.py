@@ -8,8 +8,9 @@ import numpy as np
 import pytest
 
 from helpers import write_row_int8_checkpoint, write_safetensors
+from sysone.domain.quant import Scheme
 from sysone.errors import MissingTensorError
-from sysone.weights.checkpoint import int8_parts, open_checkpoint
+from sysone.weights.checkpoint import int8_parts, open_checkpoint, stored_quant
 from sysone.weights.packing import RowInt8Store
 from sysone.weights.store import SafeTensorFile
 
@@ -40,6 +41,13 @@ def test_a_manifest_means_row_int8_and_its_absence_means_a_tensor_file(tmp_path:
     finally:
         plain.close()
         packed.close()
+
+
+def test_stored_quant_follows_the_container(tmp_path: Path) -> None:
+    """同一份数值、两种容器 ⇒ 两种量化描述：报的是"怎么存的"，不是"算了什么"。"""
+    tensors = {"w": np.full((8, 8), 0.5, dtype=np.float32)}
+    assert stored_quant(_plain(tmp_path, tensors)).scheme is Scheme.NONE
+    assert stored_quant(_row_int8(tmp_path, tensors)).scheme is Scheme.PER_ROW_SYM_INT8
 
 
 def test_parts_are_only_available_where_the_container_stored_codes(tmp_path: Path) -> None:

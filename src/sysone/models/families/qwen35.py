@@ -9,6 +9,7 @@ from typing import Mapping
 from ...config import EngineConfig
 from ...domain.attention import AttentionRole, MaskMode
 from ...errors import ConfigError
+from ...domain.quant import QuantSpec
 from ..descriptor import ModelDescriptor, ReadoutPlan, VisionSpec
 from ..layer_plan import LayerPlan, plan_layers
 
@@ -135,8 +136,14 @@ def descriptor_from(
     trained_modes: frozenset[MaskMode],
     default_mode: MaskMode,
     tied_embeddings: bool | None = None,
+    quant: QuantSpec | None = None,
 ) -> ModelDescriptor:
-    """把一份 Qwen3.5 风格 config 拼成 `ModelDescriptor`（不做 weight 相关的事）。"""
+    """把一份 Qwen3.5 风格 config 拼成 `ModelDescriptor`。
+
+    `quant` 是**检查点目录里存的那一种**（`weights.checkpoint.stored_quant`），不是 config
+    里的字段：它由容器形态决定，所以由家族在读目录时给。不给就按未量化报（`QuantSpec()`
+    的默认值）—— 那是"没告诉我"，不是"猜它是 bf16"。
+    """
     text = text_config(config)
     numbers = geometry(text)
     descriptor = ModelDescriptor(
@@ -163,6 +170,7 @@ def descriptor_from(
         supported_modes=supported_modes,
         trained_modes=trained_modes,
         default_mode=default_mode,
+        quant=quant if quant is not None else QuantSpec(),
         tied_embeddings=(
             bool(text.get("tie_word_embeddings", True))
             if tied_embeddings is None

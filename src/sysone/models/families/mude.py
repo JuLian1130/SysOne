@@ -11,6 +11,7 @@ from ...config import EngineConfig
 from ...domain.attention import AttentionRole, MaskMode
 from ...domain.decision import Question
 from ...errors import ConfigError
+from ...weights.checkpoint import stored_quant
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan, WeightPlan
 from ..registry import register_family
@@ -48,6 +49,7 @@ def parse_config(model_dir: Path) -> ModelDescriptor:
         # 发布 checkpoint 只在 prefix_noncausal 掩码下做过决策 SFT（NOTICE:8）。
         trained_modes=frozenset({MaskMode.PREFIX_NONCAUSAL}),
         default_mode=mode,
+        quant=stored_quant(model_dir),
     )
 
 

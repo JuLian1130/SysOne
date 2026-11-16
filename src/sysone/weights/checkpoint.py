@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..domain.quant import QuantSpec, Scales, Scheme, Storage
 from ..errors import MissingTensorError
 from .packing.row_int8 import MANIFEST_NAME, RowInt8Store
 from .store import SafeTensorFile
@@ -34,6 +35,22 @@ def open_checkpoint(model_dir: str | Path) -> WeightStore:
     if (root / MANIFEST_NAME).is_file():
         return RowInt8Store(root)
     return SafeTensorFile(root / WEIGHTS_FILE)
+
+
+def stored_quant(model_dir: str | Path) -> QuantSpec:
+    """这个目录**存**的是哪种量化形态（`Provenance.quant` 与 `inspect` 报的就是它）。
+
+    判据与 `open_checkpoint` 同一条，不另立一份真相：有 `int8_manifest.json` 就是 row-int8
+    （每输出行一个 fp32 标度、码与标度在同一个张量文件里），否则是原样的 16 bit 张量。
+
+    **这不是 ANE 产物那种量化**（`per_channel_sym_int8/fp16/mixed_blob`）：那是编译出来的
+    blob，检查点里没有它。所以一张按行审过的 int8 检查点，报的必须是它自己这一种 ——
+    不填的话 `QuantSpec()` 的默认值是"未量化"，回包与 `inspect` 都在说假话。
+    """
+    root = Path(model_dir)
+    if (root / MANIFEST_NAME).is_file():
+        return QuantSpec(Scheme.PER_ROW_SYM_INT8, Scales.FP32, Storage.TENSOR)
+    return QuantSpec()
 
 
 def int8_parts(store: WeightStore, name: str) -> tuple[np.ndarray, np.ndarray] | None:

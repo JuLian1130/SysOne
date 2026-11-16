@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
+import shutil
 
 import pytest
 
 from helpers import FIXTURES
 from sysone.devices.apple.geometry import Geometry, mude_geometry
 from sysone.domain.attention import AttentionRole, MaskMode
+from sysone.domain.quant import Scheme
 from sysone.errors import ConfigError
 from sysone.models.families import h2o, mude, torchcast
 
@@ -35,6 +37,18 @@ def test_mude_readout_and_modes() -> None:
     assert descriptor.default_mode is MaskMode.PREFIX_NONCAUSAL
     assert descriptor.supported_modes == frozenset(MaskMode)
     assert descriptor.trained_modes == frozenset({MaskMode.PREFIX_NONCAUSAL})
+
+
+def test_a_checkpoint_reports_the_quant_form_it_is_stored_in(tmp_path) -> None:
+    """`Provenance.quant` / `inspect` 报的是**目录里存**的形态，不是 config 里的字段。
+
+    不填的话 `QuantSpec()` 的默认值是"未量化"，一张按行审过的 int8 检查点会被报成 bf16
+    （票据 15 §26 记的这个口径问题）。判据与 `open_checkpoint` 同一条：有没有 manifest。
+    """
+    shutil.copy(FIXTURES / "h2o" / "config.json", tmp_path / "config.json")
+    assert h2o.parse_config(tmp_path).quant.scheme is Scheme.NONE
+    (tmp_path / "int8_manifest.json").write_text('{"tensors": {}}', encoding="utf-8")
+    assert h2o.parse_config(tmp_path).quant.scheme is Scheme.PER_ROW_SYM_INT8
 
 
 def test_h2o_geometry() -> None:
