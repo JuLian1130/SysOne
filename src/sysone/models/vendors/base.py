@@ -56,7 +56,8 @@ _OPTION_SEPARATOR = ": "
 def question_spec(question: Question) -> dict:
     """把 domain 的 Question 转成厂商线格式的问题描述。
 
-    厂商自己的 `question_prompt` 会按 type 选模板；criteria 是「选项键 → 判据描述」的映射，
+    厂商自己的 `question_prompt` 会按 type 选模板；criteria 是「选项键 → 判据描述」的映射
+    （noul 的键是 `true` / `false`，由协议层渲染成两行，这里原样拆回）。
     **score 例外**：它的 criteria 是**有序档位数组**（顺序即档位高低，厂商按 `Σ i·p_i` 出
     期望值）。协议层给 score 渲染的也是 `"<序号>: <档位>"` 的行，这里按序拆回档位本身。
 

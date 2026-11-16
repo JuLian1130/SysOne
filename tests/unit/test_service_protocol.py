@@ -169,8 +169,51 @@ def test_too_many_options_is_rejected() -> None:
     assert "at most" in info.value.detail["invalid_questions"]["q"]
 
 
-# ---- score：criteria 是**有序档位数组**，不是映射 -------------------------------------
+# ---- noul：criteria 是 {"true": 判据, "false": 判据}，不读就等于换了一套题面 -------------
 
+
+def test_a_noul_question_carries_its_two_criteria_descriptions() -> None:
+    """noul 的判据描述必须原样进题面。
+
+    不读它的时候厂商只能落回默认描述（"the statement holds" / "it does not"），于是题面与
+    厂商训练时不一致：实测 38 道真题的题面因此**全都不一样**（票据 15 §34）。答案标签仍然
+    固定是 ("yes", "no")，与这两行无关。
+    """
+    _, wire = protocol.parse_request(
+        {
+            "questions": {
+                "q": {
+                    "type": "noul",
+                    "instructions": "Hold?",
+                    "criteria": {"true": "the notice was served", "false": "it was not"},
+                }
+            }
+        }
+    )
+    assert wire[0].question.kind == "noul"
+    assert wire[0].question.options == ("true: the notice was served", "false: it was not")
+    assert wire[0].labels == ()
+
+
+def test_a_noul_question_without_criteria_is_unchanged() -> None:
+    """判据可缺省（旧请求照旧工作）；`false` 在前也按 true / false 的固定次序渲染。"""
+    _, wire = protocol.parse_request({"questions": {"q": {"type": "noul"}}})
+    assert wire[0].question.options == ()
+    _, ordered = protocol.parse_request(
+        {"questions": {"q": {"type": "noul", "criteria": {"false": "no", "true": "yes"}}}}
+    )
+    assert ordered[0].question.options == ("true: yes", "false: no")
+
+
+def test_noul_criteria_must_be_a_true_false_object() -> None:
+    """非映射或未知键都是坏请求：静默丢掉一个客户端显式给的判据，题面就悄悄换了。"""
+    for criteria in (["a", "b"], "yes/no", {"yes": "y", "no": "n"}):
+        with pytest.raises(protocol.Refusal) as info:
+            protocol.parse_request({"questions": {"q": {"type": "noul", "criteria": criteria}}})
+        assert info.value.status.value == 422
+
+
+# ---- score：criteria 是**有序档位数组**，不是映射 -------------------------------------
 
 def test_a_score_scale_keeps_its_order_and_names_the_levels_by_index() -> None:
     """档位顺序就是分数的含义：`0` 是最低档。线格式按序编号，回包的键也是 `"0".."n-1"`。"""

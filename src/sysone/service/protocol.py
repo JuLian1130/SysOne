@@ -38,6 +38,8 @@ DESCRIPTION = "Typed decisions with a probability for every option"
 # `format_answer`（h2o / torchcast 的答面有），mude 的码表读出答不了 —— 那种情况由
 # 家族在规划期明确拒绝（`families/mude.option_plan`），不是静默按 choice 猜一个。
 KINDS = ("choice", "noul", "score")
+# noul 的判据键：`{"true": <判据>, "false": <判据>}`（可选，缺省时厂商用默认描述）。
+_NOUL_KEYS = ("true", "false")
 MAX_OPTIONS = 255
 MODALITIES = ["text"]
 
@@ -142,7 +144,13 @@ def _wire_question(key: str, raw: Any) -> WireQuestion:
     instructions = raw.get("instructions")
     text = "" if instructions is None else describe(instructions)
     if kind == "noul":
-        return WireQuestion(key=key, question=Question(text=text, kind="noul"), labels=())
+        return WireQuestion(
+            key=key,
+            question=Question(
+                text=text, options=_noul_options(key, raw.get("criteria")), kind="noul"
+            ),
+            labels=(),
+        )
     criteria = raw.get("criteria")
     if kind == "score":
         # score 的 criteria 是**有序档位数组**：档位名就是 `"0".."n-1"`，顺序即档位高低
@@ -169,6 +177,34 @@ def _wire_question(key: str, raw: Any) -> WireQuestion:
         for label in labels
     )
     return WireQuestion(key=key, question=Question(text=text, options=options), labels=labels)
+
+
+def _noul_options(key: str, criteria: Any) -> tuple[str, ...]:
+    """noul 的可选判据 `{"true": <判据>, "false": <判据>}` → 两行选项文本。
+
+    **必须读**：不读的时候厂商只能落回默认描述（"the statement holds" / "it does not"），
+    题面就与厂商训练时不一致 —— 实测 38 道真题的题面因此**全都不一样**（票据 15 §34），
+    与票据 12 那 7/105 条判词差异同类。
+
+    顺序固定为 true 在前：厂商按 `true` / `false` 取键，不依赖这里的次序，但固定下来让同一
+    请求渲染出的题面逐字可复现。
+    """
+    if criteria is None:
+        return ()
+    if not isinstance(criteria, Mapping):
+        raise ValueError(
+            f"question {key!r} has a criteria that is not an object; "
+            "noul takes {'true': ..., 'false': ...}"
+        )
+    unknown = sorted(str(name) for name in criteria if name not in _NOUL_KEYS)
+    if unknown:
+        raise ValueError(
+            f"question {key!r} has criteria keys {', '.join(map(repr, unknown))} not understood; "
+            f"noul takes {', '.join(_NOUL_KEYS)}"
+        )
+    return tuple(
+        f"{name}: {describe(criteria[name])}" for name in _NOUL_KEYS if name in criteria
+    )
 
 
 def _attention_mode(value: Any) -> MaskMode | None:

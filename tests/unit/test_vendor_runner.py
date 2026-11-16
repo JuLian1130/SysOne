@@ -182,6 +182,25 @@ def test_question_spec_carries_options_as_criteria() -> None:
     assert spec["criteria"] == {"甲": "甲", "乙": "乙"}
 
 
+def test_noul_criteria_reach_the_vendor_as_true_and_false() -> None:
+    """noul 的判据键是 `true` / `false`：协议层渲染成两行，这里原样拆回映射。
+
+    厂商两条答面都按这两个键取判据描述（h2o shim 的 `options_of`、torchcast 的
+    `render.question_of`），给空映射它们只能用默认描述 —— 那是另一套题面。
+    """
+    from sysone.models.vendors.base import question_spec
+
+    question = Question(
+        text="Does the notice hold?",
+        options=("true: it was served in time", "false: it was served late"),
+        kind="noul",
+    )
+    assert question_spec(question)["criteria"] == {
+        "true": "it was served in time",
+        "false": "it was served late",
+    }
+
+
 def test_a_score_scale_reaches_the_vendor_as_an_ordered_array() -> None:
     """score 的 criteria 是**数组**不是映射：顺序即档位高低，厂商按 Σ i·p_i 出期望值。
 

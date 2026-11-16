@@ -119,6 +119,24 @@ def test_option_plan_noul_reverses_the_prompt_order() -> None:
     assert indexes == (1, 0)
 
 
+def test_noul_criteria_do_not_change_the_code_table_prompt() -> None:
+    """noul 的判据描述随线格式进来了，但**码表读出不看它**：题面必须逐字不变。
+
+    这是"改协议层不许动出货路径"的那条线：划线格式时 38 道 noul 题都会多出两行判据，
+    要是 mude 跟着变，那个改动就不是只影响厂商答面了。
+    """
+    bare = Question(text="要看这个文件吗？", kind="noul")
+    carried = Question(
+        text="要看这个文件吗？",
+        options=("true: 已经送达", "false: 尚未送达"),
+        kind="noul",
+    )
+    assert mude.option_plan(carried) == mude.option_plan(bare)
+    assert mude.render_messages("状态", carried, mude._NOUL_TEXTS, CODES) == (
+        mude.render_messages("状态", bare, mude._NOUL_TEXTS, CODES)
+    )
+
+
 def test_option_plan_refuses_a_kind_the_code_table_cannot_answer() -> None:
     """码表读出没有 score 的档位模板：这是**坏请求**（400），不是我们的配置坏了（500）。"""
     with pytest.raises(UnsupportedKindError) as info:

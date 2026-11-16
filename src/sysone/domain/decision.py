@@ -21,7 +21,12 @@ class MediaRef:
 
 @dataclass(frozen=True)
 class Question:
-    """一道题：题干文本 + 候选标签（choice）或 yes/no（noul）。"""
+    """一道题：题干文本 + 候选标签（choice）。
+
+    `options` 是线格式渲染好的选项行 `<键>: <描述>`：choice 的键是选项键，noul 的键是
+    `true` / `false`（判据描述，可缺省），score 的键是档位序号。`noul` 的答案标签固定是
+    ("yes", "no")，与 `options` 无关；mude 与参考编码器都不看 noul 的 `options`。
+    """
 
     text: str
     options: tuple[str, ...] = ()
