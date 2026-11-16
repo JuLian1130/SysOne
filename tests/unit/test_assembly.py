@@ -70,16 +70,22 @@ def test_a_backend_that_contradicts_the_family_is_refused(tmp_path, builders):
     assert pooled.calls == []
 
 
-def test_a_strategy_without_a_builder_says_which_ones_exist(tmp_path, builders):
-    """torchcast 声明 `vendor`，今天没有这条执行器 —— 报错要说出已经有哪几条。
+def test_a_strategy_without_a_builder_names_the_missing_step(tmp_path, builders):
+    """torchcast 声明 `vendor`，今天装配不出来 —— 报错要说出缺的是哪一步。
 
-    从 CLI 走会先落到这一条（`--backend` 里根本没有 `vendor`），所以报错不能建议一个
-    选不出来的后端。
+    缺的**不是**执行器（`VendorRunner` 在库里，桥也在），而是"用哪个桥、怎么构造"：
+    注册表只声明了策略名。所以文案既不能说自己没有执行器，也不能建议一个 `--backend`
+    里根本没有的值 —— 那会把人指到一条不存在的路上。
     """
     with pytest.raises(ConfigError) as caught:
         assembly.assemble(tmp_path, "torchcast", backend="split")
-    assert caught.value.context["strategy"] == "vendor"
-    assert caught.value.context["ready"] == ["pooled", "split"]
+    context = caught.value.context
+    assert context["strategy"] == "vendor"
+    assert context["ready"] == ["pooled", "split"]
+    assert "VendorRunner" in context["hint"]
+    # 真的没有这条路：`--backend` 的 choices 里没有 vendor，文案也不许把它写成一条可选的路
+    assert "vendor" not in assembly.BACKENDS
+    assert "--backend vendor" not in context["hint"]
 
 
 def test_both_strategies_take_the_standby_window(tmp_path, builders):

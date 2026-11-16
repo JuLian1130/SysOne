@@ -42,6 +42,17 @@ _OPTIONS: dict[str, frozenset[str]] = {
     "pooled": frozenset({"bucket", "width", "resident"}),
 }
 
+# 有执行器、但装配不出来的策略：缺的不是执行器，是「用哪个桥、怎么构造」这一步 —— 注册表
+# 只声明了策略名。报错必须说清缺的那一步：旧文案写「vendor 那条走厂商桥」，读的人会去找
+# 一个 `--backend` 里根本没有的值。
+_UNASSEMBLED = {
+    "vendor": (
+        "vendor 的执行器是 VendorRunner，它要一个厂商桥实例（H2OBridge / TorchcastBridge），"
+        "而注册表没声明用哪个桥、给什么参数，所以装配不出来；这条没有 --backend 入口，"
+        "只能在库里把 VendorRunner(<桥>) 直接交给 Engine"
+    ),
+}
+
 
 @dataclass(frozen=True)
 class Assembly:
@@ -63,17 +74,20 @@ def assemble(
 ) -> Assembly:
     """按家族声明装配一条执行器；后端与声明不符、或该策略还没有执行器时抛出 `ConfigError`。"""
     entry = family(name)
-    # 先问"这个家族的策略有没有执行器"，再问"你选的这个后端对不对"：反过来的话，一个只有
+    # 先问"这个家族的策略装配得起来吗"，再问"你选的这个后端对不对"：反过来的话，一个只有
     # `vendor` 执行器的家族（torchcast 是这种）会先撞上"后端不符"，然后建议一个 `--backend`
     # 根本选不出来的值。
     builder = _BUILDERS.get(entry.strategy)
     if builder is None:
         raise ConfigError(
-            "这个家族声明的策略还没有执行器",
+            "这个家族声明的策略装配不出来",
             family=name,
             strategy=entry.strategy,
             ready=sorted(_BUILDERS),
-            hint="今天只有 split（码表读出）与 pooled（标签行读出）两条；vendor 那条走厂商桥",
+            hint=_UNASSEMBLED.get(
+                entry.strategy,
+                "由 --backend 直接选的是 split（码表读出）与 pooled（标签行读出）",
+            ),
         )
     if backend != entry.strategy:
         raise ConfigError(
