@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sysone.devices.apple.chain import SplitChain
+from sysone.devices.apple.chain import SplitChain, artifact_state
 from sysone.models.families import mude
 
 MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
@@ -39,6 +39,11 @@ def test_chain_probabilities_and_repeat(tmp_path: Path) -> None:
         # 这两条是"启动报告"在真链上的落点 —— 少了它们，`compile_s` 又可以是恒 0 的摆设。
         assert chain.compile_s > 0.0
         assert chain.load_s > 0.0
+        # `doctor` 的产物一栏与装载共用同一份身份计算：刚编出来的必须都算"可复用"，
+        # 否则那份报告就会对着一个热目录说"要重编"。
+        state = artifact_state(MUDE_DIR, weights=mude.weight_plan(MUDE_DIR), s=256,
+                               artifacts_dir=tmp_path / "programs")
+        assert state.hits == state.total > 0
         tokens = [1, 2, 3, 4]
         probabilities = chain.forward(tokens, options=3)
         assert probabilities.shape == (3,)

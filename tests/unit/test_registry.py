@@ -38,3 +38,13 @@ def test_a_family_must_declare_its_readout_strategy() -> None:
     with pytest.raises(RegistrationError):
         register_family("no-strategy", lambda path: load_tiny_descriptor(), _noop_plan,
                         strategy="")
+
+
+def test_executor_families_declare_a_weight_plan() -> None:
+    """设备层要的那四项从注册表就能拿到：查产物（`sysone doctor`）不必先装配执行器。
+
+    `vendor` 不经过设备链，所以它可以没有 —— 这也是这个字段可选的理由。
+    """
+    assert family("mude").weight_plan is not None
+    assert family("h2o").weight_plan is not None
+    assert family("torchcast").weight_plan is None

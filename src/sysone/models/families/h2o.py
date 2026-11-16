@@ -63,4 +63,4 @@ def weight_plan(model_dir: Path) -> WeightPlan:
 
 
 register_family("h2o", parse_config, build_layer_plan,
-                strategy="pooled", source=__name__)
+                strategy="pooled", weight_plan=weight_plan, source=__name__)

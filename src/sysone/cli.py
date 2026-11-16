@@ -116,6 +116,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="顺带检查这个模型：它的几何在不在 Apple 的实测白名单里（不装载权重）",
     )
     doctor.add_argument("--weights", type=Path, default=None, help="配合 --model 的模型目录")
+    doctor.add_argument(
+        "--artifacts", type=Path, default=None,
+        help="配合 --model/--weights 顺带查产物：多少层可复用、缺哪些（默认取平台缓存目录）",
+    )
+    doctor.add_argument(
+        "--bucket", type=int, default=0,
+        help="配合 --artifacts 的桶宽（默认 1024；产物按桶宽分家，装错桶就全不命中）",
+    )
     return parser
 
 
@@ -232,6 +240,54 @@ def _geometry_report(model: str, weights: Path | None) -> dict[str, object]:
     }
     if not report["measured"]:
         report["note"] = "这套几何没有做过端到端数值对拍：ANE 会照常编译跑出数字，结果只能当实验读数"
+    return report
+
+
+def _artifact_report(
+    model: str | None, weights: Path | None, *, bucket: int, artifacts: Path | None
+) -> dict[str, object]:
+    """这份权重的编译产物能不能被复用：逐层判据与装载完全相同。
+
+    两个用途：部署前回答"这台机器热不热"（全命中 = 起服务时编译段是 0 秒），以及排查
+    "为什么又要重编"（缺哪些层、产物落在哪个目录）。只读磁盘、不碰 ANE —— 判据
+    （`_artifact_plan` + `cached_program`）是从装载那边抽出来的，所以这里不会报一个装载
+    不认的"命中"。
+    """
+    if model is None or weights is None:
+        raise ConfigError(
+            "doctor --artifacts 需要 --model 与 --weights 一起给",
+            model=model, weights=None if weights is None else str(weights),
+        )
+    from .devices.apple.chain import artifact_state
+    from .devices.apple.compile import S_NATIVE
+
+    entry = family(model)
+    if entry.weight_plan is None:
+        raise ConfigError(
+            "这个家族没有交给设备层的权重计划，也就没有产物可查",
+            family=model, strategy=entry.strategy,
+            hint="vendor 策略走厂商桥，不产生产物",
+        )
+    s = int(bucket or S_NATIVE)
+    plan = entry.weight_plan(Path(weights))
+    # 落点与 serve 同一个解析（`--artifacts` > 环境变量 > 平台缓存目录）：口径不同的话，
+    # doctor 说"全命中"、起服务照样重编，这个报告就没有意义了。
+    state = artifact_state(weights, weights=plan, s=s,
+                          artifacts_dir=_artifacts_dir(artifacts))
+    report: dict[str, object] = {
+        "family": plan.descriptor.family,
+        "s": s,
+        "directory": str(state.directory),
+        "layers": {"reusable": state.hits, "total": state.total},
+    }
+    if state.missing:
+        report["missing_layers"] = list(state.missing)
+        report["note"] = (
+            f"起服务时要重编这 {state.total - state.hits} 层；"
+            "`sysone compile` 可以把这一步提前做掉"
+        )
+    else:
+        report["note"] = "全部可复用：起服务时编译段是 0 秒"
     return report
 
 
@@ -352,6 +408,10 @@ def main(argv: list[str] | None = None) -> int:
             if geometry is not None:
                 # 挂在 apple 那一支下面：白名单是**这台机器**（ANE）的事实，不是模型的属性。
                 payload["geometry"] = geometry
+                payload["artifacts"] = _artifact_report(
+                    args.model, args.weights,
+                    bucket=int(args.bucket), artifacts=args.artifacts,
+                )
             _print(payload)
             return 0
         if args.command == "inspect":

@@ -261,7 +261,8 @@ class SplitChain:
             # 产物目录按 (模型, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
             # 的测试就会把 `s=1024` 的缓存顶掉，下一次装载要多花 9 s 重算权重与量化。
             program_root = _program_root(scratch, weights, s=s)
-            # 逐层的 (目录, 身份) 先算成一份计划：目录键与身份都只在这里算一遍。
+            # 逐层的 (目录, 身份) 与 `artifact_state` 共用同一份计算：两处各写一遍，
+            # `doctor` 报的"命中"就会与装载的实际复用慢慢漂开。
             plan = _artifact_plan(store, weights=weights, program_root=program_root,
                                   s=s, quantize=quantize)
             for index, role in enumerate(roles):
@@ -706,7 +707,7 @@ def _artifact_plan(
     s: int,
     quantize: bool,
 ) -> list[tuple[Path, dict]]:
-    """逐层的 (产物目录, 身份)。目录键与身份只在这里算一遍。"""
+    """逐层的 (产物目录, 身份)。装载与 `artifact_state` 共用这一份计算。"""
     geometry = Geometry.from_descriptor(weights.descriptor)
     plan: list[tuple[Path, dict]] = []
     for index, role in enumerate(weights.descriptor.layer_types):
@@ -720,6 +721,55 @@ def _artifact_plan(
             ),
         ))
     return plan
+
+
+@dataclass(frozen=True)
+class ArtifactState:
+    """一份权重在某个产物目录里的现状：目录 + 逐层"复用得上吗"。
+
+    命中是**逐层**的：`compile_s` 只累计真正从头构建的那几层，缺一层不等于整段重来。
+    """
+
+    directory: Path
+    layers: tuple[tuple[Path, bool], ...]
+
+    @property
+    def hits(self) -> int:
+        return sum(1 for _, reused in self.layers if reused)
+
+    @property
+    def total(self) -> int:
+        return len(self.layers)
+
+    @property
+    def missing(self) -> tuple[int, ...]:
+        return tuple(index for index, (_, reused) in enumerate(self.layers) if not reused)
+
+
+def artifact_state(
+    model_dir: str | Path,
+    *,
+    weights: WeightPlan,
+    s: int,
+    artifacts_dir: str | Path | None = None,
+    quantize: bool = True,
+) -> ArtifactState:
+    """只读地查这份权重在 `artifacts_dir` 里的产物（不装载、不碰 ANE）。
+
+    `sysone doctor` 用它回答"这台机器热不热"。判据与装载完全相同（同一个 `_artifact_plan`
+    + 同一个 `cached_program`），所以这里说命中、`serve` 的那一段就真的是 0 秒。
+    """
+    store = open_checkpoint(Path(model_dir))
+    program_root = _program_root(_artifacts_root(artifacts_dir), weights, s=int(s))
+    plan = _artifact_plan(store, weights=weights, program_root=program_root, s=int(s),
+                          quantize=quantize)
+    return ArtifactState(
+        directory=program_root,
+        layers=tuple(
+            (directory, cached_program(directory, source=source, s=int(s)) is not None)
+            for directory, source in plan
+        ),
+    )
 
 
 def _entry_array(entry: np.ndarray | tuple[np.ndarray, np.ndarray]) -> np.ndarray:

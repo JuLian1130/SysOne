@@ -1,5 +1,10 @@
 """模型家族注册表：每个家族提供两个纯函数，外加一条"它的答案怎么读"的声明。
 
+`weight_plan` 是可选的第三项：把"这份检查点怎么存"（前缀、norm 偏移、RoPE 角基）交给
+设备层的那四项纯数据。它进注册表是为了让**不装配执行器**的调用方也能拿到它（`sysone
+doctor` 查产物命中就是这种：装执行器要先起 ANE，而查缓存不该有这个前提）；`vendor` 策略
+不经过设备链，所以可以不给。
+
 旧实现靠 `named_modules()` 里的形状去猜 text backbone，并且把厂商代码用
 monkeypatch 挂进来。这里把"读懂 config"（`parse_config`）与"切层"（`build_layer_plan`）
 固定成注册项，厂商权重装载放到 `sysone.models.vendors`（M1）。
@@ -18,10 +23,11 @@ from typing import Callable
 from ..config import EngineConfig
 from ..errors import RegistrationError, UnknownModelError
 from .descriptor import ModelDescriptor
-from .layer_plan import LayerPlan
+from .layer_plan import LayerPlan, WeightPlan
 
 ParseConfig = Callable[[Path], ModelDescriptor]
 BuildLayerPlan = Callable[[ModelDescriptor, EngineConfig], LayerPlan]
+WeightPlanFn = Callable[[Path], WeightPlan]
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,7 @@ class Family:
     parse_config: ParseConfig
     build_layer_plan: BuildLayerPlan
     strategy: str
+    weight_plan: WeightPlanFn | None = None
     source: str = ""
 
 
@@ -44,6 +51,7 @@ def register_family(
     build_layer_plan: BuildLayerPlan,
     *,
     strategy: str,
+    weight_plan: WeightPlanFn | None = None,
     source: str = "",
 ) -> None:
     """注册家族；重复注册直接报错（同名两份实现是配置事故，不该静默覆盖）。"""
@@ -56,6 +64,7 @@ def register_family(
         parse_config=parse_config,
         build_layer_plan=build_layer_plan,
         strategy=strategy,
+        weight_plan=weight_plan,
         source=source,
     )
 

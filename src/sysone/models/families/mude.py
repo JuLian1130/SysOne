@@ -225,4 +225,4 @@ def weight_plan(model_dir: Path) -> WeightPlan:
 
 
 register_family("mude", parse_config, build_layer_plan,
-                strategy="split", source=__name__)
+                strategy="split", weight_plan=weight_plan, source=__name__)

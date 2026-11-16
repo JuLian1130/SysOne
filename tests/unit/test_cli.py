@@ -158,3 +158,49 @@ def test_compile_reports_the_startup_split_and_shuts_down(monkeypatch, capsys) -
     assert lines[1] == "artifacts: /var/art"
     assert calls == ["start", "shutdown"]
 
+
+# ---- doctor 的产物一栏：与装载同一份判据 -----------------------------------------------
+
+
+def test_doctor_reports_every_layer_as_outstanding_on_a_cold_cache(tmp_path: Path) -> None:
+    from helpers import make_mude_checkpoint
+    from sysone.cli import _artifact_report
+
+    root = make_mude_checkpoint(tmp_path / "model")
+    report = _artifact_report("mude", root, bucket=256, artifacts=tmp_path / "art")
+
+    assert report["layers"] == {"reusable": 0, "total": 2}
+    assert report["missing_layers"] == [0, 1]
+    assert report["s"] == 256
+    # 目录键把家族名与桶宽都编进去：mude 与 h2o 的权重目录常常都叫 `model`
+    assert report["directory"] == str(tmp_path / "art" / f"mude-{root.name}" / "s256")
+    assert "sysone compile" in report["note"]
+
+
+def test_doctor_says_when_every_layer_can_be_reused(tmp_path: Path, monkeypatch) -> None:
+    """全命中就必然是编译段 0 秒 —— 报告直接这么说，别让人自己去推。"""
+    from helpers import make_mude_checkpoint
+    from sysone.cli import _artifact_report
+    from sysone.devices.apple import chain
+
+    root = make_mude_checkpoint(tmp_path / "model")
+    monkeypatch.setattr(chain, "cached_program", lambda directory, *, source, s: object())
+
+    report = _artifact_report("mude", root, bucket=256, artifacts=tmp_path / "art")
+    assert report["layers"] == {"reusable": 2, "total": 2}
+    assert "missing_layers" not in report
+    assert "0 秒" in report["note"]
+
+
+def test_doctor_reports_artifacts_alongside_geometry(tmp_path: Path, capsys) -> None:
+    from helpers import make_mude_checkpoint
+
+    root = make_mude_checkpoint(tmp_path / "model")
+    code = main([
+        "doctor", "--platform", "reference", "--model", "mude",
+        "--weights", str(root), "--artifacts", str(tmp_path / "art"),
+    ])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["artifacts"]["layers"]["total"] == 2
+    assert payload["geometry"]["family"] == "mude"
