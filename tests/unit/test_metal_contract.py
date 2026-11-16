@@ -36,12 +36,17 @@ class StubPipeline:
     def __init__(self, rows: np.ndarray) -> None:
         self._rows = rows
         self.runs: list[dict] = []
+        self.whole_readbacks = 0
 
-    def run(self, hidden, *, length, prefix, causal):
+    def run(self, rows, *, length, prefix, causal):
         self.runs.append({"length": length, "prefix": prefix, "causal": causal})
 
     def hidden_rows(self, length: int) -> np.ndarray:
+        self.whole_readbacks += 1
         return np.asarray(self._rows[:length], np.float32)
+
+    def last_hidden(self, length: int) -> np.ndarray:
+        return np.asarray(self._rows[length - 1], np.float32)
 
 
 class StubStore:
@@ -89,3 +94,21 @@ def test_metal_hidden_applies_the_final_norm_to_every_row():
     out = chain.hidden([7, 8], causal=False)
 
     np.testing.assert_allclose(out, rms_norm(rows, final_norm), rtol=1e-6, atol=1e-6)
+
+
+def test_metal_last_hidden_reads_only_the_last_row():
+    """`last_hidden()` 与 `hidden()[-1]` 是同一行，但**不做整段读回**。
+
+    读出（`logits()` 与 pooled 的 `PooledRunner`）只要这一行，而整段读回 + 归一在 16k 上是
+    87 ms、末行 0.02 ms。钉住的是"别调 `hidden_rows`"，这是这条出口存在的全部理由。
+    """
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4)
+    final_norm = np.full(4, 2.0, dtype=np.float32)
+    chain = make_chain(rows, final_norm=final_norm, width=8)
+
+    out = chain.last_hidden([11, 22, 33], causal=True)
+
+    assert out.shape == (4,)
+    np.testing.assert_allclose(out, rms_norm(rows, final_norm)[-1], rtol=1e-6, atol=1e-6)
+    assert chain._pipeline.whole_readbacks == 0
+    assert chain._pipeline.runs == [{"length": 3, "prefix": 0, "causal": True}]

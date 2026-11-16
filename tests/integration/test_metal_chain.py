@@ -125,6 +125,26 @@ def test_metal_chain_keeps_the_last_layer_hidden_in_range(chains) -> None:
     assert rel < 5e-2, f"末层 hidden 偏差 {rel:.4e}"
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_last_hidden_is_the_last_row_of_hidden(chunked, causal) -> None:
+    """`last_hidden()` 与 `hidden()[-1]` 是同一行：设备侧的末行**逐位**相同。
+
+    端到端的最后一位差在 `rms_norm` 上，不在链上：`np.mean(x*x, -1)` 对 `[L, H]` 与 `[1, H]`
+    的归约顺序不同（rel 2e-7，`.scratch/probe_last_hidden_gap.py` 的四层对照）。所以这里
+    分别钉两件事 —— 归一之后的容差，与归一之前（读回的那一行）的逐位相同。
+
+    用多瓦片的链（桶 S/4、prompt 跨多段），因为"只读末行"最容易在这里读错列；两种掩码都量：
+    这条出口与掩码无关，causal 只改 `attn` 的参数。
+    """
+    rows = chunked.hidden(TOKENS, causal=causal)
+    row = chunked.last_hidden(TOKENS, causal=causal)
+    assert row.shape == (chunked._geometry.hid,)
+    assert float(np.abs(row - rows[-1]).max()) <= 1e-5
+    # 两次读回的是同一张画布（`last_hidden()` 刚跑完，中间没有别的前向）：逐位相同。
+    pipeline = chunked._pipeline
+    assert np.array_equal(pipeline.hidden_rows(len(TOKENS))[-1], pipeline.last_hidden(len(TOKENS)))
+
+
 def test_chunked_bucket_matches_the_single_bucket_run(chains, chunked) -> None:
     """桶宽 S/4（四段）与桶宽 S（一段）跑同一个满宽 prompt，结果应逐位相同。
 

@@ -41,9 +41,9 @@ _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one"
 
 
 class PooledChain(Protocol):
-    """这条策略只需要链的两件事：整条 prompt 的最终 hidden 与卸载。"""
+    """这条策略只需要链的两件事：末位 token 的最终 hidden 与卸载。"""
 
-    def hidden(self, tokens: Sequence[int], *, causal: bool = False) -> np.ndarray: ...
+    def last_hidden(self, tokens: Sequence[int], *, causal: bool = False) -> np.ndarray: ...
 
     def close(self) -> None: ...
 
@@ -160,16 +160,10 @@ class PooledRunner:
         causal: bool,
         index: int,
     ) -> Answer:
-        hidden = chain.hidden(prepared.ids, causal=causal)
-        if hidden.shape != (len(prepared.ids), hidden.shape[1]):
-            raise ConfigError(
-                "链返回的 hidden 行数与 prompt 长度不一致",
-                rows=int(hidden.shape[0]),
-                length=len(prepared.ids),
-            )
         # 读出只取最后一行的**最终归一化** hidden（厂商 `last_hidden_state` 就是它，见
         # `Qwen3_5TextModel.forward` 末尾的 `self.norm`），再点积标签那几行词表权重。
-        logits = self._rows(prepared.label_ids) @ hidden[-1]
+        # 链只读回这一行：整段读回 + 归一在 16k 上是 87 ms，末行 0.02 ms，而这里只需要末行。
+        logits = self._rows(prepared.label_ids) @ chain.last_hidden(prepared.ids, causal=causal)
         value, labels, probs = self._serve.answer(prepared, logits)
         return Answer(
             question_index=index,

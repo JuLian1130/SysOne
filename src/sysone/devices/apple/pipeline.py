@@ -254,9 +254,9 @@ class MudePipeline:
     def _write_rows(self, view: np.ndarray, rows: np.ndarray, s0: int = 0) -> None:
         """把 `[n, hidden]` 的行写进 `view` 的 `[s0, s0 + n)` 列（fp16，按桶转置）。
 
-        与 `run` 里那句 `view[:, :length] = ...` 的差别只在这笔账：整宽一次转置要先物化一份
-        `[hidden, length]` 的 fp32（16k 是 134 MB），这里按桶切，临时量是一桶
-        （`bucket × hidden × 4`，1024 桶下 8 MB）。`run_shared` 的前缀列与尾巴列都走它。
+        画布的入口只剩这一条：`run` 的整条 prompt、`run_shared` 的前缀列与尾巴列都走它。
+        整宽一次转置要先物化一份 `[hidden, length]` 的 fp32（16k 是 134 MB），按桶切，临时量
+        是一桶（`bucket × hidden × 4`，1024 桶下 8 MB）。
         """
         data = np.asarray(rows)
         step = self._bucket
@@ -264,10 +264,9 @@ class MudePipeline:
             block = np.asarray(data[start:start + step], np.float16)
             view[:, s0 + start:s0 + start + block.shape[0]] = block.T
 
-    def run(self, embed: np.ndarray | None, *, length: int, prefix: int = 0,
+    def run(self, rows: np.ndarray, *, length: int, prefix: int = 0,
             causal: bool = False) -> None:
-        """跑完 20 层。`embed` 是 `[length, hidden]` 的 embedding 输出（fp32；`None` = 调用方
-        已经用 `run_rows` 把行写进画布了）。
+        """跑完 20 层。`rows` 是 `[length, hidden]` 的 embedding，按桶写进 `x` 画布。
 
         **步骤图驱动**：一层被拆成 `schedule.py` 的订单式 `(chain, step)` 序列 ——
         `norm → proj → core/gather → out → norm2 → ffn → tail`，一步一个命令缓冲，
@@ -278,13 +277,17 @@ class MudePipeline:
         之间整段排空，因为表面池与 qg/kv 画布是跨层复用的。
 
         `prefix` 非 0 时还会省掉最后一层的死瓦片（S3，见下面 `dead` 的注释）。
+
+        `[length, width)` 那几列**不清零**：调度只覆盖 `[0, length)` 切出来的瓦片，核读的
+        每一列都在自己那一相写过（探针 `.scratch/probe_stale_canvas.py` 拿"短 → 长 → 短"
+        逐位对拍过，两种读法 × 两档 prefix 都是 0）。
         """
         if not 0 <= prefix <= length <= self._width:
             raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
-        if embed is not None:
-            view = self.x.array(np.float16, (self._hidden, self._width))
-            view[:] = 0
-            view[:, :length] = np.asarray(embed, np.float32).T.astype(np.float16)
+        if int(np.asarray(rows).shape[0]) != length:
+            raise ConfigError("行数与长度不一致", rows=int(np.asarray(rows).shape[0]), length=length)
+        view = self.x.array(np.float16, (self._hidden, self._width))
+        self._write_rows(view, rows, 0)
         self._chunks_list = list(self._chunks(length))
         self._prepare(length, prefix, fresh=True, causal=causal)
         for index, block_of_layers in enumerate(self._blocks()):
@@ -298,21 +301,6 @@ class MudePipeline:
                 self._residency.end(index)
         if self._residency is not None:
             self._residency.finish()   # 一轮结束落在待命窗口上（服务契约"回到前 W 层"）
-
-    def run_rows(self, rows: np.ndarray, *, length: int, prefix: int = 0,
-                 causal: bool = False) -> None:
-        """与 `run` 同语义，但 embedding 由 `[length, hidden]` 的行逐桶写进画布。
-
-        给"不想物化整宽 fp32 画布"的调用方用（`MudeChain.logits_rows`）：临时量是一桶，
-        而不是 `[hidden, length]` 的 fp32。数值上与 `run` 完全一致。
-        """
-        if not 0 <= prefix <= length <= self._width:
-            raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
-        if int(np.asarray(rows).shape[0]) != length:
-            raise ConfigError("行数与长度不一致", rows=int(np.asarray(rows).shape[0]), length=length)
-        view = self.x.array(np.float16, (self._hidden, self._width))
-        self._write_rows(view, rows, 0)
-        self.run(None, length=length, prefix=prefix, causal=causal)
 
     def run_shared(self, prefix_rows: np.ndarray, tails: Sequence[np.ndarray], *,
                    prefix: int, causal: bool = False) -> list[np.ndarray]:

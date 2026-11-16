@@ -22,21 +22,23 @@ HIDDEN = 4
 
 
 class FakeChain:
-    """只记账：hidden 的每一行都给同一组常数，最后一行单独指定。"""
+    """只记账：`last_hidden` 返回给定的那一行，`hidden` 若被调用就露馅。"""
 
     def __init__(self, last: tuple[float, ...] = (0.0, 0.0, 0.0, 1.0), width: int = HIDDEN):
         self.calls: list[tuple[tuple[int, ...], bool]] = []
         self.closed = False
+        self.whole_readbacks = 0
         self._last = np.asarray(last, dtype=np.float32)
         self._width = width
-        self._hidden = np.zeros((0, width), dtype=np.float32)
+
+    def last_hidden(self, tokens, *, causal=False):
+        self.calls.append((tuple(tokens), bool(causal)))
+        return self._last
 
     def hidden(self, tokens, *, causal=False):
-        self.calls.append((tuple(tokens), bool(causal)))
-        base = np.repeat(self._last[None, :], len(tokens), axis=0)
-        base[0] = 99.0  # 干扰项：任何一行都能被读到就说明取错了行
-        self._hidden = base
-        return base
+        """读出只要末行；整段读回是 87 ms 对 0.02 ms，这条路不该再被走到。"""
+        self.whole_readbacks += 1
+        raise AssertionError("pooled 的读出不该整段读回 hidden")
 
     def close(self):
         self.closed = True
@@ -74,7 +76,7 @@ def two_option_request() -> DecisionRequest:
 
 # ------------------------------------------------------------------- 答案
 def test_answer_reads_the_last_row_through_the_vendor_answer():
-    """hidden 的最后一行 × 标签行 → logits → 厂商判答案；前面几行（这里放了 99）不参与。"""
+    """末位 token 的 hidden × 标签行 → logits → 厂商判答案；整段读回不参与。"""
     subject = runner(last=(0.0, 0.0, 3.0, 1.0))
     request = two_option_request()
     answers, tokens, _ = subject.answers_for(request, MaskMode.CAUSAL)
@@ -88,8 +90,8 @@ def test_answer_reads_the_last_row_through_the_vendor_answer():
     assert tokens == len(subject._serve.prepare(request.state, spec()).ids)
 
 
-def test_answer_follows_the_last_row_not_the_first():
-    """把最后一行改成第三维占优，答案就要跟着走 —— 这条钉住"读的是 `hidden[-1]`"。"""
+def test_answer_follows_the_row_the_chain_gives_it():
+    """链给的那一行换个方向，答案就要跟着走 —— 这条钉住"点积用的是 `last_hidden`"。"""
     subject = runner(last=(0.0, 5.0, 0.0, 0.0))
     answers, _, _ = subject.answers_for(two_option_request(), MaskMode.NONCAUSAL_FULL)
     # logits = [0, 5] → B 胜出

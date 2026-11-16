@@ -180,7 +180,7 @@ class SplitChain:
         只会让每一层都差一点点 —— 默认零正是让"忘了给"看起来像跑通的写法。
 
         读出可以是 `None`：`descriptor.readout.kind` 不是 `code_rows` 的模型（h2o 是
-        `pooled`）没有码表，这条链就只提供逐层 hidden 与 `logits_rows`，`logits()` 会报
+        `pooled`）没有码表，这条链就只提供逐层 hidden，`logits()` 会报
         `NotReadyError` 指出来（pooled 读出还没实现，票据 15 的 G6）。
         """
         if device != "ane":
@@ -299,6 +299,20 @@ class SplitChain:
 
     # ------------------------------------------------------------------ 前向
 
+    def _ids_and_length(self, tokens: Sequence[int], prefix: int) -> tuple[np.ndarray, int]:
+        """三条前向入口共用的门禁：token 数组、长度，与 `prefix` 的越界检查。"""
+        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
+        length = int(ids.size)
+        if length == 0:
+            raise ValueError("prompt 至少要有一个 token")
+        if length > self._width:
+            raise ValueError(
+                f"prompt 长度 {length} 超过链的缓冲宽度 width={self._width}；"
+                "用更大的 width 重新 load")
+        if not 0 <= prefix <= length:
+            raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
+        return ids, length
+
     def logits(self, tokens: Sequence[int], *, trace: list[np.ndarray] | None = None,
                prefix: int = 0, causal: bool = False,
                debug: dict | None = None) -> np.ndarray:
@@ -313,29 +327,19 @@ class SplitChain:
         `causal=True` 换成三角掩码 `k <= q`。它与 `prefix` 是**两个轴**：causal 下每一行
         只看自己之前（含自己），所以 `prefix` 不再改变掩码 —— 前缀行本来就是行内三角的一部
         分，尾巴行看到的 `[0, prefix)` 也在 `k <= q` 之内。
+
+        只有最后一条 token 的行进读出，所以 Metal 那条路直接走 `last_hidden()`（不做整段
+        读回）：16k 上整段读回归一要 87 ms，末行是 0.02 ms。
         """
-        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
-        length = int(ids.size)
-        if length == 0:
-            raise ValueError("prompt 至少要有一个 token")
-        if length > self._width:
-            raise ValueError(
-                f"prompt 长度 {length} 超过链的缓冲宽度 width={self._width}；"
-                "用更大的 width 重新 load")
-        if not 0 <= prefix <= length:
-            raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
-        # 读出可能不存在（h2o 是 pooled）：先算，最后一步才要码表 —— 这样没有码表的模型
-        # 仍然能用 `hidden()` 跑整链、做逐层对拍。
+        ids, length = self._ids_and_length(tokens, prefix)
+        # 码表先要：没有码表的模型（h2o 是 pooled）连前向都不必跑，报错也不必等到算完。
+        # 它不影响 `hidden()` / `last_hidden()` —— 那两条出口不需要码表。
+        readout = self._require_readout()
         if self._pipeline is not None:
             if trace is not None or debug is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace 或 debug（中间量留在面上）",
                                  hint="用 metal=False 的 numpy 链做逐层对拍")
-            embed = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid,
-                           self._width)
-            self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix,
-                               causal=causal)
-            final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
-            return self._require_readout() @ final
+            return readout @ self.last_hidden(tokens, prefix=prefix, causal=causal)
         x = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid, self._width)
         if trace is not None:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
@@ -352,7 +356,7 @@ class SplitChain:
             if trace is not None:
                 trace.append(x[:, length - 1].copy())
         final = rms_norm(x.T, self._final_norm)[length - 1]
-        return self._require_readout() @ final
+        return readout @ final
 
     def hidden(self, tokens: Sequence[int], *, prefix: int = 0,
                causal: bool = False, trace: list[np.ndarray] | None = None) -> np.ndarray:
@@ -360,23 +364,16 @@ class SplitChain:
 
         这是**没有码表读出的模型**（h2o 的 `pooled`）也能用的出口，也是厂商路径对拍的抓手：
         G6 接上之前，"h2o 的链算得对不对"只能拿它比。`logits()` 就是它的最后一行过码表。
+
+        整段读回只在逐位置对拍与 trace 时需要；只要末行请用 `last_hidden()`（出货的
+        `pooled` 路径走那条）。
         """
-        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
-        length = int(ids.size)
-        if length == 0:
-            raise ValueError("prompt 至少要有一个 token")
-        if length > self._width:
-            raise ValueError(
-                f"prompt 长度 {length} 超过链的缓冲宽度 width={self._width}；"
-                "用更大的 width 重新 load")
-        if not 0 <= prefix <= length:
-            raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
+        ids, length = self._ids_and_length(tokens, prefix)
         if self._pipeline is not None:
             if trace is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace；用 metal=False 的 numpy 链")
-            embed = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid,
-                           self._width)
-            self._pipeline.run(embed[:, :length].T, length=length, prefix=prefix, causal=causal)
+            self._pipeline.run(self._store.read_rows(self._embed_name, ids), length=length,
+                               prefix=prefix, causal=causal)
             # 与 numpy 那条路同形：`[length, hidden]`（末位就是读出要的那一行）。以前这条
             # 分支只返回末位的一维向量，与自己的 docstring 不符 —— 逐位置对拍与
             # `PooledRunner` 的形状自检都会撞上。
@@ -394,6 +391,21 @@ class SplitChain:
             if trace is not None:
                 trace.append(x[:, length - 1].copy())
         return rms_norm(x.T, self._final_norm)[:length]
+
+    def last_hidden(self, tokens: Sequence[int], *, prefix: int = 0,
+                    causal: bool = False) -> np.ndarray:
+        """最后一条 token 的最终归一化 hidden（`[hidden]` fp32）。
+
+        `hidden(tokens)[-1]` 的那一行，但不读回整段：16k 上整段读回 + 归一 87 ms，只取末行
+        0.02 ms（票据 08 §3）。`pooled` 的读出与 `logits()` 都只要这一行。
+        """
+        ids, length = self._ids_and_length(tokens, prefix)
+        if self._pipeline is not None:
+            self._pipeline.run(self._store.read_rows(self._embed_name, ids), length=length,
+                               prefix=prefix, causal=causal)
+            return rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
+        # numpy 那条路不是热点：整段本来就是一小块 host 内存，直接复用 `hidden()`。
+        return self.hidden(tokens, prefix=prefix, causal=causal)[-1]
 
     def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0,
                 causal: bool = False) -> np.ndarray:
@@ -452,28 +464,6 @@ class SplitChain:
             out.append(self._require_readout() @ final)
         return out
 
-    def logits_rows(self, tokens: Sequence[int], *, prefix: int = 0) -> np.ndarray:
-        """与 `logits` 同语义，但 embedding 按桶逐块写进画布，不物化整宽 fp32 画布。
-
-        探针 `.scratch/probe_place.py` 拿它量"整宽画布"那笔内存值多少；两条路径的 logits
-        必须逐位相同（`logits` 仍是默认路径，没换）。
-        """
-        if self._pipeline is None:
-            raise ValueError("按行写画布只有 Metal 链提供（load 时用 metal=True）")
-        ids = np.asarray(tokens, dtype=np.int64).reshape(-1)
-        length = int(ids.size)
-        if length == 0:
-            raise ValueError("prompt 至少要有一个 token")
-        if length > self._width:
-            raise ValueError(
-                f"prompt 长度 {length} 超过链的缓冲宽度 width={self._width}；用更大的 width 重新 load")
-        if not 0 <= prefix <= length:
-            raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
-        self._pipeline.run_rows(
-            self._store.read_rows(self._embed_name, ids), length=length, prefix=prefix)
-        final = rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
-        return self._require_readout() @ final
-
     def _require_readout(self) -> np.ndarray:
         """码表读出；没有就明确报错（`pooled` 读出还没接，见 `_readout`）。"""
         if self._readout is None:
@@ -481,7 +471,7 @@ class SplitChain:
                 "这个模型没有码表读出，`logits()` 用不了",
                 readout_kind=self._readout_kind,
                 hint="h2o 的 pooled 读出 + selector 还没接（票据 15 G6）；"
-                     "在此之前只能用 `logits_rows` / 逐层 hidden 做对拍",
+                     "在此之前只能用 `hidden()` / `last_hidden()` 做对拍",
             )
         return self._readout
 
