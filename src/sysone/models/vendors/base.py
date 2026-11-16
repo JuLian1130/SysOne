@@ -56,13 +56,20 @@ _OPTION_SEPARATOR = ": "
 def question_spec(question: Question) -> dict:
     """把 domain 的 Question 转成厂商线格式的问题描述。
 
-    厂商自己的 `question_prompt` 会按 type 选模板；criteria 是「选项键 → 判据描述」的映射。
-    没有描述（选项就是键本身）时两侧相同，与旧实现一致。
+    厂商自己的 `question_prompt` 会按 type 选模板；criteria 是「选项键 → 判据描述」的映射，
+    **score 例外**：它的 criteria 是**有序档位数组**（顺序即档位高低，厂商按 `Σ i·p_i` 出
+    期望值）。协议层给 score 渲染的也是 `"<序号>: <档位>"` 的行，这里按序拆回档位本身。
 
     拆分的必要性是实测的（票据 12）：只给键不给描述时，h2o 在真实题集上与厂商自己的 harness
     有 7/105 条判词不同（torchcast 6/105）；把厂商原装的 criteria 喂回去，这 13 条**全部**
     复现 —— 也就是说差的不是权重、不是掩码、也不是 dtype，是选项行里少了判据描述。
     """
+    if question.kind == "score":
+        return {
+            "type": "score",
+            "instructions": question.text,
+            "criteria": [_description(option) for option in question.options or ()],
+        }
     criteria: dict[str, str] = {}
     for option in question.options or ():
         key, separator, description = option.partition(_OPTION_SEPARATOR)
@@ -72,6 +79,12 @@ def question_spec(question: Question) -> dict:
         "instructions": question.text,
         "criteria": criteria,
     }
+
+
+def _description(option: str) -> str:
+    """选项行 `"<键>: <描述>"` 的描述那一段；没有分隔符时整行就是描述。"""
+    _key, separator, description = option.partition(_OPTION_SEPARATOR)
+    return description if separator else option
 
 
 def normalize(answer: VendorAnswer, question: Question) -> tuple[str, tuple[float, ...], tuple[str, ...]]:

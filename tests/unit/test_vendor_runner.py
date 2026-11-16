@@ -182,6 +182,32 @@ def test_question_spec_carries_options_as_criteria() -> None:
     assert spec["criteria"] == {"甲": "甲", "乙": "乙"}
 
 
+def test_a_score_scale_reaches_the_vendor_as_an_ordered_array() -> None:
+    """score 的 criteria 是**数组**不是映射：顺序即档位高低，厂商按 Σ i·p_i 出期望值。
+
+    协议层给所有题型都渲染 `"<键>: <描述>"` 行，所以这里要按序拆回档位本身。档位文字里
+    自带 `": "` 时只拆第一处（`hard-opus-c-long_policy-05` 的档位就是这种）。
+    """
+    from sysone.models.vendors.base import question_spec
+
+    question = Question(
+        text="How many violations?",
+        options=(
+            "0: Compliant: nothing over the limit",
+            "1: Exactly one violation",
+            "2: Two or more",
+        ),
+        kind="score",
+    )
+    spec = question_spec(question)
+    assert spec["type"] == "score"
+    assert spec["criteria"] == [
+        "Compliant: nothing over the limit",
+        "Exactly one violation",
+        "Two or more",
+    ]
+
+
 def test_wire_answer_shapes() -> None:
     from sysone.models.vendors.base import wire_answer
 

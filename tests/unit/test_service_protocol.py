@@ -169,6 +169,60 @@ def test_too_many_options_is_rejected() -> None:
     assert "at most" in info.value.detail["invalid_questions"]["q"]
 
 
+# ---- score：criteria 是**有序档位数组**，不是映射 -------------------------------------
+
+
+def test_a_score_scale_keeps_its_order_and_names_the_levels_by_index() -> None:
+    """档位顺序就是分数的含义：`0` 是最低档。线格式按序编号，回包的键也是 `"0".."n-1"`。"""
+    _, wire = protocol.parse_request(
+        {
+            "questions": {
+                "q": {
+                    "type": "score",
+                    "instructions": "How severe?",
+                    "criteria": ["SEV-4 (lowest)", "SEV-3", "SEV-2", "SEV-1 (highest)"],
+                }
+            }
+        }
+    )
+    assert wire[0].labels == ("0", "1", "2", "3")
+    assert wire[0].question.kind == "score"
+    assert wire[0].question.options == (
+        "0: SEV-4 (lowest)",
+        "1: SEV-3",
+        "2: SEV-2",
+        "3: SEV-1 (highest)",
+    )
+
+
+def test_a_score_scale_must_be_an_ordered_array() -> None:
+    """映射形态是 choice 的；收下它会把档位顺序丢掉（厂商 `options_of` 也只收数组）。"""
+    for criteria in ({"0": "low", "1": "high"}, [], "low, high", 3):
+        with pytest.raises(protocol.Refusal) as info:
+            protocol.parse_request(
+                {"questions": {"q": {"type": "score", "criteria": criteria}}}
+            )
+        assert "ordered array" in info.value.detail["invalid_questions"]["q"]
+
+
+def test_a_score_answer_is_the_expected_level_and_its_distribution() -> None:
+    """厂商口径（`h2o_lightning_shim.format_answer`）：score = Σ i·p_i，概率按档位序号给。"""
+    _, wire = protocol.parse_request(
+        {"questions": {"q": {"type": "score", "criteria": ["low", "mid", "high"]}}}
+    )
+    payload = protocol.answer_payload(
+        _result((_answer(kind="score", value="0.750", probs=(0.25, 0.75, 0.0),
+                         labels=("0", "1", "2")),)),
+        model_name="h2o",
+        wire=wire,
+    )
+    answer = payload["answers"]["q"]
+    assert answer["type"] == "score"
+    assert answer["probabilities"] == {"0": 0.25, "1": 0.75, "2": 0.0}
+    # 0·0.25 + 1·0.75 + 2·0.0
+    assert answer["score"] == pytest.approx(0.75)
+
+
 def test_parse_body_reads_json_and_refuses_nan() -> None:
     assert protocol.parse_body(b'{"state": "x"}') == {"state": "x"}
     for raw in (b"{", b'{"state": NaN}', b'{"state": Infinity}'):

@@ -10,7 +10,7 @@ import numpy as np
 from ...config import EngineConfig
 from ...domain.attention import AttentionRole, MaskMode
 from ...domain.decision import Question
-from ...errors import ConfigError
+from ...errors import ConfigError, UnsupportedKindError
 from ...weights.checkpoint import stored_quant
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan, WeightPlan
@@ -111,7 +111,13 @@ def option_plan(question: Question) -> tuple[tuple[str, ...], tuple[str, ...], t
     if question.kind == "noul":
         return _NOUL_TEXTS, ("yes", "no"), (1, 0)
     if question.kind != "choice":
-        raise ConfigError("mude 只支持 choice / noul", kind=question.kind)
+        # 码表读出没有 score 的档位模板（`d3_format` 不给 score）：硬按 choice 读会拿
+        # 两套不同的题面比概率。明确拒绝，让客户端知道这不是它重试能解决的。
+        raise UnsupportedKindError(
+            "mude 的码表读出答不了这种题型",
+            kind=question.kind,
+            supported=["choice", "noul"],
+        )
     if not question.options:
         raise ConfigError("choice 题缺少选项")
     options = tuple(question.options)

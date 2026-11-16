@@ -34,8 +34,10 @@ ACCEPTED_FIELDS = ("state", "questions", *MEDIA_FIELDS, "model", "attention_mode
 JSON_TYPE = "application/json"
 DESCRIPTION = "Typed decisions with a probability for every option"
 
-# mude 的线格式只有这两种读出方式（`d3_format` 不给 score）。
-KINDS = ("choice", "noul")
+# 线格式认的三种题型。**认**不等于**答得了**：score 要的是厂商自己的档位模板与
+# `format_answer`（h2o / torchcast 的答面有），mude 的码表读出答不了 —— 那种情况由
+# 家族在规划期明确拒绝（`families/mude.option_plan`），不是静默按 choice 猜一个。
+KINDS = ("choice", "noul", "score")
 MAX_OPTIONS = 255
 MODALITIES = ["text"]
 
@@ -133,14 +135,30 @@ def _wire_question(key: str, raw: Any) -> WireQuestion:
         raise ValueError(f"question {key!r} must be an object")
     kind = raw.get("type")
     if kind not in KINDS:
+        # 说"线格式有哪些"，不说"这个模型答得了哪些"：后者是家族的读出能力，协议层不知道。
         raise ValueError(
-            f"question {key!r} has type {kind!r}; this model answers {', '.join(KINDS)}"
+            f"question {key!r} has type {kind!r}; the wire format carries {', '.join(KINDS)}"
         )
     instructions = raw.get("instructions")
     text = "" if instructions is None else describe(instructions)
     if kind == "noul":
         return WireQuestion(key=key, question=Question(text=text, kind="noul"), labels=())
     criteria = raw.get("criteria")
+    if kind == "score":
+        # score 的 criteria 是**有序档位数组**：档位名就是 `"0".."n-1"`，顺序即档位高低
+        # （厂商按 `Σ i·p_i` 出期望值）。这里不接映射形态 —— 映射会把档位顺序丢掉，而
+        # 顺序正是分数的全部含义（`h2o_lightning_shim.options_of` 只收数组）。
+        if isinstance(criteria, (str, bytes)) or not isinstance(criteria, Sequence) or not criteria:
+            raise ValueError(
+                f"question {key!r} needs criteria: an ordered array of score levels"
+            )
+        if len(criteria) > MAX_OPTIONS:
+            raise ValueError(f"question {key!r} has {len(criteria)} levels; at most {MAX_OPTIONS}")
+        labels = tuple(str(index) for index in range(len(criteria)))
+        levels = tuple(f"{label}: {describe(level)}" for label, level in zip(labels, criteria))
+        return WireQuestion(
+            key=key, question=Question(text=text, options=levels, kind="score"), labels=labels
+        )
     if not isinstance(criteria, Mapping) or not criteria:
         raise ValueError(f"question {key!r} needs criteria: an object of one or more option keys")
     if len(criteria) > MAX_OPTIONS:
@@ -228,6 +246,15 @@ def _answer_object(answer: Answer, wire: WireQuestion) -> dict[str, Any]:
         # 引擎里的标签顺序是 ("yes", "no")，线格式要的是 P(true)。
         return {"type": "noul", "noul": _normalized(answer.probs, 2)[0]}
     shares = _normalized(answer.probs, len(wire.labels))
+    if wire.question.kind == "score":
+        # 厂商口径（`h2o_lightning_shim.format_answer` 的 score 分支）：档位序号上的期望值
+        # `Σ i·p_i`，概率表按 `"0".."n-1"` 给。不带 `legend`：档位就是请求里那些，与 choice
+        # 分支不回选项文本同口径。
+        return {
+            "type": "score",
+            "score": sum(index * share for index, share in enumerate(shares)),
+            "probabilities": dict(zip(wire.labels, shares)),
+        }
     best = max(range(len(shares)), key=shares.__getitem__)
     return {
         "type": "choice",

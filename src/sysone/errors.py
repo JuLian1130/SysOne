@@ -43,6 +43,17 @@ class UnsupportedModeError(SysOneError):
     status = 400
 
 
+class UnsupportedKindError(SysOneError):
+    """请求的题型不在该模型的读出能力里（线格式认、这个模型答不了）。
+
+    与 `ConfigError` 分开：这是**坏请求**不是我们的配置坏了，客户端据此知道不要重试。
+    今天只有 mude 会抛（码表读出没有 score 的档位模板）。
+    """
+
+    code = "unsupported_kind"
+    status = 400
+
+
 class UnsupportedPrecisionError(SysOneError):
     """精度 / 设备 / 权重组合不可用。"""
 

@@ -19,7 +19,13 @@ from sysone.domain.decision import Question
 from sysone.domain.work import CompilationTimes
 from sysone.engine.engine import Engine
 from sysone.engine.strategies.split import SplitRunner
-from sysone.errors import ConfigError, NotReadyError, RequestTooLongError, UnsupportedModeError
+from sysone.errors import (
+    ConfigError,
+    NotReadyError,
+    RequestTooLongError,
+    UnsupportedKindError,
+    UnsupportedModeError,
+)
 from sysone.models.families import mude
 
 CODES = tuple(f"K{index:03d}" for index in range(mude.CODE_ROWS))
@@ -113,9 +119,12 @@ def test_option_plan_noul_reverses_the_prompt_order() -> None:
     assert indexes == (1, 0)
 
 
-def test_option_plan_rejects_unknown_kind_and_empty_options() -> None:
-    with pytest.raises(ConfigError):
+def test_option_plan_refuses_a_kind_the_code_table_cannot_answer() -> None:
+    """码表读出没有 score 的档位模板：这是**坏请求**（400），不是我们的配置坏了（500）。"""
+    with pytest.raises(UnsupportedKindError) as info:
         mude.option_plan(Question(text="打分", kind="score"))
+    assert info.value.status == 400
+    assert info.value.context == {"kind": "score", "supported": ["choice", "noul"]}
     with pytest.raises(ConfigError):
         mude.option_plan(Question(text="选一个"))
 
