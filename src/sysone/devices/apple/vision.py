@@ -223,7 +223,8 @@ class VisionTower:
         self.root = vw.tower_root(store)
         self.directory = _program_root(_artifacts_root(artifacts_dir), descriptor,
                                        s=self.s) / "vision"
-        self.stats = {"evals": 0, "ane_ms": 0.0, "gpu_ms": 0.0, "host_ms": 0.0}
+        self.stats = {"evals": 0, "ane_ms": 0.0, "gpu_ms": 0.0, "gpu_busy_ms": 0.0,
+                      "host_ms": 0.0}
         self._header = f"vision{next(_TOWERS)}"
 
         # patch 的输入宽度从**权重形状**取：写死 1536 就是第二份塔的形状。
@@ -385,18 +386,29 @@ class VisionTower:
                 # 转置成 `(½dim, L)`：核里一格的 32 个 lane 读同一行 `k` 的 32 个连续 token
                 cos_dev.array(np.float16, (half_dim, length))[...] = cos16[:, :half_dim].T
                 sin_dev.array(np.float16, (half_dim, length))[...] = sin16[:, :half_dim].T
+                tiles = list(self._tiles(length))
                 for index in range(int(spec.depth)):
                     block = self._programs[f"block{index:02d}"]
-                    for lo, n in self._tiles(length):
+                    for lo, n in tiles:
                         self._put("hidden_in", self.hidden, residual[lo:lo + n].T)
                         self._call(block, "main")
                         qkv_view[:, lo:lo + n] = self._take(block, "main", n)
                     vrope(self.metal, qkv_dev, cos_dev, sin_dev, T=length,
                           hidden=self.hidden, dim=self.head_dim)
-                    vattn(self.metal, qkv_dev, ctx_dev, T=length, nq=length,
-                          hidden=self.hidden, dim=self.head_dim, scale=self.scale)
-                    self.stats["gpu_ms"] += self.metal.sync()
-                    for lo, n in self._tiles(length):
+                    # 注意力按 query 瓦片发、与 p1 的同一片交错：p1 的第 j 片只读注意力的第 j
+                    # 段，所以"发第 j+1 段、同时跑第 j 片"没有依赖问题。每层第一段是躲不掉的
+                    # 头部（24 层合计 ~107 ms @1024²），其余三段藏在 p1 后面（票据 07 §7.12）。
+                    for j, (lo, n) in enumerate(tiles):
+                        if j == 0:
+                            vattn(self.metal, qkv_dev, ctx_dev, T=length, nq=n, s0=lo,
+                                  hidden=self.hidden, dim=self.head_dim, scale=self.scale)
+                            self.metal.commit()
+                        self._await_gpu()
+                        if j + 1 < len(tiles):
+                            lo2, n2 = tiles[j + 1]
+                            vattn(self.metal, qkv_dev, ctx_dev, T=length, nq=n2, s0=lo2,
+                                  hidden=self.hidden, dim=self.head_dim, scale=self.scale)
+                            self.metal.commit()
                         attn = self._view("attn", 2 * self.hidden)
                         attn[:self.hidden, :n] = ctx_view[:, lo:lo + n]
                         attn[self.hidden:, :n] = residual[lo:lo + n].T
@@ -441,6 +453,16 @@ class VisionTower:
         s_out = program.io[proc][3]
         view = out.array(np.float16, (1, cout, 1, s_out))[0, :, 0]
         return view[:, :cols]
+
+    def _await_gpu(self) -> None:
+        """等队首那一片注意力完成，两个口径分开记。
+
+        `gpu_ms` 是"等了多少"（墙钟）：串行时它等于 GPU 忙时，交错之后它只剩没藏住的那一截，
+        所以它同时也是"这次重叠亏了多少"的度量。`gpu_busy_ms` 是 GPU 真在跑的时间
+        （`e8m_wait_upto` 里的 `g_last_gpu_ms`），两条排布下应当相同——不同就是争用。
+        """
+        self.stats["gpu_ms"] += self.metal.wait()
+        self.stats["gpu_busy_ms"] += self.metal.gpu_ms()
 
     def _call(self, program: _Program, proc: str) -> None:
         self.stats["ane_ms"] += program.run(self.runtime, proc)
@@ -570,6 +592,7 @@ class VisionSlot:
         self._evals = 0
         self._ane_ms = 0.0
         self._gpu_ms = 0.0
+        self._gpu_busy_ms = 0.0
 
     # -- 装载与卸载 ----------------------------------------------------------
     def warm(self) -> VisionTower:
@@ -631,12 +654,14 @@ class VisionSlot:
     def encode(self, img: np.ndarray) -> np.ndarray:
         with self._lock:
             tower = self._ensure()
-            before = (tower.stats["evals"], tower.stats["ane_ms"], tower.stats["gpu_ms"])
+            keys = ("evals", "ane_ms", "gpu_ms", "gpu_busy_ms")
+            before = [tower.stats.get(k, 0.0) for k in keys]
             rows = tower.encode(img)
-            after = (tower.stats["evals"], tower.stats["ane_ms"], tower.stats["gpu_ms"])
+            after = [tower.stats.get(k, 0.0) for k in keys]
             self._evals += after[0] - before[0]
             self._ane_ms += after[1] - before[1]
             self._gpu_ms += after[2] - before[2]
+            self._gpu_busy_ms += after[3] - before[3]
             self._last_use = time.monotonic()
         self._arm()
         return rows
@@ -697,8 +722,9 @@ class VisionSlot:
                 "unloads": self._unloads,
                 "load_s": round(self._load_s, 3),
                 "idle_s": self._idle,
-                # 这三个是**累计**的（塔卸载之后也还在），否则 `/metrics` 会把历史抹掉。
+                # 这几个是**累计**的（塔卸载之后也还在），否则 `/metrics` 会把历史抹掉。
                 "evals": self._evals,
                 "ane_ms": round(self._ane_ms, 3),
                 "gpu_ms": round(self._gpu_ms, 3),
+                "gpu_busy_ms": round(self._gpu_busy_ms, 3),
             }
