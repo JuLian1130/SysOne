@@ -19,6 +19,7 @@ from sysone.devices.apple import kernels
 from sysone.devices.apple.chain import _rope_table
 from sysone.devices.apple.metal import MetalRuntime
 from sysone.devices.apple.ops import apply_rotary, attention, rms_norm, sigmoid
+from sysone.errors import NotReadyError
 from sysone.weights.store import SafeTensorFile
 
 MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
@@ -450,3 +451,79 @@ def test_attention_reads_q_from_the_ring_slot(
     assert rel < TOL, f"环槽位里的注意力对不上：relL2={rel:.3e}"
     for buf in (qg_buf, kv_buf, out_buf, scratch):
         buf.free()
+
+
+def _vattn_reference(q: np.ndarray, k: np.ndarray, v: np.ndarray, heads: int,
+                     dim: int) -> np.ndarray:
+    """通道主序的 softmax(QKᵀ)·V，逐头、非因果、fp32 中间量（视觉塔的注意力参考）。"""
+    scale = dim ** -0.5
+    out = np.empty((heads * dim, q.shape[1]), dtype=np.float16)
+    for h in range(heads):
+        b = h * dim
+        qh = q[b:b + dim].astype(np.float32)
+        kh = k[b:b + dim].astype(np.float32)
+        vh = v[b:b + dim].astype(np.float32)
+        sc = (qh.T @ kh) * scale                        # (nq, T)
+        sc -= sc.max(axis=1, keepdims=True)
+        p = np.exp(sc)
+        p /= p.sum(axis=1, keepdims=True)
+        out[b:b + dim] = (p @ vh.T).T.astype(np.float16)
+    return out
+
+
+@pytest.mark.parametrize(("T", "nq", "s0"), [
+    (25, 25, 0),        # 奇数 T、一档都没铺满：尾列写入的守卫（漏了会踩掉下一行第 0 列）
+    (96, 96, 0),        # 三档铺满
+    (128, 70, 8),       # query 尾（第二格只写 6 列）+ 列偏移
+    (300, 300, 0),      # 尾档 300 % 32 = 12
+])
+def test_vision_attention_matches_numpy(runtime: MetalRuntime, T: int, nq: int,
+                                        s0: int) -> None:
+    """`k_vattn`（非因果、head_dim 64、64 列 query 一格、键 32 一档）对 numpy。
+
+    视觉的注意力核没有权重，所以这条用例的输入是随机构造的；形状是按会咬人的边界挑的：
+    奇数 `T`、尾档不满、query 不满一格、以及非零 `s0`。
+    """
+    heads, dim = 16, 64
+    hidden = heads * dim
+    rng = np.random.default_rng(5)
+    qkv = (rng.standard_normal((3 * hidden, T)) * 0.6).astype(np.float16)
+    sentinel = np.float16(-777.0)
+    out = np.full((hidden, T), sentinel, dtype=np.float16)
+    qbuf = runtime.alloc(qkv.nbytes)
+    obuf = runtime.alloc(out.nbytes)
+    try:
+        qbuf.array(np.float16, qkv.shape)[:] = qkv
+        obuf.array(np.float16, out.shape)[:] = out
+        kernels.vattn(runtime, qbuf, obuf, T=T, nq=nq, hidden=hidden, dim=dim,
+                      scale=dim ** -0.5, s0=s0)
+        runtime.commit()
+        runtime.wait()
+        got = obuf.array(np.float16, (hidden, T)).copy()
+    finally:
+        qbuf.free()
+        obuf.free()
+
+    # q 只切出这次产出的列；k/v 必须是全部 T 列（核按全 T 个键做 softmax）
+    col = slice(s0, s0 + nq)
+    want = _vattn_reference(qkv[:hidden, col], qkv[hidden:2 * hidden], qkv[2 * hidden:],
+                            heads, dim)
+    diff = np.abs(got[:, col].astype(np.float32) - want.astype(np.float32))
+    peak = float(np.abs(want.astype(np.float32)).max())
+    assert diff.max() / peak < TOL, f"视觉注意力对不上：rel={diff.max() / peak:.3e}"
+    assert (got[:, col] != sentinel).all(), "有 query 列没被写过（网格没铺满 nq）"
+    outside = np.ones(got.shape, dtype=bool)
+    outside[:, col] = False
+    assert (got[outside] == sentinel).all(), "写到了本次调用范围之外的列"
+
+
+def test_vision_attention_rejects_other_head_dims(runtime: MetalRuntime) -> None:
+    """核里 8 档通道是按 head_dim == 64 写死的：别的值要当场拒绝，不能算出垃圾。"""
+    qbuf = runtime.alloc(3 * 256 * 4 * 2)
+    obuf = runtime.alloc(256 * 4 * 2)
+    try:
+        with pytest.raises(NotReadyError):
+            kernels.vattn(runtime, qbuf, obuf, T=4, nq=4, hidden=256, dim=32, scale=0.1)
+    finally:
+        qbuf.free()
+        obuf.free()

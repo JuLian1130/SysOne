@@ -489,14 +489,20 @@ def vattn(
 
     q/k 的轴向 RoPE 由调用方先做完（`vision.py::rope_qk`）：核不读 cos/sin，所以它只是
     softmax(QKᵀ)·V —— 给定 q/k 之后，注意力本身没有别的约定。
-    一个线程组管 (一个 query, 一个 head)：`grid = (nq, heads)`、`tg = (dim)`。
+    一格管 **64 列 query × 一个头**：`grid = (ceil(nq/64), hidden//dim)`、`tg = (256)`，键按
+    32 一档。`nq` 不是 64 的倍数时，最后一格只写前 `nq % 64` 列；`s0 + nq <= T` 是调用方的
+    约定（`out` 里只有 `[s0, s0+nq)` 这些列会被写）。
     """
+    if dim != 64:
+        # 核里"8 档通道 × 8 个分片"是按 head_dim == 64 写死的。`k_attn` 对 `E8_HEAD_DIM` 用
+        # 编译期 `#error` 拦同一件事，视觉的 head_dim 是运行期参数（来自描述符），所以拦在这里。
+        raise NotReadyError("视觉注意力核只实现了 head_dim = 64", dim=dim, hidden=hidden)
     runtime.dispatch(
         "k_vattn",
         [qkv, out],
         args=vattn_args(T=T, nq=nq, s0=s0, hidden=hidden, dim=dim, scale=scale),
-        grid=(nq, hidden // dim, 1),
-        tg=(dim, 1, 1),
+        grid=((nq + 63) // 64, hidden // dim, 1),
+        tg=(256, 1, 1),
         lane=lane,
     )
 
