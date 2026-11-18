@@ -20,6 +20,7 @@ from ..domain.decision import (
 from ..domain.work import CompilationTimes
 from ..errors import ConfigError, UnsupportedMediaError, UnsupportedModeError
 from ..models.descriptor import ModelDescriptor
+from ..models.vision.contract import image_contract as _text_contract
 from .memory import plan_memory
 from .planner import Planner
 from .runner import ModelRunner
@@ -92,7 +93,11 @@ class Engine:
     def run(self, request: DecisionRequest) -> DecisionResult:
         started = time.perf_counter()
         if request.media:
-            raise UnsupportedMediaError("M0 不支持多模态输入", count=len(request.media))
+            reason = self.vision_unavailable()
+            if reason is not None:
+                # 说清**哪一种**不行（模型没有塔 / 这次启动关了 / 链是 numpy 形态）：一件
+                # "不支持多模态"把三件不同的事压成一句，客户端不知道是换参还是换模型。
+                raise UnsupportedMediaError(reason, count=len(request.media))
         # 三级回落：请求 → 配置（`--attention-mode`，`SchedulerConfig` 的 docstring 写明
         # 非 None 就是"用这个"）→ 模型自己的默认。跳过中间一级会让 CLI 的开关只在
         # `cache_key` 里留痕、在请求上不留痕。
@@ -184,6 +189,31 @@ class Engine:
             self._readout_s += output.readout_s
             answers.append(output.answer)
         return StepResult(answers=tuple(answers), has_unfinished=self._scheduler.has_unfinished())
+
+    # ------------------------------------------------------------------ 视觉
+
+    def image_contract(self) -> dict[str, object]:
+        """这次装配收不收图、收的话四条预算是多少。**执行器是唯一的来源**。
+
+        没有视觉能力的执行器（reference / 未装配的替身）连 `image_contract` 都没有，那就不
+        收图，理由照实说 —— 这里补一个 `supported: False` 的表，而不是让前门去猜 `None`
+        是什么意思（那会让"能力"在上游是 `None`、在下游是 `"no vision tower"`，两句话对不上）。
+        """
+        contract = getattr(self._runner, "image_contract", None)
+        if callable(contract):
+            return dict(contract())
+        return _text_contract(unavailable="这条执行路径没有视觉塔，收不了图")
+
+    def vision_unavailable(self) -> str | None:
+        """收不了图的原因；`None` 表示收得了。与 `image_contract()` 同一份数据。"""
+        return self.image_contract().get("unavailable")
+
+    def vision_stats(self) -> dict[str, object]:
+        """`/metrics` 的 `vision` 一栏；执行器不认识视觉时给一个"不可用"的空壳。"""
+        stats = getattr(self._runner, "vision_stats", None)
+        if not callable(stats):
+            return {"available": False}
+        return dict(stats())
 
     def stats(self) -> RunStats:
         return RunStats(

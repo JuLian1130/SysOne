@@ -290,6 +290,31 @@ def test_decode_jpeg_differs_from_pillow_by_a_bounded_amount() -> None:
     assert diff > 0, "JPEG 竟然逐位相同了？先确认 fixture 与 dylib 是同一份输入"
 
 
+def test_size_answers_the_dimensions_without_decoding_pixels() -> None:
+    """`size` 是 16 MP 那条拒收的前置：真解码再判，等于先把不该解的那块内存申请下来。"""
+    from sysone.devices.apple.image import available, size
+
+    if not available():
+        pytest.skip("没有 libe8image.dylib")
+    for name in ("png", "jpeg"):
+        data, want, _ = _decode_fixture(name)
+        # 5 行 7 列：`(宽, 高)` 不是 `(高, 宽)`，转置过的实现会在这里翻车
+        assert size(data) == (want.shape[1], want.shape[0]), name
+
+
+def test_size_rejects_bytes_that_are_not_an_image() -> None:
+    from sysone.devices.apple.image import available, size
+
+    if not available():
+        pytest.skip("没有 libe8image.dylib")
+    with pytest.raises(UnsupportedMediaError):
+        size(b"")
+    with pytest.raises(UnsupportedMediaError):
+        size(b"\x89PNG\r\n\x1a\n not really a png")
+    with pytest.raises(UnsupportedMediaError):
+        size("不是字节")  # type: ignore[arg-type]
+
+
 def test_decode_rejects_garbage(tmp_path: Path) -> None:
     from sysone.devices.apple.image import available, decode
 

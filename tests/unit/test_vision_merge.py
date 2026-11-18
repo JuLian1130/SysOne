@@ -109,6 +109,15 @@ def test_media_checks_rows_against_counts() -> None:
     assert media.images == 2
 
 
+def test_media_refuses_a_patch_grid_instead_of_the_merged_one() -> None:
+    """`grids` 是**合并之后**的网格：交 patch 网格（面积 4×行数）必须报错，不能截断。
+
+    截断过的那一版在这里是绿的：4 个 token 照旧拿到 4 个位置，只是每个位置的行列号都错。
+    """
+    with pytest.raises(ValueError, match="合并之后"):
+        Media(counts=(4,), grids=((4, 4),), rows=np.zeros((4, 8), np.float32))
+
+
 def test_attach_returns_a_placement_whose_positions_match_the_ids() -> None:
     media = Media(counts=(4,), grids=((2, 2),), rows=np.arange(8, dtype=np.float32).reshape(4, 2))
     expanded, placement = attach([1, IMAGE, 2], media, image_token_id=IMAGE)

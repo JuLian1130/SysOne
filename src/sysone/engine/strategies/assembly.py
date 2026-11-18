@@ -38,8 +38,8 @@ _BUILDERS: dict[str, Callable[..., object]] = {
 # 给了不认的参数要报错 —— 静默丢掉一个用户显式给的旋钮，会让"我设了窗口"和"它没生效"
 # 同时成立。
 _OPTIONS: dict[str, frozenset[str]] = {
-    "split": frozenset({"bucket", "width", "resident"}),
-    "pooled": frozenset({"bucket", "width", "resident"}),
+    "split": frozenset({"bucket", "width", "resident", "vision", "vision_idle"}),
+    "pooled": frozenset({"bucket", "width", "resident", "vision", "vision_idle"}),
 }
 
 # 有执行器、但装配不出来的策略：缺的不是执行器，是「用哪个桥、怎么构造」这一步 —— 注册表
@@ -71,12 +71,18 @@ def assemble(
     bucket: int | None = None,
     width: int | None = None,
     resident: int | None = None,
+    vision: bool | None = None,
+    vision_idle: float | None = None,
     artifacts_dir: str | Path | None = None,
 ) -> Assembly:
     """按家族声明装配一条执行器；后端与声明不符、或该策略还没有执行器时抛出 `ConfigError`。
 
     `artifacts_dir` 是编译产物的落点（部署概念）；执行器那一层叫它 `scratch_dir`，因为对链
     来说那只是一处"把 MIL/blob 放哪"的目录 —— 只有 CLI 与配置层知道它应当持久。
+
+    `vision` / `vision_idle` 是视觉那条路的两个旋钮（`False` = 纯文本服务；`vision_idle` 是
+    塔的空闲卸载秒数）。它们**不进 `cache_key`**：塔的产物身份由权重与形状决定，与"这次要不要
+    收图"无关 —— 关掉视觉再打开，26 份产物照样命中。
     """
     entry = family(name)
     # 先问"这个家族的策略装配得起来吗"，再问"你选的这个后端对不对"：反过来的话，一个只有
@@ -103,7 +109,10 @@ def assemble(
             available=list(BACKENDS),
             hint=f"{name} 的答案是按 {entry.strategy} 读出的，用 --backend {entry.strategy}",
         )
-    given = {"bucket": bucket, "width": width, "resident": resident}
+    given: dict[str, object] = {
+        "bucket": bucket, "width": width, "resident": resident,
+        "vision": vision, "vision_idle": vision_idle,
+    }
     accepted = _OPTIONS[entry.strategy]
     refused = sorted(key for key, value in given.items() if value is not None and key not in accepted)
     if refused:
@@ -115,7 +124,8 @@ def assemble(
         )
     root = Path(model_dir)
     descriptor = entry.parse_config(root)
-    options = {key: value for key, value in given.items() if key in accepted}
+    options = {key: value for key, value in given.items()
+               if key in accepted and value is not None}
     runner = builder(root, **options, scratch_dir=artifacts_dir)
     return Assembly(descriptor=descriptor, runner=runner, strategy=entry.strategy)
 

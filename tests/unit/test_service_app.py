@@ -67,6 +67,15 @@ class FakeEngine:
             startup=StartupStats(),
         )
 
+    def image_contract(self) -> dict:
+        """这个替身没有视觉：协议层据此拒图，并把 `unavailable` 原样回出去。"""
+        from sysone.models.vision.contract import image_contract
+
+        return image_contract(unavailable="这个替身没有视觉塔")
+
+    def vision_stats(self) -> dict[str, object]:
+        return {"available": False}
+
 
 def _decider(engine: FakeEngine | None = None) -> service_app.EngineDecider:
     return service_app.EngineDecider(

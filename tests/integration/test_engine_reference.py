@@ -72,11 +72,14 @@ def test_unsupported_mode_is_400(tmp_path: Path) -> None:
     assert caught.value.status == 400
 
 
-def test_media_is_rejected(tmp_path: Path) -> None:
+def test_media_is_rejected_with_the_reason_that_it_is_the_path_not_the_request(tmp_path: Path) -> None:
+    """reference 执行器没有塔：拒收的理由要说"这条执行路径"，不是"这个模型"。"""
     engine, _ = _engine(tmp_path)
-    request = dataclasses.replace(make_request(), media=(MediaRef(kind="image", locator="a.png"),))
-    with pytest.raises(UnsupportedMediaError):
+    request = dataclasses.replace(make_request(), media=(MediaRef(kind="image", data=b"x"),))
+    with pytest.raises(UnsupportedMediaError) as caught:
         engine.run(request)
+    assert caught.value.status == 422
+    assert "执行路径" in caught.value.message, caught.value.message
 
 
 def test_long_request_is_rejected(tmp_path: Path) -> None:

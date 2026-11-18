@@ -93,7 +93,7 @@ def test_the_prompt_expands_to_text_plus_four_rows_per_image(
     with_image, _, _, _ = prompter.encode(STATE, QUESTION, images=1)
     descriptor = mude.parse_config(MUDE_DIR)
     rows = np.zeros((4, int(descriptor.vision.out_hidden_size)), np.float16)  # type: ignore[union-attr]
-    media = merge.Media(counts=(4,), grids=((4, 4),), rows=rows)
+    media = merge.Media(counts=(4,), grids=((2, 2),), rows=rows)
     expanded, placement = merge.attach(with_image, media,
                                        image_token_id=int(descriptor.image_token_id or 0))
     assert len(expanded) == len(plain) + 4 + 2
@@ -104,4 +104,9 @@ def test_the_prompt_expands_to_text_plus_four_rows_per_image(
     assert placement.positions.shape == (3, len(expanded))
     start, count = placement.spans[0]
     block = placement.positions[:, start:start + count]
-    assert len({tuple(block[:, i].tolist()) for i in range(count)}) == count, "行/列轴没生效"
+    # 减去第一个 token 之后是**合并后 2×2 网格**的 `indices`：(t, 行, 列) 三个轴各走一遍。
+    # 这一条比"四个位置互不相同"强：patch 网格（4×4 截前 4 个）也满足互不相同，
+    # 而它给出的是一行四列，这里要求的是一列一行各两格（票据 07 §7.4c）。
+    assert (block - block[:, :1]).tolist() == [
+        [0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 0, 1],
+    ]

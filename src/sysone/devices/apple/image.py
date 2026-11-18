@@ -42,7 +42,7 @@ import numpy as np
 from ...errors import NotReadyError, UnsupportedMediaError
 
 DYLIB_NAME = "libe8image.dylib"
-_REQUIRED = ("e8_img_decode", "e8_img_free")
+_REQUIRED = ("e8_img_decode", "e8_img_free", "e8_img_size")
 _ERR_LEN = 256
 
 _lib: ctypes.CDLL | None = None
@@ -82,6 +82,12 @@ def _load(path: str | os.PathLike | None) -> ctypes.CDLL:
     ]
     lib.e8_img_free.restype = None
     lib.e8_img_free.argtypes = [ctypes.c_void_p]
+    lib.e8_img_size.restype = ctypes.c_int
+    lib.e8_img_size.argtypes = [
+        ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_size_t,
+    ]
     _lib, _lib_path = lib, str(dylib)
     return lib
 
@@ -102,6 +108,26 @@ def available(e8_dir: str | os.PathLike | None = None) -> bool:
     except OSError:
         return False
     return True
+
+
+def size(data: bytes, *, path: str | os.PathLike | None = None) -> tuple[int, int]:
+    """`bytes` → `(宽, 高)`，**不解码**：只读容器头。
+
+    16 MP 那条拒收要用它：真解码再判，等于先把"这张图不该被解"的那块内存申请下来（30000²
+    的 PNG 压缩后几百 KB、解开是 3.6 GB）。读到的是编码尺寸、不是 EXIF 旋转之后的尺寸 ——
+    与 PIL 的 `Image.size` 同口径，所以两边的 16 MP 判据落在同一批文件上。
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise UnsupportedMediaError("解码只接受字节", type=type(data).__name__)
+    buf = bytes(data)
+    lib = _load(path)
+    width, height = ctypes.c_int(), ctypes.c_int()
+    err = ctypes.create_string_buffer(_ERR_LEN)
+    rc = lib.e8_img_size(buf, len(buf), ctypes.byref(width), ctypes.byref(height), err, _ERR_LEN)
+    if rc != 0:
+        reason = err.value.decode("utf-8", "replace")
+        raise UnsupportedMediaError("认不出这张图", reason=reason, bytes=len(buf), rc=int(rc))
+    return width.value, height.value
 
 
 def decode(data: bytes, *, path: str | os.PathLike | None = None) -> np.ndarray:

@@ -40,6 +40,9 @@ _SPLIT_WIDTH = SchedulerConfig().max_len
 _RESIDENT_W = 4
 # 后端不给 `--model` 时的默认家族。mude 维持原样；pooled 只有 h2o。
 _DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o"}
+# 视觉塔的空闲卸载窗口（票据 07 §6 未定项 2 的默认值）。60 s 是"连续几张图算同一批"的量级：
+# 装一次 0.6–2 s、卸一次同样，窗口短于这个数就等于每张图都付两遍。
+_VISION_IDLE = 60.0
 
 
 def _model_flags() -> argparse.ArgumentParser:
@@ -75,6 +78,16 @@ def _model_flags() -> argparse.ArgumentParser:
         help="编译产物的落点（默认平台缓存目录；SYS1_ARTIFACTS_DIR 也会被读到）。"
              "清掉它等于下次启动重编一遍",
     )
+    common.add_argument(
+        "--vision", default="auto", choices=("auto", "off"),
+        help="auto（默认）：模型有塔就收图，第一次带图请求才建塔（0 常驻）；"
+             "off：纯文本服务，不建塔、不读塔权重，收图时 422 并说明原因",
+    )
+    common.add_argument(
+        "--vision-idle", type=float, default=_VISION_IDLE, dest="vision_idle",
+        help=f"视觉塔空闲多少秒后真卸载（默认 {_VISION_IDLE:.0f}；0 = 每请求后立刻卸）。"
+             "卸载是把 26 个 program 卸掉、面释放，不是挂起",
+    )
     return common
 
 
@@ -104,9 +117,14 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--admit-timeout", type=float, default=120.0, help="排队超过这么多秒就 429")
     serve.add_argument("--name", default=None, help="回包里的 model 名（默认模型 id）")
 
-    sub.add_parser(
+    compile = sub.add_parser(
         "compile", parents=[_model_flags()],
         help="按给定形状预编译产物，不起服务（部署时跑一次，之后起服务不必再编）",
+    )
+    compile.add_argument(
+        "--with-vision", action="store_true", dest="with_vision",
+        help="连视觉塔的 26 份产物一起建出来（默认**不**建：塔是按需装载的，"
+             "预编它就是选常驻的语义）。接受不了 `--vision` 这个短名：它已经是能力开关",
     )
 
     doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
@@ -280,6 +298,9 @@ def _artifact_report(
         "directory": str(state.directory),
         "layers": {"reusable": state.hits, "total": state.total},
     }
+    tower = _vision_report(weights, descriptor=plan.descriptor, bucket=s, artifacts=artifacts)
+    if tower is not None:
+        report["vision"] = tower
     if state.missing:
         report["missing_layers"] = list(state.missing)
         report["note"] = (
@@ -288,6 +309,48 @@ def _artifact_report(
         )
     else:
         report["note"] = "全部可复用：起服务时编译段是 0 秒"
+    return report
+
+
+def _vision_report(
+    weights: Path, *, descriptor: ModelDescriptor, bucket: int, artifacts: Path | None
+) -> dict[str, object] | None:
+    """视觉塔在这一份权重上的账：能力表（四条预算）+ 26 份产物命中几个 + 常驻多少字节。
+
+    只读磁盘：`artifact_state` 与装载共用判据，所以这里不会报一个装载不认的"命中"。
+    `bytes` 是**装起来之后**的量（26 份 blob + 一套面），不是现在占着的 —— 塔默认不装。
+    """
+    from .devices.apple import vision as vision_device
+    from .models.vision.contract import image_contract
+    from .weights.checkpoint import open_checkpoint
+
+    if descriptor.vision is None:
+        return {"available": False, "unavailable": "这个模型没有视觉塔"}
+    store = open_checkpoint(weights)
+    try:
+        state = vision_device.artifact_state(store, descriptor=descriptor, s=bucket,
+                                             artifacts_dir=_artifacts_dir(artifacts))
+        # 常驻字节要真装一次才算得准，而 doctor 不该把塔装上（那是"选了常驻"）。所以报的是
+        # 26 份 blob 的和，与 `VisionTower.bytes` 的差值就是那套复用的面（几十 MB 量级）。
+        blobs = sum(
+            (state.directory / name / "weights.bin").stat().st_size
+            for name in ["patch", "merger"] + [f"block{index:02d}" for index in range(int(descriptor.vision.depth))]
+            if (state.directory / name / "weights.bin").is_file()
+        )
+    finally:
+        store.close()
+    report: dict[str, object] = {
+        "available": True,
+        "directory": str(state.directory),
+        "programs": {"reusable": state.hits, "total": state.total},
+        "blob_bytes": blobs,
+        "contract": image_contract(),
+    }
+    if state.missing:
+        report["note"] = (
+            f"第一次带图请求要现编这 {state.missing} 份产物；"
+            "`sysone compile --with-vision` 可以把这一步提前做掉"
+        )
     return report
 
 
@@ -304,7 +367,8 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
             "resident": args.resident or None,
         }
         assembled = assemble(args.weights, name, backend=args.backend,
-                             artifacts_dir=artifacts, **options)
+                             artifacts_dir=artifacts, vision=(args.vision != "off"),
+                             vision_idle=float(args.vision_idle), **options)
         descriptor = assembled.descriptor
         config = EngineConfig(
             model=ModelSelection(name=args.weights.name, dir=args.weights),
@@ -382,11 +446,25 @@ def _compile(args: argparse.Namespace) -> int:
     engine = _build_engine(args, _parse_mode(args.attention_mode))
     try:
         times = engine.start()
+        tower = None
+        if args.with_vision:
+            warm = getattr(engine._runner, "vision_warmup", None)  # noqa: SLF001 - compile 就是"替服务把活干完"
+            if not callable(warm):
+                raise ConfigError("这条装配没有视觉塔，--with-vision 无从做起",
+                                  backend=args.backend, model=args.model)
+            tower = warm()
+            if tower is None:
+                raise ConfigError("视觉被关掉了：--vision off 与 --with-vision 互相矛盾",
+                                  vision=args.vision)
     finally:
         # 这条命令比服务寿命短：退出前把 ANE 程序与表面还回去（不还也只是进程退出）。
         engine.shutdown()
     print(f"sysone compile: {times.total_s:.2f}s{startup_report(times)}")
     print(f"artifacts: {engine.config.storage.resolved_artifacts_dir()}")
+    if tower is not None:
+        programs = tower["programs"]
+        print(f"vision: {programs['reusable']}/{programs['total']} programs, "
+              f"{tower['bytes'] / 1e6:.1f} MB resident (load {tower['load_s']:.2f}s)")
     return 0
 
 

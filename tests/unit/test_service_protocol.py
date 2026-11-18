@@ -127,11 +127,19 @@ def test_parse_request_rejects_fields_outside_the_whitelist() -> None:
     assert "temperature" in info.value.detail
 
 
-def test_parse_request_rejects_media() -> None:
+def test_parse_request_rejects_images_without_a_vision_capability() -> None:
+    """没有视觉的装配：拒收**先于**任何解析，理由是"这条路没有塔"。"""
     with pytest.raises(protocol.Refusal) as info:
         protocol.parse_request(_body(images=["data:image/png;base64,AAAA"]))
     assert info.value.status == 422
-    assert "images" in info.value.detail
+    assert "image inputs are not available" in info.value.detail
+
+
+def test_parse_request_prefers_the_engine_reason_over_a_generic_one() -> None:
+    contract = {"supported": False, "unavailable": "视觉被关掉了：给 --vision auto"}
+    with pytest.raises(protocol.Refusal) as info:
+        protocol.parse_request(_body(images=["data:image/png;base64,AAAA"]), image_contract=contract)
+    assert "视觉被关掉了" in info.value.detail
 
 
 def test_parse_request_rejects_a_non_object_body() -> None:
@@ -394,3 +402,121 @@ def test_payload_is_json_serializable_as_compact_json() -> None:
                                       model_name="mude", wire=wire)
     encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     assert '"model":"mude"' in encoded
+
+
+# ------------------------------------------------------------- 图片（P4 的前门）
+
+def _contract(**overrides: object) -> dict:
+    from sysone.models.vision.contract import image_contract
+
+    contract = image_contract()
+    contract.update(overrides)
+    return contract
+
+
+def _data_url(data: bytes = b"\x89PNG\r\n\x1a\n", subtype: str = "png") -> str:
+    import base64
+
+    return f"data:image/{subtype};base64," + base64.b64encode(data).decode("ascii")
+
+
+def test_images_are_decoded_into_bytes_on_the_request() -> None:
+    payload = b"\x89PNG\r\n\x1a\n real-ish"
+    request, _ = protocol.parse_request(_body(images=[_data_url(payload)]),
+                                       image_contract=_contract())
+    assert len(request.media) == 1
+    ref = request.media[0]
+    assert ref.kind == "image" and ref.data == payload
+
+
+def test_an_empty_image_list_is_the_text_path() -> None:
+    """`images: []` 与不传 `images` 逐字节相同（上游 §D 那条门）。"""
+    plain, _ = protocol.parse_request(_body(), image_contract=_contract())
+    empty, _ = protocol.parse_request(_body(images=[]), image_contract=_contract())
+    assert plain == empty and plain.media == ()
+
+
+def test_images_must_be_a_list_of_data_urls() -> None:
+    """句子与上游 strict mode 一字不差：客户端拿两边的报错写同一份处理。"""
+    for value, expected in (
+        ("data:image/png;base64,AAAA", "images takes a list of base64 data URLs"),
+        ([123], "images[0]: strict mode: images must be given as a data: URL string"),
+        (["/tmp/a.png"], "images[0]: strict mode: images must be given as a data: URL string"),
+        (["data:image/gif;base64,AAAA"], "images[0]: image data URLs take the types"),
+        (["data:image/png;base64,!!!"], "images[0]: the data URL does not hold valid base64"),
+        (["data:image/png,AAAA"], "images[0]: expected a base64 data URL"),
+        (["data:image/png;base64,"], "images[0]: the data URL holds no bytes"),
+    ):
+        with pytest.raises(protocol.Refusal) as caught:
+            protocol.parse_request(_body(images=value), image_contract=_contract())
+        assert caught.value.status == 422
+        assert expected in caught.value.detail, (value, caught.value.detail)
+
+
+def test_an_image_over_the_byte_limit_is_refused_before_decoding() -> None:
+    """8 MB 是**字节**上限：编码长度先拒（`4·ceil(n/3)`），解码后再验一次。"""
+    contract = _contract(max_bytes=4)
+    five = _data_url(b"12345")
+    with pytest.raises(protocol.Refusal) as caught:
+        protocol.parse_request(_body(images=[five]), image_contract=contract)
+    assert "over the 4 byte limit" in caught.value.detail
+    ok = _data_url(b"1234")
+    request, _ = protocol.parse_request(_body(images=[ok]), image_contract=contract)
+    assert request.media[0].data == b"1234"
+
+
+def test_videos_are_refused_with_a_sentence_about_the_missing_path() -> None:
+    with pytest.raises(protocol.Refusal) as caught:
+        protocol.parse_request(_body(videos=[{}]), image_contract=_contract())
+    assert caught.value.status == 422
+    assert caught.value.detail == protocol.VIDEO_UNAVAILABLE
+
+
+def test_a_literal_placeholder_in_the_prompt_is_a_per_question_error() -> None:
+    """写死的 `<|image_pad|>` 会被当成图块：数与图对不上，只能是坏请求。
+
+    上游要的形状是 `{"detail": {"invalid_questions": {...}}}` 且**只点名那一题**。
+    """
+    body = _body(images=[_data_url()])
+    body["questions"]["good"] = {"type": "noul", "instructions": "is it on?"}
+    body["questions"]["risky"] = {"type": "noul",
+                                  "instructions": f"look at {protocol.IMAGE_TOKEN_TEXT}"}
+    with pytest.raises(protocol.Refusal) as caught:
+        protocol.parse_request(body, image_contract=_contract())
+    detail = caught.value.detail
+    assert isinstance(detail, dict) and set(detail["invalid_questions"]) == {"risky"}
+    assert "literal image or video placeholder" in detail["invalid_questions"]["risky"]
+
+
+def test_the_placeholder_rule_only_applies_to_requests_that_carry_images() -> None:
+    """纯文本请求里那个 token 只是"词表里有个词"，协议层不管（带图时才管）。"""
+    body = _body(state=f"the label reads {protocol.IMAGE_TOKEN_TEXT}")
+    request, _ = protocol.parse_request(body, image_contract=_contract())
+    assert request.media == ()
+    assert protocol.IMAGE_TOKEN_TEXT in request.state
+
+
+def test_models_payload_publishes_the_image_contract_only_when_supported() -> None:
+    text_only = protocol.models_payload(model_name="mude", max_input_tokens=16384)
+    assert text_only["models"][0]["modalities"] == ["text"]
+    assert "image" not in text_only["models"][0] and "image_max_pixels" not in text_only["models"][0]
+
+    contract = _contract()
+    vision = protocol.models_payload(model_name="mude", max_input_tokens=16384, contract=contract)
+    entry = vision["models"][0]
+    assert entry["modalities"] == ["text", "image"]
+    assert entry["image_max_pixels"] == contract["max_pixels"]
+    assert entry["image"] == contract
+    # 四个预算是四个不同的数：混成一个的话，客户端会把"会被缩"读成"会被拒"
+    assert contract["min_pixels"] < contract["max_pixels"] < contract["max_source_pixels"]
+    assert contract["max_bytes"] != contract["max_pixels"]
+
+
+def test_health_declares_the_image_modality_from_the_same_contract() -> None:
+    text_only = protocol.health_payload(model_name="mude", max_input_tokens=16, authentication=False)
+    assert text_only["modalities"] == ["text"]
+    health = protocol.health_payload(model_name="mude", max_input_tokens=16, authentication=False,
+                                     modalities=protocol.modalities_of(_contract()))
+    assert health["modalities"] == ["text", "image"]
+    off = _contract(supported=False, unavailable="视觉被关掉了")
+    assert protocol.modalities_of(off) == ["text"]

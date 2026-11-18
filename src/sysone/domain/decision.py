@@ -11,12 +11,17 @@ from .quant import QuantSpec
 
 @dataclass(frozen=True)
 class MediaRef:
-    """图片/视频引用；M0 只记录，不解码（`UnsupportedMediaError`）。"""
+    """一张随请求进来的图：协议层已经校验过的**编码字节**，执行器负责解码。
+
+    `data` 是解码前的原始字节（PNG/JPEG/WebP）。放字节而不是放路径，是因为协议层（唯一
+    知道"data URL"这件事的地方）已经把 8 MB 那条拒收做完了；执行器再拿到一个 locator 去
+    重新读盘，就是第二份解析、第二个失败点。`kind` 留着是因为视频迟早要走同一个字段，
+    而那时"这是图还是视频"必须能判。
+    """
 
     kind: str
-    locator: str
-    width: int = 0
-    height: int = 0
+    data: bytes = b""
+    locator: str = ""
 
 
 @dataclass(frozen=True)

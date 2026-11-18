@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import dataclasses
 import json
 import math
@@ -19,7 +21,8 @@ from http import HTTPStatus
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..domain.attention import MaskMode
-from ..domain.decision import Answer, DecisionRequest, DecisionResult, Question
+from ..domain.decision import Answer, DecisionRequest, DecisionResult, MediaRef, Question
+from ..models.vision.contract import MAX_BYTES
 
 HEALTH_PATH = "/health"
 METRICS_PATH = "/metrics"
@@ -47,7 +50,18 @@ KINDS = ("choice", "noul", "score")
 # noul 的判据键：`{"true": <判据>, "false": <判据>}`（可选，缺省时厂商用默认描述）。
 _NOUL_KEYS = ("true", "false")
 MAX_OPTIONS = 255
-MODALITIES = ["text"]
+
+# `data:image/<subtype>;base64,` 认这几种（上游 `DATA_URL_IMAGE_TYPES`）。
+IMAGE_TYPES = ("png", "jpeg", "jpg", "webp")
+# 占位符的**文字**。id 在 descriptor（`image_token_id`），而协议层拿不到 descriptor —— 这里要
+# 的是"客户端能不能把占位符直接写在正文里"，答案是不行：写了就与真正的图块数对不上。
+# 两个出货 checkpoint 的分词表在这两个 token 上相同（`tests/unit/test_vision_merge.py`
+# 对着真实分词器钉过 id），所以这份常量与 descriptor 的 id 是同一件事的两种写法。
+IMAGE_TOKEN_TEXT = "<|image_pad|>"
+VIDEO_TOKEN_TEXT = "<|video_pad|>"
+
+# 视频没有实现（票据 07 §7.7 的"明确不在这一步里"），所以理由是一句事实而不是一个开关。
+VIDEO_UNAVAILABLE = "video inputs are not available: this engine ships no video path"
 
 
 class Refusal(Exception):
@@ -95,8 +109,14 @@ def parse_body(raw: bytes) -> Any:
         raise unprocessable(f"could not read the body as JSON ({exc})") from exc
 
 
-def parse_request(body: Any) -> tuple[DecisionRequest, tuple[WireQuestion, ...]]:
-    """请求体 → (`DecisionRequest`, 题目线格式)；不合法的题目一次全报出来，什么都不跑。"""
+def parse_request(
+    body: Any, *, image_contract: Mapping[str, Any] | None = None
+) -> tuple[DecisionRequest, tuple[WireQuestion, ...]]:
+    """请求体 → (`DecisionRequest`, 题目线格式)；不合法的题目一次全报出来，什么都不跑。
+
+    `image_contract` 是执行器的能力表（`Engine.vision_unavailable` 那份）。**没有它就不收图**：
+    "能力"不能由协议层猜，猜错的两种错法都是静默的（收下了却没塔、或者有塔却拒了）。
+    """
     if not isinstance(body, dict):
         raise unprocessable('expected a JSON object such as {"questions": {...}, "state": ...}')
     unknown = sorted(set(body) - set(ACCEPTED_FIELDS))
@@ -105,9 +125,11 @@ def parse_request(body: Any) -> tuple[DecisionRequest, tuple[WireQuestion, ...]]
             f"{', '.join(map(repr, unknown))} not understood; a request may carry "
             f"{', '.join(ACCEPTED_FIELDS)}"
         )
-    for name in MEDIA_FIELDS:
-        if body.get(name) is not None:
-            raise unprocessable(f"{name} is not supported: this model answers text only")
+    if body.get("videos") is not None:
+        raise unprocessable(VIDEO_UNAVAILABLE)
+    # 先读图、再读题（上游 `arguments()` 的次序）：坏 data URL 要压过题面里那些问句的错误，
+    # 否则客户端改了一遍题面才看见图是坏的。
+    media = _images(body.get("images"), image_contract=image_contract)
     raw_questions = body.get("questions")
     if not isinstance(raw_questions, dict) or not raw_questions:
         raise unprocessable(
@@ -125,12 +147,85 @@ def parse_request(body: Any) -> tuple[DecisionRequest, tuple[WireQuestion, ...]]
     if errors:
         raise unprocessable({"invalid_questions": errors})
 
+    state = _state_text(body.get("state"))
+    if media:
+        # 带图的请求里，占位符**一个都不许**由用户写出来：我们的渲染器在题面之前按图数拼好
+        # 图块（`MudePrompter._prefix_ids` / `h2o_serve.VISION_BLOCK`），多写一个就与真正的
+        # 图块重叠，`expand_image_tokens` 数出来的占位符数对不上 —— 报错会晚、而且难懂。
+        # 纯文本请求不管这件事：那只是"词表里有这个 token"，不是这层要管的。
+        literal = {
+            item.key: "the state or question contains a literal image or video placeholder token"
+            for item in parsed
+            if IMAGE_TOKEN_TEXT in state + item.question.text
+            or VIDEO_TOKEN_TEXT in state + item.question.text
+        }
+        if literal:
+            raise unprocessable({"invalid_questions": literal})
+
     request = DecisionRequest(
-        state=_state_text(body.get("state")),
+        state=state,
         questions=tuple(item.question for item in parsed),
+        media=media,
         attention_mode=mode,
     )
     return request, tuple(parsed)
+
+
+def _images(value: Any, *, image_contract: Mapping[str, Any] | None) -> tuple[MediaRef, ...]:
+    """`images: [data URL, ...]` → 解码后的字节；每一处拒收都说是第几张、为什么。
+
+    句法对着上游的 strict mode：**只收** `data:image/<png|jpeg|jpg|webp>;base64,`、8 MB 以内、
+    直认的 base64。16 MP 那条在上游是 PIL 读出的尺寸，我们这里在**解码之前**按容器头判
+    （`devices/apple/image.size`）—— 先解码再判等于先把不该解的内存申请下来。
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise unprocessable("images takes a list of base64 data URLs")
+    if not value:
+        return ()
+    unavailable = None if image_contract is None else image_contract.get("unavailable")
+    if image_contract is None or not image_contract.get("supported"):
+        raise unprocessable(f"image inputs are not available: {unavailable or 'no vision tower'}")
+    limit = int(image_contract.get("max_bytes") or MAX_BYTES)
+    out: list[MediaRef] = []
+    for number, item in enumerate(value):
+        try:
+            out.append(MediaRef(kind="image", locator="data-url", data=_data_url(item, limit)))
+        except ValueError as exc:
+            raise unprocessable(f"images[{number}]: {exc}") from exc
+    return tuple(out)
+
+
+def _data_url(value: Any, limit: int) -> bytes:
+    """一个 `data:image/...;base64,` 字符串 → 字节。句法与上限都与上游 strict mode 一致。"""
+    if not isinstance(value, str) or not value.startswith("data:"):
+        raise ValueError(
+            "strict mode: images must be given as a data: URL string, not a file path, "
+            "web address or PIL image"
+        )
+    head, comma, text = value.partition(",")
+    head = head.strip().lower()
+    opening, closing = "data:image/", ";base64"
+    if not comma or not head.startswith(opening) or not head.endswith(closing):
+        raise ValueError("expected a base64 data URL: data:image/<type>;base64,<data>")
+    subtype = head[len(opening):-len(closing)]
+    if subtype not in IMAGE_TYPES:
+        raise ValueError(
+            f"image data URLs take the types {', '.join(IMAGE_TYPES)}, got {subtype!r}"
+        )
+    # 先按长度拒：`4·ceil(n/3)` 是 n 个字节最多能编码出的字符数，读都不必读。
+    if len(text) > 4 * math.ceil(limit / 3):
+        raise ValueError(f"the encoded data exceeds the {limit:,} byte limit")
+    try:
+        data = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("the data URL does not hold valid base64") from exc
+    if len(data) > limit:
+        raise ValueError(f"the decoded data has {len(data):,} bytes, over the {limit:,} byte limit")
+    if not data:
+        raise ValueError("the data URL holds no bytes")
+    return data
 
 
 def _state_text(value: Any) -> str:
@@ -234,27 +329,52 @@ def _no_constants(name: str) -> Any:
 # ---------------------------------------------------------------------- 出
 
 
-def health_payload(*, model_name: str, max_input_tokens: int, authentication: bool) -> dict[str, Any]:
+def image_contract_or_none(engine: Any) -> dict[str, Any] | None:
+    """执行器的能力表；能力齐全时返回字典，否则 `None`（与上游"文本构建没有塔"同形）。"""
+    contract = getattr(engine, "image_contract", None)
+    if not callable(contract):
+        return None
+    return contract()
+
+
+def modalities_of(contract: Mapping[str, Any] | None) -> list[str]:
+    """`["text"]` / `["text", "image"]` —— 与上游 `Decider.modalities()` 同一个判据。"""
+    return ["text", "image"] if contract is not None and contract.get("supported") else ["text"]
+
+
+def health_payload(
+    *, model_name: str, max_input_tokens: int, authentication: bool,
+    modalities: Sequence[str] = ("text",),
+) -> dict[str, Any]:
     return {
         "status": "ready",
         "model": model_name,
         "max_input_tokens": int(max_input_tokens),
-        "modalities": list(MODALITIES),
+        "modalities": list(modalities),
         "authentication": bool(authentication),
     }
 
 
-def models_payload(*, model_name: str, max_input_tokens: int) -> dict[str, Any]:
-    return {
-        "models": [
-            {
-                "name": model_name,
-                "description": DESCRIPTION,
-                "max_input_tokens": int(max_input_tokens),
-                "modalities": list(MODALITIES),
-            }
-        ]
+def models_payload(
+    *, model_name: str, max_input_tokens: int,
+    contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """`/v1/models`：`image_max_pixels` 与上游同名同义，`image` 是那份能力表本身。
+
+    上游只发布 `image_max_pixels` 一个数（`d3_server.py:115`），四个预算里另外三个客户端
+    只能从文档里猜；这里把整张表挂上去。**能力不支持时两个键都不出现** —— 与上游一致，
+    客户端据此可以只看键在不在。
+    """
+    entry: dict[str, Any] = {
+        "name": model_name,
+        "description": DESCRIPTION,
+        "max_input_tokens": int(max_input_tokens),
+        "modalities": modalities_of(contract),
     }
+    if contract is not None and contract.get("supported"):
+        entry["image_max_pixels"] = int(contract["max_pixels"])
+        entry["image"] = dict(contract)
+    return {"models": [entry]}
 
 
 def answer_payload(

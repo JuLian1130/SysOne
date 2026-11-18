@@ -201,6 +201,28 @@ class SplitChain:
         self._width = int(width)
         self._closed = False
 
+    # ------------------------------------------------------------------ 资源
+
+    @property
+    def store(self) -> WeightStore:
+        """这条链打开的权重容器（只读）。视觉塔复用它，不另开一份。"""
+        return self._store
+
+    @property
+    def runtime(self) -> AneRuntime:
+        """这条链的 ANE 句柄。塔的 26 个程序与 20 层文本层共用它（一条固件队列）。"""
+        return self._runtime
+
+    @property
+    def metal_runtime(self) -> object | None:
+        """GPU 运行时；numpy 形态（`metal=False`）时是 `None`，塔的注意力核没有地方跑。"""
+        return self._metal_runtime
+
+    @property
+    def bucket(self) -> int:
+        """ANE program 的列宽（塔的 26 个程序按同一条桶宽编译）。"""
+        return self._s
+
     # ------------------------------------------------------------------ 装载耗时
 
     @property

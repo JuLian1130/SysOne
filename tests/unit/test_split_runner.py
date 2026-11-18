@@ -32,10 +32,23 @@ from sysone.models.families import mude
 from sysone.models.vision import merge
 
 CODES = tuple(f"K{index:03d}" for index in range(mude.CODE_ROWS))
+# 真分词表里那三个特殊 token 的 id（两个出货 checkpoint 相同）。字符级假分词器要像真的一样
+# 把整段特殊文本收成**一个** id，否则"一位图一个占位符"这件事在这里根本表示不出来。
+SPECIAL_TOKENS = (
+    ("<|vision_start|>", 248053),
+    ("<|vision_end|>", 248054),
+    ("<|image_pad|>", 248056),
+)
 
 
 class FakeTokenizer:
-    """字符级假分词器（`token = ord(ch)`）：chat 模板只加定位用的标记，user 内容原样保留。"""
+    """字符级假分词器（`token = ord(ch)`）：chat 模板只加定位用的标记，user 内容原样保留。
+
+    带图时 user 轮是 **content parts**（`[{"type": "image"}, {"type": "text", ...}]`）：真模板
+    （`chat_template.jinja` 的 `render_content`）把每个 image part 渲染成
+    `<|vision_start|><|image_pad|><|vision_end|>`，文字 part 原样拼上 —— 这里照做，否则
+    "带图的前缀量不出来"这类问题在单元测试里根本不会出现。
+    """
 
     def __init__(self) -> None:
         self.chat_calls = 0
@@ -45,11 +58,29 @@ class FakeTokenizer:
         assert add_generation_prompt is True
         assert enable_thinking is False
         self.chat_calls += 1
-        return f"<|system|>{conversation[0]['content']}<|user|>{conversation[1]['content']}<|assistant|>"
+        content = conversation[1]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                "<|vision_start|><|image_pad|><|vision_end|>" if part["type"] == "image"
+                else part["text"]
+                for part in content
+            )
+        return f"<|system|>{conversation[0]['content']}<|user|>{content}<|assistant|>"
 
     def __call__(self, text, *, add_special_tokens):
         assert add_special_tokens is False
-        return {"input_ids": [ord(char) for char in text]}
+        ids: list[int] = []
+        index = 0
+        while index < len(text):
+            for literal, token in SPECIAL_TOKENS:
+                if text.startswith(literal, index):
+                    ids.append(token)
+                    index += len(literal)
+                    break
+            else:
+                ids.append(ord(text[index]))
+                index += 1
+        return {"input_ids": ids}
 
 
 class FakeChain:
@@ -561,3 +592,128 @@ def test_images_are_refused_by_a_model_without_a_tower() -> None:
     with pytest.raises(UnsupportedMediaError):
         runner.answers_for(make_request(questions=1), MaskMode.PREFIX_NONCAUSAL, media=media)
     assert chain.calls == [], "拒收之前不该发生任何前向"
+
+
+# ------------------------------------------------------- 前门那条真路径（P4）
+
+class FakeSlot:
+    """`VisionSlot` 的替身：只回答"被调用了几次、给了什么、收尾了几次"。"""
+
+    def __init__(self, rows: int = 4) -> None:
+        self.rows = rows
+        self.calls: list[object] = []
+        self.finished = 0
+        self.closed = 0
+
+    def media(self, refs):
+        self.calls.append(tuple(refs))
+        return merge.Media(counts=(self.rows,), grids=((2, 2),),
+                           rows=np.zeros((self.rows, 8), np.float32))
+
+    def finish(self) -> None:
+        self.finished += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def warm(self) -> None:
+        self.calls.append("warm")
+
+    def stats(self) -> dict:
+        return {"loaded": bool(self.calls), "bytes": 1, "reuse": [26, 26],
+                "loads": len(self.calls), "unloads": 0, "load_s": 0.0, "idle_s": 60.0,
+                "evals": 0, "ane_ms": 0.0, "gpu_ms": 0.0}
+
+
+def _vision_runner(chain, slot: FakeSlot | None, *, metal: bool = True):
+    """一条"有塔"的装配：`image_token_id` 与工厂都给了，链上挂着 `metal_runtime`。"""
+    prompter, _ = _prompter()
+    if metal:
+        chain.metal_runtime = object()          # 只用来回答"有没有 Metal 运行时"
+    return SplitRunner(lambda: chain, prompter, max_len=4096,
+                       image_token_id=248056,
+                       load_tower=(lambda held: slot) if slot is not None else None)
+
+
+def test_a_tower_less_assembly_refuses_images_with_the_reason() -> None:
+    chain = FakeChain()
+    runner = _vision_runner(chain, None)
+    runner.load_weights()
+    request = make_request(questions=1)
+    object.__setattr__  # noqa: B018 - 只是提醒：DecisionRequest 是 frozen 的
+    request = _with_media(request)
+    with pytest.raises(UnsupportedMediaError) as caught:
+        runner.answers_for(request, MaskMode.PREFIX_NONCAUSAL)
+    assert "--vision" in caught.value.message, caught.value.message
+    assert chain.calls == []
+
+
+def test_request_images_go_through_the_slot_and_are_released_afterwards() -> None:
+    """请求自带的图走真路径：`slot.media(request.media)` → 前向 → `finish()`（TTL 从这儿起算）。"""
+    chain = FakeChain()
+    slot = FakeSlot()
+    runner = _vision_runner(chain, slot)
+    runner.load_weights()
+    request = _with_media(make_request(questions=2))
+    answers, tokens, _ = runner.answers_for(request, MaskMode.PREFIX_NONCAUSAL)
+    assert len(answers) == 2 and tokens > 0
+    assert slot.calls == [(request.media[0],)], "slot 拿到的应当就是请求里那些图"
+    assert slot.finished == 1, "一次请求结束要调 finish（idle = 0 时那就是卸载点）"
+    assert chain.calls, "带图的请求照样要前向"
+
+
+def test_shutdown_closes_the_tower_before_the_chain() -> None:
+    chain = FakeChain()
+    slot = FakeSlot()
+    runner = _vision_runner(chain, slot)
+    runner.load_weights()
+    runner.shutdown()
+    assert slot.closed == 1 and chain.closed is True
+
+
+def test_the_contract_says_which_of_the_four_reasons_applies() -> None:
+    chain = FakeChain()
+
+    text_only = SplitRunner(lambda: chain, _prompter()[0], max_len=4096)
+    text_only.load_weights()
+    assert text_only.vision_unavailable() == "这个模型没有视觉塔，收不了图"
+    assert text_only.image_contract()["supported"] is False
+    assert text_only.image_contract()["unavailable"] == "这个模型没有视觉塔，收不了图"
+
+    switched_off = _vision_runner(chain, None)
+    switched_off.load_weights()
+    assert "--vision" in switched_off.vision_unavailable()
+
+    # 链是 numpy 形态：塔装了也跑不了注意力核
+    numpy_chain = FakeChain()
+    numpy_form = _vision_runner(numpy_chain, FakeSlot(), metal=False)
+    numpy_form.load_weights()
+    assert "Metal" in numpy_form.vision_unavailable()
+
+    ready = _vision_runner(FakeChain(), FakeSlot())
+    ready.load_weights()
+    assert ready.vision_unavailable() is None
+    contract = ready.image_contract()
+    assert contract["supported"] is True and "unavailable" not in contract
+    assert ready.vision_stats()["available"] is True
+
+
+def test_vision_warmup_reports_the_artifacts_of_the_tower() -> None:
+    """`compile --with-vision` 的落地：装上（= 编译产物），报 26 份里命中几个。"""
+    chain = FakeChain()
+    slot = FakeSlot()
+    runner = _vision_runner(chain, slot)
+    runner.load_weights()
+    report = runner.vision_warmup()
+    assert report is not None
+    assert slot.calls == ["warm"]
+    assert report["programs"] == {"reusable": 26, "total": 26}
+    assert SplitRunner(lambda: chain, _prompter()[0], max_len=4096).vision_warmup() is None
+
+
+def _with_media(request, *, data: bytes = b"\x89PNG\r\n\x1a\n"):
+    import dataclasses
+
+    from sysone.domain.decision import MediaRef
+
+    return dataclasses.replace(request, media=(MediaRef(kind="image", data=data),))

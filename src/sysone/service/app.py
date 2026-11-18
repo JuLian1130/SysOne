@@ -47,11 +47,15 @@ def startup_report(times: CompilationTimes | None) -> str:
 
 
 class EngineSource(Protocol):
-    """`EngineDecider` 从引擎要的两件事：跑一道请求、给三层统计。"""
+    """`EngineDecider` 从引擎要的四件事：跑一道请求、三层统计、视觉能力、视觉统计。"""
 
     def run(self, request: DecisionRequest) -> DecisionResult: ...
 
     def stats(self) -> RunStats: ...
+
+    def image_contract(self) -> dict[str, Any] | None: ...
+
+    def vision_stats(self) -> dict[str, Any]: ...
 
 
 class EngineDecider:
@@ -70,11 +74,16 @@ class EngineDecider:
         self.max_input_tokens = int(max_input_tokens)
         self.debug_timings = bool(debug_timings)
 
+    def contract(self) -> dict[str, Any] | None:
+        """执行器收不收图、收的话四条预算是多少（一次问、两处用）。"""
+        return protocol.image_contract_or_none(self.engine)
+
     def health(self, *, authentication: bool) -> dict[str, Any]:
         return protocol.health_payload(
             model_name=self.model_name,
             max_input_tokens=self.max_input_tokens,
             authentication=authentication,
+            modalities=protocol.modalities_of(self.contract()),
         )
 
     def metrics(self) -> dict[str, Any]:
@@ -95,16 +104,20 @@ class EngineDecider:
                 "compile_s": round(stats.startup.compile_s, 3),
                 "warmup_s": round(stats.startup.warmup_s, 3),
             },
+            # 塔在不在、占多少字节、装过几次：`--vision-idle` 卸载之后这里要能看出来回到 0。
+            "vision": self.engine.vision_stats(),
         }
 
     def models(self) -> dict[str, Any]:
         return protocol.models_payload(
-            model_name=self.model_name, max_input_tokens=self.max_input_tokens
+            model_name=self.model_name,
+            max_input_tokens=self.max_input_tokens,
+            contract=self.contract(),
         )
 
     def answer(self, body: Any) -> dict[str, Any]:
         """一次 `/v1/systemone`：解析 → 引擎 → 回包（引擎的异常原样往上抛）。"""
-        request, wire = protocol.parse_request(body)
+        request, wire = protocol.parse_request(body, image_contract=self.contract())
         result = self.engine.run(request)  # type: ignore[attr-defined]
         return protocol.answer_payload(
             result,

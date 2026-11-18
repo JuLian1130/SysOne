@@ -28,17 +28,23 @@
 from __future__ import annotations
 
 import itertools
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
-from ...errors import NotReadyError
+from ...errors import NotReadyError, UnsupportedMediaError
 from ...models.descriptor import ModelDescriptor, VisionSpec
+from ...models.vision import contract as vision_contract
+from ...models.vision import merge
+from ...models.vision import preprocess
 from ...weights import vision as vw
 from ...weights.checkpoint import WeightStore
 from ...weights.packing.ane_blob import build as build_blob
+from . import image
 from . import vision_plan as vp
 from .chain import _artifacts_root, _program_root
 from .compile import ProgramFiles, cached_program, write_program
@@ -256,28 +262,8 @@ class VisionTower:
         return surfaces
 
     def _source(self, kind: str, index: int | None = None) -> dict:
-        """产物的身份：权重容器指纹 + 塔的形状 + 桶宽 + 是哪一份。**
-
-        `cached_program` 只比这个字典，不比哈希（那是缓存要省掉的那一段），所以凡是会改变产物
-        的输入都得进来 —— 尤其是**塔的形状**：同一份 `family-model` 目录下换了 config 的检查点
-        不能认领彼此的产物。
-        """
-        spec = self.spec
-        return {
-            "weights": self.store.fingerprint(),
-            "kind": kind,
-            "index": index,
-            "s": self.s,
-            "hidden": spec.hidden,
-            "ffn": spec.intermediate_size,
-            "depth": spec.depth,
-            "heads": spec.num_heads,
-            "patch": spec.patch_size,
-            "merge": spec.spatial_merge,
-            "temporal": spec.temporal_patch_size,
-            "out_hidden": spec.out_hidden_size,
-            "pos": spec.num_position_embeddings,
-        }
+        """产物的身份 —— 与 `artifact_state` 是同一个函数（`doctor` 报的命中率不能与装载分家）。"""
+        return _identity(self.store, self.spec, self.s, kind, index)
 
     def _assemble(self, name: str, directory: Path, source: dict,
                   io: dict[str, tuple[int, int, int, int]],
@@ -469,3 +455,239 @@ class VisionTower:
         for surface in self._surfaces.values():
             surface.free()
         self._surfaces.clear()
+
+
+# ------------------------------------------------------------------ 生命周期
+
+
+@dataclass(frozen=True)
+class VisionArtifacts:
+    """塔的产物在磁盘上的状态（不装载、不碰 ANE，`doctor` 用）。"""
+
+    directory: Path
+    hits: int
+    total: int
+
+    @property
+    def missing(self) -> int:
+        return self.total - self.hits
+
+
+def artifact_state(
+    store: WeightStore, *, descriptor: ModelDescriptor, s: int,
+    artifacts_dir: str | Path | None = None,
+) -> VisionArtifacts:
+    """这份权重在 `artifacts_dir` 里已经有哪些塔的产物：判据与装载**完全相同**。
+
+    与 `chain.artifact_state` 同一个形态、同一个理由：`doctor` 说"全命中"而装载照样重编，
+    这个报告就没有意义了。所以身份字典由塔自己在构造时用的那一份（`_identity`）算，
+    这里只读磁盘。
+    """
+    spec = descriptor.vision
+    if spec is None:
+        raise NotReadyError("这个模型没有视觉塔", model=descriptor.model_id)
+    kinds: list[tuple[str, int | None]] = [("patch", None), ("merger", None)]
+    kinds += [("block", index) for index in range(int(spec.depth))]
+    directory = _program_root(_artifacts_root(artifacts_dir), descriptor, s=int(s)) / "vision"
+    hits = 0
+    for kind, index in kinds:
+        name = f"block{index:02d}" if kind == "block" else kind
+        source = _identity(store, spec, int(s), kind, index)
+        if cached_program(directory / name, source=source, s=int(s)) is not None:
+            hits += 1
+    return VisionArtifacts(directory=directory, hits=hits, total=len(kinds))
+
+
+def _identity(store: WeightStore, spec: VisionSpec, s: int, kind: str,
+              index: int | None) -> dict:
+    """一份塔产物的身份：权重容器指纹 + 塔的形状 + 桶宽 + 是哪一份。
+
+    `cached_program` 只比这个字典，不比哈希（那是缓存要省掉的那一段），所以凡是会改变产物
+    的输入都得进来 —— 尤其是**塔的形状**：同一份 `family-model` 目录下换了 config 的检查点
+    不能认领彼此的产物。
+    """
+    return {
+        "weights": store.fingerprint(),
+        "kind": kind,
+        "index": index,
+        "s": s,
+        "hidden": spec.hidden,
+        "ffn": spec.intermediate_size,
+        "depth": spec.depth,
+        "heads": spec.num_heads,
+        "patch": spec.patch_size,
+        "merge": spec.spatial_merge,
+        "temporal": spec.temporal_patch_size,
+        "out_hidden": spec.out_hidden_size,
+        "pos": spec.num_position_embeddings,
+    }
+
+
+class VisionSlot:
+    """懒加载 + 空闲卸载：**注册了但没常驻 = 0 内存**（票据 07 §2.5 #5.1–#5.5）。
+
+    两条都不是风格，是旧引擎量出来的：
+
+    * **"挂起"省不了内存**（627.6 MB 里只还 20–56 MB，§4.12）⇒ 这里只有"装"和"真卸载"；
+      卸载就是 `VisionTower.close()`：26 个 program 卸掉、面释放。
+    * **不预热**（`e8e-service-plan.md` T6）⇒ 第一次带图请求才建塔。启动时就把塔装上等于选了
+      常驻，0 常驻的契约当场作废。
+
+    `idle` 秒之后没有新请求就卸（`threading.Timer`，到点先查"最近一次使用"再决定，所以并发
+    请求不会把一个正在跑的塔卸掉）。`idle = 0` 表示"每次请求之后立刻卸"，那是 `finish()`
+    的事 —— 一次请求里有几张图时不该装一次卸一次。
+
+    **塔不是可重入的**（一套复用的面、一份 GPU 缓冲），所以 `encode` 全程持锁：这条路径本来
+    就受 ANE 那条固件队列的串行约束，锁只是把"必须串行"这件事写明。
+    """
+
+    def __init__(self, build: "callable", *, spec: VisionSpec, idle: float = 60.0) -> None:
+        if idle < 0:
+            raise ValueError(f"空闲卸载的秒数不能为负：{idle}")
+        self._build = build
+        # 规格在这里而不是在塔上取：`media()` 要用它跑像素管线，而那时塔可能还没装
+        # （`--vision-idle 0` 的请求之间塔是不在的）。
+        self._spec = spec
+        self._idle = float(idle)
+        self._tower: VisionTower | None = None
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._last_use = 0.0
+        self._loads = 0
+        self._unloads = 0
+        self._load_s = 0.0
+        self._evals = 0
+        self._ane_ms = 0.0
+        self._gpu_ms = 0.0
+
+    # -- 装载与卸载 ----------------------------------------------------------
+    def warm(self) -> VisionTower:
+        """只装不跑：`sysone compile --vision` 用它把 26 份产物提前建出来。"""
+        with self._lock:
+            return self._ensure()
+
+    def _ensure(self) -> VisionTower:
+        if self._tower is None:
+            started = time.perf_counter()
+            tower = self._build()
+            self._load_s = time.perf_counter() - started
+            self._tower = tower
+            self._loads += 1
+        self._last_use = time.monotonic()
+        return self._tower
+
+    def _drop(self) -> None:
+        tower, self._tower = self._tower, None
+        if tower is not None:
+            tower.close()
+            self._unloads += 1
+
+    def _arm(self) -> None:
+        """按"现在"重排一次卸载计时；`idle = 0` 不排（卸载在 `finish()` 里）。"""
+        if self._idle <= 0.0:
+            return
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            timer = threading.Timer(self._idle, self._fire)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def _fire(self) -> None:
+        with self._lock:
+            if self._tower is None:
+                return
+            if time.monotonic() - self._last_use < self._idle:
+                # 期间又被用过：那一次的 `_arm()` 已经排了新的计时器。
+                return
+            self._drop()
+
+    def finish(self) -> None:
+        """一次请求的收尾：`idle = 0` 时立刻卸，其它情况等计时器。"""
+        if self._idle <= 0.0:
+            with self._lock:
+                self._drop()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._drop()
+
+    # -- 跑 ------------------------------------------------------------------
+    def encode(self, img: np.ndarray) -> np.ndarray:
+        with self._lock:
+            tower = self._ensure()
+            before = (tower.stats["evals"], tower.stats["ane_ms"], tower.stats["gpu_ms"])
+            rows = tower.encode(img)
+            after = (tower.stats["evals"], tower.stats["ane_ms"], tower.stats["gpu_ms"])
+            self._evals += after[0] - before[0]
+            self._ane_ms += after[1] - before[1]
+            self._gpu_ms += after[2] - before[2]
+            self._last_use = time.monotonic()
+        self._arm()
+        return rows
+
+    def media(self, refs: Sequence[object]) -> merge.Media:
+        """一次请求的图片 → `Media`：解码、16 MP 的拒收、像素管线、塔、行数与合并网格。
+
+        错误一律带 `images[i]:` 前缀（与上游 `load_images` 同一句法）：客户端要知道是第几张
+        坏，而不是"你这批图有问题"。
+        """
+        spec = self._spec
+        counts: list[int] = []
+        grids: list[tuple[int, int]] = []
+        blocks: list[np.ndarray] = []
+        unit = int(spec.spatial_merge)
+        for index, ref in enumerate(refs):
+            data = getattr(ref, "data", b"")
+            if not isinstance(data, (bytes, bytearray, memoryview)) or not data:
+                raise UnsupportedMediaError(
+                    f"images[{index}]: 这一项没有解码后的字节", length=len(data or b""))
+            try:
+                width, height = image.size(bytes(data))
+            except UnsupportedMediaError as exc:
+                raise UnsupportedMediaError(
+                    f"images[{index}]: {exc.message}", **exc.context) from exc
+            if width * height > vision_contract.MAX_SOURCE_PIXELS:
+                raise UnsupportedMediaError(
+                    f"images[{index}]: the image has {width * height:,} pixels; "
+                    f"at most {vision_contract.MAX_SOURCE_PIXELS:,} are accepted",
+                    width=width, height=height)
+            try:
+                rgb = image.decode(bytes(data))
+            except UnsupportedMediaError as exc:
+                raise UnsupportedMediaError(
+                    f"images[{index}]: {exc.message}", **exc.context) from exc
+            pixels, grid = preprocess.prepare(rgb, spec=spec)
+            # `prepare` 给的是 patch 网格；`Media` 要的是**合并之后**的网格（厂商同口径）。
+            gh, gw = int(grid[0, 1]) // unit, int(grid[0, 2]) // unit
+            if gh * gw < 1:
+                raise UnsupportedMediaError(
+                    f"images[{index}]: 缩到 {pixels.shape[1]}×{pixels.shape[0]} 之后连一个合并块都没有",
+                    shape=list(pixels.shape), merge=unit)
+            counts.append(gh * gw)
+            grids.append((gh, gw))
+            blocks.append(np.asarray(self.encode(pixels)))
+        return merge.Media(counts=tuple(counts), grids=tuple(grids),
+                           rows=np.concatenate(blocks).astype(np.float16))
+
+    # -- 观测 ----------------------------------------------------------------
+    def stats(self) -> dict:
+        with self._lock:
+            tower = self._tower
+            return {
+                "loaded": tower is not None,
+                "bytes": 0 if tower is None else int(tower.bytes),
+                "reuse": [0, 0] if tower is None else list(tower.reuse),
+                "loads": self._loads,
+                "unloads": self._unloads,
+                "load_s": round(self._load_s, 3),
+                "idle_s": self._idle,
+                # 这三个是**累计**的（塔卸载之后也还在），否则 `/metrics` 会把历史抹掉。
+                "evals": self._evals,
+                "ane_ms": round(self._ane_ms, 3),
+                "gpu_ms": round(self._gpu_ms, 3),
+            }

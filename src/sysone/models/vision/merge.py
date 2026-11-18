@@ -30,9 +30,14 @@ import numpy as np
 class Media:
     """一次请求的图像侧：塔已经算完，这里只记"产了几行 + 网格多大"。
 
-    `counts[i]` 是第 i 张图交给文本栈的行数（`gh*gw/merge²`），`grids[i]` 是它在**合并之后**的
+    `counts[i]` 是第 i 张图交给文本栈的行数（`gh*gw`），`grids[i]` 是它在**合并之后**的
     `(gh, gw)`。两者都要：行数说"展开成几个占位符"，网格说"这些占位符在图上怎么摆" —— 后者
     推不出来（`n = gh*gw` 有无穷多组解，而且 6 个 token 可能是一行六列也可能是一列六行）。
+
+    **网格是合并之后的**，与厂商 `grid_thw[1] // spatial_merge_size` 同口径。传合并**之前**的
+    patch 网格也"跑得通"（`gh*gw > n`，位置表截前 n 个），只是每个 token 的行列号是错的 ——
+    所以 `__post_init__` 要求 `gh*gw == counts[i]` 恰好相等。P3 的门与一条集成用例当时都传了
+    patch 网格，两边互相印证，读数却是假的（票据 07 §7.4c）。
     """
 
     counts: tuple[int, ...]
@@ -46,6 +51,12 @@ class Media:
                 f"counts 与 grids 条数不一致：{len(self.counts)} vs {len(self.grids)}")
         if not self.counts:
             raise ValueError("Media 至少要有 1 张图")
+        for index, (rows, grid) in enumerate(zip(self.counts, self.grids)):
+            gh, gw = (int(value) for value in grid)
+            if gh * gw != int(rows):
+                raise ValueError(
+                    f"第 {index} 张图：网格 {gh}×{gw} = {gh * gw} 行，counts 却说 {rows} 行；"
+                    "grids 是**合并之后**的网格（厂商 grid_thw 除以 spatial_merge_size）")
         given = sum(self.counts)
         if self.rows.shape[0] != given:
             raise ValueError(
@@ -134,9 +145,13 @@ def mrope_positions(
             continue
         n = int(counts[index])
         gh, gw = (int(value) for value in grids[index])
-        if gh * gw < n:
-            raise ValueError(f"第 {index} 张图：网格 {gh}×{gw} = {gh * gw} 行 < {n}")
-        grid = np.indices((1, gh, gw)).reshape(3, -1)[:, :n] + start
+        if gh * gw != n:
+            # 截断是最坏的一种"宽容"：patch 网格（gh*gw = 4n）会照常算出 n 个位置，只是每个
+            # token 的行列号都错 —— P3 的门这样过了（票据 07 §7.4c）。
+            raise ValueError(
+                f"第 {index} 张图：网格 {gh}×{gw} = {gh * gw} 行 ≠ counts 的 {n} 行；"
+                "grids 是**合并之后**的网格（厂商 grid_thw 除以 spatial_merge_size）")
+        grid = np.indices((1, gh, gw)).reshape(3, -1) + start
         positions[:, out:out + n] = grid
         out += n
         start = int(grid.max()) + 1

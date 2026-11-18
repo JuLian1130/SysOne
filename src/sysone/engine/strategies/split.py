@@ -15,6 +15,7 @@ from typing import Callable, Protocol, Sequence
 from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest, Question
 from ...domain.work import CompilationTimes
+from .vision import VisionRunner
 from ...errors import (
     ConfigError,
     NotReadyError,
@@ -64,11 +65,16 @@ class Prompter(Protocol):
     ) -> tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]: ...
 
 
-class SplitRunner:
+class SplitRunner(VisionRunner):
     """实现 `ModelRunner` 的 split 路径：一题一次整链前向。
 
     `load_chain` 延迟到 `load_weights()` 才调用，所以构造它不碰 ANE；`max_len` 是链的
     缓冲宽度（prompt 超过它就是 422，而不是让链里抛裸 `ValueError`）。
+
+    `load_tower` 是视觉塔的工厂（`chain → VisionSlot`）：塔要复用链已经打开的权重容器与
+    运行时（第二个 `AneRuntime` 能建、但第二个 `MetalRuntime` 会按另一套几何编译失败），
+    所以它必须等到 `load_weights()` 之后才能调。`None` 表示这条装配不做图（`--vision off`，
+    或者模型本身没有塔）。
     """
 
     def __init__(
@@ -78,6 +84,7 @@ class SplitRunner:
         *,
         max_len: int,
         image_token_id: int | None = None,
+        load_tower: Callable[[object], object] | None = None,
     ) -> None:
         if max_len < 1:
             raise ConfigError("max_len 必须为正", max_len=max_len)
@@ -87,6 +94,8 @@ class SplitRunner:
         # 占位 token 的 id 来自 descriptor（`image_token_id`）。没有任何模型的 `validate()`
         # 允许"带塔却不说 id"，所以这里的 `None` 只出现在纯文本装配里。
         self._image_token = image_token_id
+        self._load_tower = load_tower
+        self._vision: object | None = None
         self._chain: ModelChain | None = None
         self._warm_ok = False
 
@@ -98,6 +107,8 @@ class SplitRunner:
 
     def load_weights(self) -> None:
         self._chain = self._load_chain()
+        if self._load_tower is not None:
+            self._vision = self._load_tower(self._chain)
 
     def artifact_bytes(self) -> int:
         """编译产物落在链自己的 scratch 目录；这里不计（产物预算默认不设上限）。"""
@@ -122,6 +133,7 @@ class SplitRunner:
         raise ConfigError("split 策略按请求整批执行，不走单题 execute")
 
     def shutdown(self) -> None:
+        self._release_vision()
         if self._chain is not None:
             self._chain.close()
             self._chain = None
@@ -134,11 +146,17 @@ class SplitRunner:
     ) -> tuple[tuple[Answer, ...], int, float]:
         """一次请求内的所有题：返回 (答案元组, 输入 token 数, 前向耗时)。
 
-        一个请求里所有题共享同一个 `state`，所以前缀天然相同：**两题以上**且链提供共享路径
-        时，前缀只算一遍、每题只跑自己那条尾巴（`SplitRunner._answer_shared`）。只有一题、
-        或分词边界让某题的前缀与别人不同、或链是 numpy 形态（没有零拷贝流水线）时，退回
-        逐题整趟。两条路径的答案在这套实现里应当逐位相同（信息量守恒，不做近似）。
+        `media` 是给门与替身用的旁路：给了就原样用。**请求自带的图**（`request.media`）在这里
+        走真路径 —— 解码、像素管线、塔、`Media` —— 然后与 `media=` 那条路汇合。两条都在
+        同一个 `finally` 里释放塔（`idle = 0` 时"每请求后即卸"就是靠它）。
         """
+        if media is None and request.media:
+            return self._answers_with_images(request, mode)
+        return self._answers(request, mode, media)
+
+    def _answers(
+        self, request: DecisionRequest, mode: MaskMode, media: object | None
+    ) -> tuple[tuple[Answer, ...], int, float]:
         chain = self._require_chain()
         if mode not in _SUPPORTED_MODES:
             raise UnsupportedModeError(
@@ -155,10 +173,9 @@ class SplitRunner:
         started = time.perf_counter()
         images = 0 if media is None else int(media.images)
         if images and self._image_token is None:
-            # 没有视觉塔的模型（纯文本装配，或者 `--vision off` 的进程）收到图：这是**请求**的
-            # 问题，不是我们的配置坏了 —— 客户端据此知道不要重试。前门（P4）会先用
-            # `image_contract` 拒一次，这里是最后一道，不能让 `image_token_id=None` 变成一个
-            # 诡异的"占位符数不对"。
+            # 图块没有 token id 的模型（纯文本装配）收到图：这是**请求**的问题，不是我们的配置
+            # 坏了 —— 客户端据此知道不要重试。前门会先用 `image_contract()` 拒一次，这里是最后
+            # 一道，不能让 `image_token_id=None` 变成一个诡异的"占位符数不对"。
             raise UnsupportedMediaError("这个模型没有视觉塔，收不了图", images=images)
         # 先把所有题编码完：共享前缀要先知道每题的尾巴，长度检查也按整条 prompt 做。
         encoded: list[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]] = []
@@ -320,6 +337,8 @@ def mude_runner(
     quantize: bool = True,
     scratch_dir: str | Path | None = None,
     resident: int | None = None,
+    vision: bool | None = None,
+    vision_idle: float = 60.0,
 ) -> SplitRunner:
     """装一条 mude split 链：分词器 + 回答码 + ANE/Metal 链。
 
@@ -328,6 +347,10 @@ def mude_runner(
 
     `resident` 是待命常驻的层数，`None` 表示全装；窗口的具体病理见
     `devices/apple/residency.py`（它是这张卡上最大的一笔内存，所以由调用方决定让不让）。
+
+    `vision` 是 `None`（自动：有塔且图能解就收图）/ `False`（`--vision off`：纯文本服务，
+    不建塔、不读塔权重）。`vision_idle` 是塔的空闲卸载秒数（`0` = 每请求后即卸）。**都不预热**：
+    建塔发生在第一次带图请求（`VisionSlot`）。
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
@@ -357,8 +380,24 @@ def mude_runner(
             resident=resident,
         )
 
+    def load_tower(chain: object) -> object:
+        # 塔复用链已经打开的权重容器与两个运行时：`MetalRuntime` 是进程单例、按几何编译，
+        # 塔再要一份的话，先建塔后建链（或反过来）会让第二次构造撞上"已经按另一套几何编译过"。
+        from ...devices.apple.vision import VisionSlot, VisionTower
+
+        slot = VisionSlot(
+            lambda: VisionTower(store=chain.store, descriptor=weights.descriptor,  # type: ignore[attr-defined]
+                                s=bucket_width, runtime=chain.runtime,           # type: ignore[attr-defined]
+                                metal=chain.metal_runtime,                       # type: ignore[attr-defined]
+                                artifacts_dir=scratch_dir),
+            spec=weights.descriptor.vision,
+            idle=vision_idle,
+        )
+        return slot
+
+    load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
     return SplitRunner(load_chain, prompter, max_len=buffer_width,
-                       image_token_id=weights.descriptor.image_token_id)
+                       image_token_id=weights.descriptor.image_token_id, load_tower=load)
 
 
 def _load_tokenizer(model_dir: str | Path) -> object:

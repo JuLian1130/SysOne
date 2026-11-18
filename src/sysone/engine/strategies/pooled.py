@@ -34,6 +34,7 @@ from ...errors import (
 from ...models.vision import merge
 from ...models.vendors.base import question_spec
 from ...models.vendors.h2o_serve import Prepared, Serve
+from .vision import VisionRunner
 
 # h2o 训练过两种读法、也只声明了两种：整段因果，或整段双向（没有 prefix 语义）。
 _SUPPORTED_MODES = (MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL)
@@ -51,7 +52,7 @@ class PooledChain(Protocol):
     def close(self) -> None: ...
 
 
-class PooledRunner:
+class PooledRunner(VisionRunner):
     """实现 `ModelRunner` 的 pooled 路径：一题一次整链前向 + 一次标签行读出。
 
     `rows` 把"标签 token id"换成"词表里的那几行"（tied 模型上就是 `embed_tokens`），由调用
@@ -66,6 +67,7 @@ class PooledRunner:
         *,
         max_len: int,
         image_token_id: int | None = None,
+        load_tower: Callable[[object], object] | None = None,
     ) -> None:
         if max_len < 1:
             raise ConfigError("max_len 必须为正", max_len=max_len)
@@ -74,6 +76,10 @@ class PooledRunner:
         self._rows = rows
         self._max_len = int(max_len)
         self._image_token = image_token_id
+        # 视觉塔的工厂（`chain → VisionSlot`）：塔要复用链的权重容器与运行时，所以只能在
+        # `load_weights()` 之后建。`None` 表示这条装配不做图（`--vision off` 或没有塔）。
+        self._load_tower = load_tower
+        self._vision: object | None = None
         self._chain: PooledChain | None = None
         self._load_s = 0.0
         self._warm_ok = False
@@ -86,6 +92,8 @@ class PooledRunner:
     def load_weights(self) -> None:
         started = time.perf_counter()
         self._chain = self._load_chain()
+        if self._load_tower is not None:
+            self._vision = self._load_tower(self._chain)
         self._load_s = time.perf_counter() - started
 
     def artifact_bytes(self) -> int:
@@ -121,6 +129,7 @@ class PooledRunner:
         raise ConfigError("pooled 策略按请求整批执行，不走单题 execute")
 
     def shutdown(self) -> None:
+        self._release_vision()
         if self._chain is not None:
             self._chain.close()
             self._chain = None
@@ -130,7 +139,18 @@ class PooledRunner:
     def answers_for(
         self, request: DecisionRequest, mode: MaskMode, *, media: object | None = None
     ) -> tuple[tuple[Answer, ...], int, float]:
-        """一次请求内的所有题：返回 (答案元组, 输入 token 数, 读出耗时)。"""
+        """一次请求内的所有题：返回 (答案元组, 输入 token 数, 读出耗时)。
+
+        `media` 是给门与替身用的旁路；**请求自带的图**（`request.media`）走真路径（解码 →
+        像素管线 → 塔 → `Media`），两条路在 `_answers` 汇合。
+        """
+        if media is None and request.media:
+            return self._answers_with_images(request, mode)
+        return self._answers(request, mode, media)
+
+    def _answers(
+        self, request: DecisionRequest, mode: MaskMode, media: object | None
+    ) -> tuple[tuple[Answer, ...], int, float]:
         chain = self._require_chain()
         if mode not in _SUPPORTED_MODES:
             raise UnsupportedModeError(
@@ -211,6 +231,8 @@ def h2o_runner(
     tokenizer: object | None = None,
     metal: bool = True,
     resident: int | None = None,
+    vision: bool | None = None,
+    vision_idle: float = 60.0,
 ) -> PooledRunner:
     """装一条 h2o 的 pooled 链：厂商答面 + 词表行按需取 + ANE 链。
 
@@ -225,6 +247,10 @@ def h2o_runner(
     `resident` 是待命常驻的层数（`None` = 32 层全装）。h2o 的 32 层 blob 合计 ≈3.33 GiB，
     是这条链最大的一笔常驻；给 4 就是"一个块"，换窗代价见票据 15 §25。它只在 `metal=True`
     时才有意义（窗口是流水线的机制），`metal=False` 传它会退化成"全装"。
+
+    `vision` 是 `None`（自动）/ `False`（`--vision off`，纯文本服务：不建塔、不读塔权重）。
+    h2o 的塔与 mude **同一套几何**，只差 merger 的输出宽度（2560 vs 2048），所以这里不需要
+    第二份实现；`vision_idle` 是塔的空闲卸载秒数（`0` = 每请求后即卸）。
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
@@ -264,8 +290,21 @@ def h2o_runner(
     def rows(label_ids: Sequence[int]) -> np.ndarray:
         return np.asarray(store.read_rows(embed_name, list(label_ids)), np.float32)
 
+    def load_tower(chain: object) -> object:
+        from ...devices.apple.vision import VisionSlot, VisionTower
+
+        return VisionSlot(
+            lambda: VisionTower(store=chain.store, descriptor=weights.descriptor,  # type: ignore[attr-defined]
+                                s=bucket_width, runtime=chain.runtime,           # type: ignore[attr-defined]
+                                metal=chain.metal_runtime,                       # type: ignore[attr-defined]
+                                artifacts_dir=scratch_dir),
+            spec=weights.descriptor.vision,
+            idle=vision_idle,
+        )
+
+    load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
     return PooledRunner(load_chain, serve, rows, max_len=buffer_width,
-                        image_token_id=weights.descriptor.image_token_id)
+                        image_token_id=weights.descriptor.image_token_id, load_tower=load)
 
 
 __all__ = ["PooledRunner", "h2o_runner"]
