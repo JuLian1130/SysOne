@@ -1,8 +1,8 @@
 // 视觉塔的非因果注意力：`k_vattn`。
 //
 // 与文本的 `k_attn` 不是同一个核：视觉是 head_dim 64（不是 `E8_HEAD_DIM` 256）、16 头对 16 头
-// （没有 GQA 的 kv 头）、**非因果**、无 mask、无 gate、无环。q/k 的轴向 RoPE 已经在 host 上做完
-// （`vision.py::rope_qk` 把 cos/sin 乘进 q、k 的通道），所以这个核只做 softmax(QKᵀ)·V。
+// （没有 GQA 的 kv 头）、**非因果**、无 mask、无 gate、无环。q/k 的轴向 RoPE 由同一文件里的
+// `k_vrope` 先做完（原地作用在通道主序的 `[q | k | v]` 上），所以这个核只做 softmax(QKᵀ)·V。
 //
 // ---------------------------------------------------------------------------------------
 // 形态（P2.d）：一个线程组管 **64 列 query × 1 个头**，键按 32 一档
@@ -287,3 +287,58 @@ kernel void k_vattn(device const half  *qkv    [[buffer(0)]],
 #undef VA_SM1
 #undef VA_SM2
 #undef VA_STORE
+
+// ---------------------------------------------------------------------------------------
+// k_vrope: axial RoPE over q|k, in place, on the channel-major `[q | k | v]` buffer
+// ---------------------------------------------------------------------------------------
+// 这里不再是文本的 `k_q_prep` / `k_kv_prep` 那件事：文本的 rope 叠在环形槽位的列号上、只转
+// `E8_ROTARY_DIM` 维；视觉的是整图一次、按 (行, 列) 两个轴算角度、配对是 `(d, d + head_dim/2)`
+// 而不是相邻两维，而且没有 gate、没有环。旧引擎把这步放在 GPU 上（`mx_rot` 作用在已上传的
+// `(heads, L, dim)`）；我们原来放在主机上（`vision.py::rope_qk`），量到占整图 33–39 %
+// （票据 07 §7.8），所以搬到这里。
+//
+// 形态：一格 128 线程管**一个通道对**、扫 512 列
+//   * 通道对序号 u ∈ [0, hidden)：`seg = u / (hidden/2)`（0 = q、1 = k）、`p = u % (hidden/2)`、
+//     `h = p / (dim/2)`、`k = p % (dim/2)`；行号 `seg·hidden + h·dim + k`，配对行 `+dim/2`。
+//   * 一格里按 grid-stride 扫 512 列：同一行的 32 个连续列落在 32 个连续 lane 上，所以
+//     `row[t]`（每行沿 token 连续）与转置过的 `cos[k][t]` 都是 64 B 一条的合并读写。
+//
+// 数值：与 `rope_qk` 的 numpy 算式逐运算对应 —— 四个乘各舍入一次，再减/加各一次，最后落 f16。
+// `#pragma clang fp contract(off)` 把"不折 fma"写死，不靠编译器的默认值：本机去掉它也是逐位
+// 相同（A/B 过），但那是这份编译器的默认，不是 MSL 的保证；折了就会在最后一位上与主机不同。
+// 判据是 `tests/integration/test_metal_kernels.py::test_vision_rope_matches_host_bitwise`。
+#define VR_ITER  4u                       // 一格扫过的列数 = ntg * VR_ITER（与 `kernels.vrope` 对齐）
+
+struct VRopeArgs {
+    uint T;       // 0  每通道列数（qkv 的 stride，也是列总数）
+    uint hidden;  // 1  q 的通道数（k 同）
+    uint dim;     // 2  head_dim（偶数：配对是 (k, k + dim/2)）
+};
+
+kernel void k_vrope(device half       *qkv  [[buffer(0)]],
+                    device const half *cosb [[buffer(1)]],
+                    device const half *sinb [[buffer(2)]],
+                    constant VRopeArgs &a   [[buffer(E8_ARGS_INDEX)]],
+                    uint2 tgid [[threadgroup_position_in_grid]],
+                    uint2 tid2 [[thread_position_in_threadgroup]],
+                    uint2 ntg2 [[threads_per_threadgroup]]) {
+    const uint T = a.T, HID = a.hidden, D = a.dim, H = D >> 1;
+    const uint u = tgid.y, tid = tid2.x, ntg = ntg2.x;
+    if (u >= HID) return;
+    const uint seg = u / (HID >> 1), p = u % (HID >> 1);
+    const uint k = p % H, hd = p / H;
+    device half *lo = qkv + ((ulong)seg * HID + (ulong)hd * D + k) * T;
+    device half *hi = lo + (ulong)H * T;
+    const device half *tc = cosb + (ulong)k * T;
+    const device half *ts = sinb + (ulong)k * T;
+    const uint base = tgid.x * (ntg * VR_ITER);
+    for (uint t = base + tid; t < base + ntg * VR_ITER && t < T; t += ntg) {
+#pragma clang fp contract(off)
+        const float x0 = float(lo[t]), x1 = float(hi[t]);
+        const float c = float(tc[t]), s = float(ts[t]);
+        const float a0 = x0 * c, a1 = x1 * s;          // 各舍入一次
+        const float b0 = x1 * c, b1 = x0 * s;
+        lo[t] = half(a0 - a1);
+        hi[t] = half(b0 + b1);
+    }
+}

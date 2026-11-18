@@ -48,7 +48,7 @@ from . import image
 from . import vision_plan as vp
 from .chain import _artifacts_root, _program_root
 from .compile import ProgramFiles, cached_program, write_program
-from .kernels import vattn
+from .kernels import vattn, vrope
 from .metal import MetalRuntime
 from .runtime import AneRuntime, Surface
 
@@ -128,6 +128,10 @@ def rope_qk(qkv: np.ndarray, cos: np.ndarray, sin: np.ndarray, *,
     `(d, d + head_dim/2)` 配对：`out[d] = x[d]·cos[d] - x[d+½]·sin[d]`、
     `out[d+½] = x[d+½]·cos[d] + x[d]·sin[d]`。cos/sin 的两半相同，所以一对抽头共用一个角 ——
     这正是厂商 `recomposition_frequencies` 里那次 `cat` 的含义。
+
+    **这不是执行路径**：`encode` 用 GPU 上的 `kernels.vrope`（同一算式，逐位对齐）。这份主机实现
+    留着当参考，是 `tests/unit/test_vision_image.py`（对厂商 `rotate_half`）与
+    `tests/integration/test_metal_kernels.py`（对核）两条判据的 oracle。
     """
     half = head_dim // 2
     heads = hidden // head_dim
@@ -245,7 +249,6 @@ class VisionTower:
             ("hidden_in", self.hidden),
             ("qkv", 3 * self.hidden),
             ("attn", 2 * self.hidden),
-            ("p1o", self.hidden),
             ("hidden_out", self.hidden),
             ("m1o", self.ffn),
             ("m2o", self.out_hidden),
@@ -311,8 +314,7 @@ class VisionTower:
         return self._assemble(
             f"{self._header}_block_{index:02d}", self.directory / f"block{index:02d}",
             self._source("block", index), io, build,
-            {"main": ("hidden_in", "qkv"), "p1": ("attn", "p1o"),
-             "p2": ("p1o", "hidden_out")},
+            {"main": ("hidden_in", "qkv"), "p1": ("attn", "hidden_out")},
         )
 
     def _build_merger(self) -> _Program:
@@ -367,21 +369,30 @@ class VisionTower:
                 self._call(self._programs["patch"], "main")
                 residual[lo:lo + n] = self._take(self._programs["patch"], "main", n).T + pos[lo:lo + n]
 
-            # 2) 24 个 block：每层先把整图的 qkv 收齐，注意力按**整图**算，再分趟喂回去
-            qkv = np.empty((3 * self.hidden, length), np.float16)
+            # 2) 24 个 block：每层先把整图的 qkv 收齐，注意力按**整图**算，再分趟喂回去。
+            # q、k 的轴向 RoPE 在 GPU 上做（`k_vrope`），所以主机上不再需要那块整宽数组：每个瓦片
+            # 的 ANE 输出直接写进 device buffer 的对应列。这不是"把同一份工作挪个地方"——
+            # 主机上那趟是 25 MB 的 f32 重写（rope 占整图 33–39 %），设备上只多一次 25 MB 的读写。
+            # 实测 512² 395 → 239 ms、1024² 1 872 → 1 243 ms（票据 07 §7.9）。
             qkv_dev = self.metal.alloc(3 * self.hidden * length * 2)
             ctx_dev = self.metal.alloc(self.hidden * length * 2)
+            half_dim = self.head_dim // 2
+            cos_dev = self.metal.alloc(half_dim * length * 2)
+            sin_dev = self.metal.alloc(half_dim * length * 2)
             try:
                 qkv_view = qkv_dev.array(np.float16, (3 * self.hidden, length))
                 ctx_view = ctx_dev.array(np.float16, (self.hidden, length))
+                # 转置成 `(½dim, L)`：核里一格的 32 个 lane 读同一行 `k` 的 32 个连续 token
+                cos_dev.array(np.float16, (half_dim, length))[...] = cos16[:, :half_dim].T
+                sin_dev.array(np.float16, (half_dim, length))[...] = sin16[:, :half_dim].T
                 for index in range(int(spec.depth)):
                     block = self._programs[f"block{index:02d}"]
                     for lo, n in self._tiles(length):
                         self._put("hidden_in", self.hidden, residual[lo:lo + n].T)
                         self._call(block, "main")
-                        qkv[:, lo:lo + n] = self._take(block, "main", n)
-                    rope_qk(qkv, cos16, sin16, hidden=self.hidden, head_dim=self.head_dim)
-                    qkv_view[...] = qkv
+                        qkv_view[:, lo:lo + n] = self._take(block, "main", n)
+                    vrope(self.metal, qkv_dev, cos_dev, sin_dev, T=length,
+                          hidden=self.hidden, dim=self.head_dim)
                     vattn(self.metal, qkv_dev, ctx_dev, T=length, nq=length,
                           hidden=self.hidden, dim=self.head_dim, scale=self.scale)
                     self.stats["gpu_ms"] += self.metal.sync()
@@ -389,12 +400,11 @@ class VisionTower:
                         attn = self._view("attn", 2 * self.hidden)
                         attn[:self.hidden, :n] = ctx_view[:, lo:lo + n]
                         attn[self.hidden:, :n] = residual[lo:lo + n].T
-                        self._call(block, "p1")
-                        self._call(block, "p2")          # 读 `p1o`、写 `hidden_out`
-                        residual[lo:lo + n] = self._take(block, "p2", n).T
+                        self._call(block, "p1")          # proj → 残差 → norm2 → FFN → 残差
+                        residual[lo:lo + n] = self._take(block, "p1", n).T
             finally:
-                qkv_dev.free()
-                ctx_dev.free()
+                for dev in (qkv_dev, ctx_dev, cos_dev, sin_dev):
+                    dev.free()
 
             # 3) merger：每趟把 2×2 合成 4·hidden，再 fc1 → gelu → fc2
             merged = np.empty((length // self.unit, self.out_hidden), np.float16)
@@ -500,15 +510,16 @@ def artifact_state(
 
 def _identity(store: WeightStore, spec: VisionSpec, s: int, kind: str,
               index: int | None) -> dict:
-    """一份塔产物的身份：权重容器指纹 + 塔的形状 + 桶宽 + 是哪一份。
+    """一份塔产物的身份：权重容器指纹 + 塔的形状 + 桶宽 + 段数 + 是哪一份。
 
     `cached_program` 只比这个字典，不比哈希（那是缓存要省掉的那一段），所以凡是会改变产物
     的输入都得进来 —— 尤其是**塔的形状**：同一份 `family-model` 目录下换了 config 的检查点
-    不能认领彼此的产物。
+    不能认领彼此的产物。`procs` 同理：段名决定面槽位，三段与两段的产物互相认领会绑错面。
     """
     return {
         "weights": store.fingerprint(),
         "kind": kind,
+        "procs": "+".join(sorted(vp.PROCS)),
         "index": index,
         "s": s,
         "hidden": spec.hidden,

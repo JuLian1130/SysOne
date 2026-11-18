@@ -28,8 +28,8 @@ from ...weights.packing.ane_blob import BlobEntry
 from .compile import _conv, _func, _program, _slice
 
 
-# procedure 名 -> 序号：`main` < `p1` < `p2` 的字典序正好是 0/1/2（见模块 docstring）。
-PROCS = {"main": 0, "p1": 1, "p2": 2}
+# procedure 名 -> 序号：`main` < `p1` 的字典序正好是 0/1（见模块 docstring）。
+PROCS = {"main": 0, "p1": 1}
 
 
 @dataclass(frozen=True)
@@ -51,9 +51,8 @@ def patch_io(*, cin: int, hidden: int, s: int) -> dict[str, tuple[int, int, int,
 
 
 def block_io(*, hidden: int, ffn: int, s: int) -> dict[str, tuple[int, int, int, int]]:
-    """一个 block 三个 procedure 的面尺寸（见 `block_plan` 的说明）。"""
-    return {"main": (hidden, s, 3 * hidden, s), "p1": (2 * hidden, s, hidden, s),
-            "p2": (hidden, s, hidden, s)}
+    """一个 block 两个 procedure 的面尺寸（见 `block_plan` 的说明）。"""
+    return {"main": (hidden, s, 3 * hidden, s), "p1": (2 * hidden, s, hidden, s)}
 
 
 def merger_io(*, hidden: int, ffn: int, out_hidden: int, s: int
@@ -80,12 +79,16 @@ def patch_plan(*, hidden: int, s: int, entries: dict[str, np.ndarray],
 
 def block_plan(*, hidden: int, ffn: int, s: int, entries: dict[str, np.ndarray],
                blob: dict[str, BlobEntry]) -> ProgramPlan:
-    """一个视觉 block 的线性半边（三段，注意力在 GPU 上）：
+    """一个视觉 block 的线性半边（两段，注意力在 GPU 上）：
 
     - `main`：`norm1` → `qkv`(+bias)，出口是 `[3·hidden]`（q/k/v 还没切）；
-    - `p1`：入口是 `[attn_ctx | residual]`（两段不同，所以要分开切片）→ `proj`(+bias) → 加残差；
-    - `p2`：`norm2` → `fc1`(+bias) → gelu → `fc2`(+bias) → 加残差。这一段的残差就是 `norm2`
-      读的那块（`h + mlp(norm2(h))`），所以不需要第二张切片。
+    - `p1`：入口是 `[attn_ctx | residual]`（两段不同，所以要分开切片）→ `proj`(+bias) → 加残差
+      → `norm2` → `fc1`(+bias) → gelu → `fc2`(+bias) → 再加一次残差。第二段的残差就是 `norm2`
+      读的那块（`h + mlp(norm2(h))`），所以只需要一次加法，不需要第二张切片。
+
+    这两段原来各是一次 eval（`p1`/`p2`），中间过一张 `hidden × s` 的面。合成一段省掉的是每次
+    tile 一次 eval 加一次面的往返，代价是同一趟里两段矩阵乘互相争用（旧引擎 §4.19 量到
+    +0.30 ms/eval，而 1024² 整图省下 96 次 eval，见票据 07 §7.10）。
 
     视觉的每个 `nn.Linear` 都带 bias（文本层不带，所以 `_conv` 那里是对的、这里必须补）。
     """
@@ -98,23 +101,21 @@ def block_plan(*, hidden: int, ffn: int, s: int, entries: dict[str, np.ndarray],
     body1 += _slice("sr", begin=hidden, size=hidden, s=s, src="x", out="r")
     body1 += _conv("o", cin=hidden, cout=hidden, s=s, entry=blob["proj"], src="v", out="ov")
     body1 += _bias("o", c=hidden, s=s, src="ov", out="ovb", entry=blob["proj_b"])
-    body1.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> y = add(x = ovb, y = r)'
-                 f'[name = string("y")];')
-
-    body2 = _layernorm("n2", c=hidden, s=s, src="x", out="xn",
-                       gamma=blob["n2_g"], beta=blob["n2_b"])
-    body2 += _conv("u", cin=hidden, cout=ffn, s=s, entry=blob["fc1"], src="xn", out="gt")
-    body2 += _bias("u", c=ffn, s=s, src="gt", out="gtb", entry=blob["fc1_b"])
-    body2 += _gelu(c=ffn, s=s, src="gtb", out="ga")
-    body2 += _conv("d", cin=ffn, cout=hidden, s=s, entry=blob["fc2"], src="ga", out="yb")
-    body2 += _bias("d", c=hidden, s=s, src="yb", out="ybb", entry=blob["fc2_b"])
-    body2.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> y = add(x = ybb, y = x)'
+    body1.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> h = add(x = ovb, y = r)'
+                 f'[name = string("h")];')
+    body1 += _layernorm("n2", c=hidden, s=s, src="h", out="xn",
+                        gamma=blob["n2_g"], beta=blob["n2_b"])
+    body1 += _conv("u", cin=hidden, cout=ffn, s=s, entry=blob["fc1"], src="xn", out="gt")
+    body1 += _bias("u", c=ffn, s=s, src="gt", out="gtb", entry=blob["fc1_b"])
+    body1 += _gelu(c=ffn, s=s, src="gtb", out="ga")
+    body1 += _conv("d", cin=ffn, cout=hidden, s=s, entry=blob["fc2"], src="ga", out="yb")
+    body1 += _bias("d", c=hidden, s=s, src="yb", out="ybb", entry=blob["fc2_b"])
+    body1.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> y = add(x = ybb, y = h)'
                  f'[name = string("y")];')
 
     mil = _program([
         _func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x", body=body0),
         _func("p1", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x", body=body1),
-        _func("p2", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x", body=body2),
     ])
     return ProgramPlan(mil=mil, io=block_io(hidden=hidden, ffn=ffn, s=s))
 

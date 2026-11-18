@@ -59,8 +59,9 @@ def test_tower_shape_repeat_and_reuse(tmp_path: Path) -> None:
         assert first.dtype == np.float16
         second = tower.encode(image)
         assert np.array_equal(first, second), "同一张图两次调用的结果不是逐位相同"
-        # 一次前向的 eval 次数是固定的：patch 1 + 24×3 + merger 2 = 75（分趟时按趟乘）
-        assert tower.stats["evals"] == 150, tower.stats
+        # 一次前向的 eval 次数是固定的：patch 1 + 24×2 + merger 2 = 51（分趟时按趟乘）。
+        # 24 层每层两次，不是三次：`proj → 残差 → norm2 → FFN → 残差` 在同一段里（票据 07 §7.10）。
+        assert tower.stats["evals"] == 102, tower.stats
     finally:
         tower.close()
 

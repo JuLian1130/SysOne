@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sysone.devices.apple import kernels
+from sysone.devices.apple import kernels, vision
 from sysone.devices.apple.chain import _rope_table
 from sysone.devices.apple.metal import MetalRuntime
 from sysone.devices.apple.ops import apply_rotary, attention, rms_norm, sigmoid
@@ -527,3 +527,63 @@ def test_vision_attention_rejects_other_head_dims(runtime: MetalRuntime) -> None
     finally:
         qbuf.free()
         obuf.free()
+
+
+@pytest.mark.parametrize(("T", "dim", "hidden"), [
+    (25, 64, 1024),      # 一格都没填满：尾列与 grid-stride 的守卫
+    (300, 64, 1024),     # 640×480 的图（30×20 的 patch 网格）
+    (513, 64, 1024),     # 跨出第一格（512 列）一列
+    (1024, 64, 1024),    # 512² 的真实形状
+])
+def test_vision_rope_matches_host_bitwise(runtime: MetalRuntime, T: int, dim: int,
+                                          hidden: int) -> None:
+    """`k_vrope` 与 `vision.py::rope_qk` **逐位**相同。
+
+    判据是逐位、不是 relL2：两边都是「四个乘各舍入一次、一减一加、最后落 f16」，核里关掉了
+    fma 合并。只要有一位不同，就说明编译器把乘加折了，或者配对/转置写错了 —— 这两种错都不会
+    被 5e-3 的容差拦下来（配对写反时 relL2 只有 0.5 量级，而容差是 5e-3，拦得住；但 f32→f16
+    的最后一位不同拦不住，而它恰恰是"逐位对齐主机"这个约定的全部内容）。
+    """
+    half = dim // 2
+    rng = np.random.default_rng(11)
+    qkv = (rng.standard_normal((3 * hidden, T)) * 0.6).astype(np.float16)
+    rows = np.arange(T) // 32
+    cols = np.arange(T) % 32
+    cos, sin = vision.rope_tables(rows, cols, head_dim=dim, theta=1e4)
+    cos16, sin16 = cos.astype(np.float16), sin.astype(np.float16)
+
+    want = vision.rope_qk(qkv.copy(), cos16, sin16, hidden=hidden, head_dim=dim)
+
+    qbuf = runtime.alloc(qkv.nbytes)
+    cbuf = runtime.alloc(half * T * 2)
+    sbuf = runtime.alloc(half * T * 2)
+    try:
+        qbuf.array(np.float16, qkv.shape)[:] = qkv
+        cbuf.array(np.float16, (half, T))[...] = cos16[:, :half].T
+        sbuf.array(np.float16, (half, T))[...] = sin16[:, :half].T
+        kernels.vrope(runtime, qbuf, cbuf, sbuf, T=T, hidden=hidden, dim=dim)
+        runtime.commit()
+        runtime.wait()
+        got = qbuf.array(np.float16, qkv.shape).copy()
+    finally:
+        for buf in (qbuf, cbuf, sbuf):
+            buf.free()
+
+    bad = np.argwhere(got != want)
+    assert bad.size == 0, (f"k_vrope 与主机 rope 不是逐位相同：{bad.shape[0]} 处不同，"
+                           f"第一处 {bad[0].tolist() if bad.size else '-'}")
+    assert (got[2 * hidden:] == qkv[2 * hidden:]).all(), "v 段不该被碰"
+
+
+def test_vision_rope_rejects_bad_geometry(runtime: MetalRuntime) -> None:
+    """核按 `dim/2` 配对、按 `dim` 切头：奇数 dim 或除不尽的通道数要当场拒绝。"""
+    qbuf = runtime.alloc(3 * 1024 * 16 * 2)
+    cbuf = runtime.alloc(8 * 16 * 2)
+    sbuf = runtime.alloc(8 * 16 * 2)
+    try:
+        for hidden, dim in ((1024, 63), (1000, 64)):
+            with pytest.raises(NotReadyError):
+                kernels.vrope(runtime, qbuf, cbuf, sbuf, T=16, hidden=hidden, dim=dim)
+    finally:
+        for buf in (qbuf, cbuf, sbuf):
+            buf.free()

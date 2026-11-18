@@ -31,6 +31,7 @@ __all__ = [
     "norm_to",
     "q_prep",
     "vattn",
+    "vrope",
 ]
 
 # ---- 几何（默认 = mude 2B，与 e8_common.h:52-67 的默认宏一致）------------------------------
@@ -61,6 +62,7 @@ _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
 _ATTN = struct.Struct("<IIIfIIIIIIIIIIIIII")  # struct AttnArgs，72 B
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
 _VATTN = struct.Struct("<IIIIIf")  # struct VAttnArgs，24 B
+_VROPE = struct.Struct("<III")  # struct VRopeArgs，12 B
 
 
 def nrm_args(
@@ -145,6 +147,11 @@ def vattn_args(
     没有槽位：`T`/`nq`/`s0` 是 qkv 与 out 的列布局，`hidden`/`dim` 是通道布局，`scale` 是 1/√d。
     """
     return _VATTN.pack(T, nq, s0, hidden, dim, scale)
+
+
+def vrope_args(*, T: int, hidden: int, dim: int) -> bytes:
+    """`k_vrope`（`shaders/e8_vattn.metal`）：列数/stride、q 的通道数、head_dim（偶数）。"""
+    return _VROPE.pack(T, hidden, dim)
 
 
 def gdn_args(
@@ -472,6 +479,44 @@ def attention(
     )
 
 
+_VROPE_TG = 128      # `k_vrope` 的线程数
+_VROPE_ITER = 4      # 一格扫过的列数 = `_VROPE_TG * _VROPE_ITER`（核里的 `VR_ITER`）
+
+
+def vrope(
+    runtime: MetalRuntime,
+    qkv: MetalBuffer,
+    cos: MetalBuffer,
+    sin: MetalBuffer,
+    *,
+    T: int,
+    hidden: int,
+    dim: int,
+    lane: int = LANE_LONG,
+) -> None:
+    """视觉塔的轴向 RoPE：把 `qkv` 前 `2·hidden` 行（q、k）按整图**原地**转过去。
+
+    `cos`/`sin` 是**转置**过的 `(dim/2, T)` fp16：沿 token 连续，一格里的 32 个 lane 才读得成
+    一条合并访问。核看不出这个轴，所以形状是调用方的约定（`vision.py::encode` 负责转置）。
+
+    数值与 `vision.py::rope_qk` 逐位相同：四个乘各舍入一次，核里再用
+    `#pragma clang fp contract(off)` 把"不折 fma"写死（不靠编译器的默认值）。
+    """
+    if dim < 2 or dim % 2:
+        raise NotReadyError("视觉 rope 的 head_dim 必须是正偶数", dim=dim)
+    if hidden % dim:
+        raise NotReadyError("视觉 rope 的通道数必须是 head_dim 的整数倍", hidden=hidden, dim=dim)
+    span = _VROPE_TG * _VROPE_ITER
+    runtime.dispatch(
+        "k_vrope",
+        [qkv, cos, sin],
+        args=vrope_args(T=T, hidden=hidden, dim=dim),
+        grid=((T + span - 1) // span, hidden, 1),
+        tg=(_VROPE_TG, 1, 1),
+        lane=lane,
+    )
+
+
 def vattn(
     runtime: MetalRuntime,
     qkv: MetalBuffer,
@@ -487,7 +532,7 @@ def vattn(
 ) -> None:
     """视觉塔的非因果注意力：`qkv` 依次是 `[q | k | v]` 各 `hidden` 行，结果写 `out` 的前 `hidden` 行。
 
-    q/k 的轴向 RoPE 由调用方先做完（`vision.py::rope_qk`）：核不读 cos/sin，所以它只是
+    q/k 的轴向 RoPE 由调用方先做完（`vrope`，见它的 docstring）：核不读 cos/sin，所以它只是
     softmax(QKᵀ)·V —— 给定 q/k 之后，注意力本身没有别的约定。
     一格管 **64 列 query × 一个头**：`grid = (ceil(nq/64), hidden//dim)`、`tg = (256)`，键按
     32 一档。`nq` 不是 64 的倍数时，最后一格只写前 `nq % 64` 列；`s0 + nq <= T` 是调用方的

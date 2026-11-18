@@ -44,7 +44,7 @@ def test_procedure_names_sort_in_execution_order() -> None:
     """
     names = sorted(vp.PROCS, key=vp.PROCS.get)
     assert names == sorted(vp.PROCS), "PROCS 的序号不是按名字的字典序排的"
-    assert vp.PROCS == {"main": 0, "p1": 1, "p2": 2}
+    assert vp.PROCS == {"main": 0, "p1": 1}
 
 
 def test_patch_program_declares_what_the_plan_allocates() -> None:
@@ -64,15 +64,17 @@ def test_block_program_declares_what_the_plan_allocates() -> None:
     )
     blob, table = _blob(entries)
     plan = vp.block_plan(hidden=HIDDEN, ffn=FFN, s=S, entries=entries, blob=table)
-    # p1 的入口是 `[attn_ctx | residual]`：两段各 HIDDEN 行、两段不同所以不能共用一张面。
+    # p1 的入口是 `[attn_ctx | residual]`：两段各 HIDDEN 行、两段不同所以不能共用一张面；
+    # proj 之后的 norm2+FFN 与它在同一段里（`h` 是这一段的残差），所以只有两段。
     assert plan.io == {"main": (HIDDEN, S, 3 * HIDDEN, S),
-                       "p1": (2 * HIDDEN, S, HIDDEN, S),
-                       "p2": (HIDDEN, S, HIDDEN, S)}
-    assert _func_inputs(plan.mil) == {"main": (HIDDEN, S), "p1": (2 * HIDDEN, S),
-                                     "p2": (HIDDEN, S)}
+                       "p1": (2 * HIDDEN, S, HIDDEN, S)}
+    assert _func_inputs(plan.mil) == {"main": (HIDDEN, S), "p1": (2 * HIDDEN, S)}
     # 出口宽度也要与声明一致：`y` 是每个 func 的返回值。
-    for cout in (3 * HIDDEN, HIDDEN, HIDDEN):
+    for cout in (3 * HIDDEN, HIDDEN):
         assert f"tensor<fp16, [1, {cout}, 1, {S}]> y = " in plan.mil
+    # 两段各自只加一次残差：p1 里 `h = proj_out + r`、`y = fc2_out + h`。
+    assert 'add(x = ovb, y = r)' in plan.mil
+    assert 'add(x = ybb, y = h)' in plan.mil
 
 
 def test_merger_changes_width_inside_one_procedure() -> None:
