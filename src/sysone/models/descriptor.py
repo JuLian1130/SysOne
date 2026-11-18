@@ -57,13 +57,30 @@ class ReadoutPlan:
 
 @dataclass(frozen=True)
 class VisionSpec:
-    """视觉塔的几何（M0 只记录，不加载）。"""
+    """视觉塔的几何（只记录，不加载）。
+
+    `out_hidden_size` 是塔交给文本栈的宽度，与文本的 `hidden` 是**两份契约**：mude 两者都是
+    2048、h2o 两者都是 2560，只是碰巧相等 —— 按"塔宽 = 文本 hidden"写，第三个模型就会错。
+
+    `rope_type` / `rope_theta` 记的是厂商 `Qwen3_5VisionConfig` 的轴向 RoPE 约定（两个出货
+    模型都是 `axial` / θ=1e4）；h2o 的 `vision_config` 没有 `rope_parameters` 段，这两项就是
+    厂商默认值，不是猜的。
+    """
 
     model_type: str
     depth: int = 0
     hidden: int = 0
     patch_size: int = 0
     spatial_merge: int = 2
+    intermediate_size: int = 0
+    num_heads: int = 0
+    out_hidden_size: int = 0
+    temporal_patch_size: int = 0
+    # `sqrt(num_position_embeddings)` 是 pos_embed 表的边长（两个出货模型都是 48，表
+    # `(2304, 1024)`）：表按 `align_corners=True` 插值到每张图的 `(gh, gw)` 网格。
+    num_position_embeddings: int = 0
+    rope_theta: float = 10000.0
+    rope_type: str = "axial"
 
 
 @dataclass(frozen=True)
@@ -105,6 +122,17 @@ class ModelDescriptor:
     mtp_layers: int = 0
     rms_eps: float = 1e-6
     vision: VisionSpec | None = None
+    # 多模态合流要的三样：占位 token 的 id（好在题面里认出 `<|vision_start|>…<|vision_end|>`
+    # 那一段），与 M-RoPE 的频率分段。纯文本模型留 `None`。
+    image_token_id: int | None = None
+    video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
+    # M-RoPE：`rope_parameters.mrope_section` 把旋转的频率轴切成三段（时间/行/列），三段之和
+    # 等于 `rotary_dim / 2`；`mrope_interleaved=True` 时三轴按 `i % 3` 交错排布（Qwen3.5 就是
+    # 这种），否则三段连续。合流时按这份约定拼表（票据 07 §7.4）。
+    mrope_section: tuple[int, ...] | None = None
+    mrope_interleaved: bool = False
 
     def validate(self) -> None:
         """结构自检；不做"参数猜谜"，只查能让引擎崩掉的不一致。
@@ -145,6 +173,42 @@ class ModelDescriptor:
                     missing=missing,
                     hint="家族 parser 要从 config 的 linear_num_key_heads / linear_key_head_dim / "
                          "linear_num_value_heads / linear_value_head_dim 填这四项",
+                )
+        if self.vision is not None:
+            # 带塔却说不出占位 token 的 id，合流时只能靠猜：猜窄了少画图片，猜宽了把文本
+            # 也盖掉。与前面对线性层几何的态度一致 —— 缺就报错，不填默认值。
+            missing = [
+                name
+                for name in (
+                    "image_token_id",
+                    "video_token_id",
+                    "vision_start_token_id",
+                    "vision_end_token_id",
+                    "mrope_section",
+                )
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ConfigError(
+                    "模型带视觉塔，descriptor 却没带合流需要的 id 或 M-RoPE 分段",
+                    missing=missing,
+                    hint="家族 parser 要从 config 顶层的 image_token_id / video_token_id / "
+                         "vision_start_token_id / vision_end_token_id 与 "
+                         "text_config.rope_parameters.mrope_section 填这五项",
+                )
+            # 分段之和就是频率轴的一半（rotary_dim = head_dim × partial_rotary_factor）。
+            # 不等说明分段与旋转维度对不上：合流时会把行轴的频率灌进列轴，错得很安静。
+            if len(self.mrope_section) != 3:  # type: ignore[arg-type]
+                raise ConfigError(
+                    "mrope_section 必须是三段（时间/行/列）",
+                    mrope_section=list(self.mrope_section),  # type: ignore[arg-type]
+                )
+            half = int(self.head_dim * self.partial_rotary_factor) // 2
+            if sum(self.mrope_section) != half:  # type: ignore[arg-type]
+                raise ConfigError(
+                    "mrope_section 之和与 rotary_dim/2 不一致",
+                    mrope_section=list(self.mrope_section),  # type: ignore[arg-type]
+                    rotary_half=half,
                 )
         if not self.supported_modes:
             raise ConfigError("supported_modes 不能为空")
@@ -193,6 +257,12 @@ class ModelDescriptor:
                 "temperature": self.readout.temperature,
                 "dtype": self.readout.dtype.value,
             },
+            "image_token_id": self.image_token_id,
+            "video_token_id": self.video_token_id,
+            "vision_start_token_id": self.vision_start_token_id,
+            "vision_end_token_id": self.vision_end_token_id,
+            "mrope_section": list(self.mrope_section) if self.mrope_section else None,
+            "mrope_interleaved": self.mrope_interleaved,
             "vision": (
                 None
                 if self.vision is None
@@ -200,8 +270,15 @@ class ModelDescriptor:
                     "model_type": self.vision.model_type,
                     "depth": self.vision.depth,
                     "hidden": self.vision.hidden,
+                    "intermediate_size": self.vision.intermediate_size,
+                    "num_heads": self.vision.num_heads,
+                    "out_hidden_size": self.vision.out_hidden_size,
                     "patch_size": self.vision.patch_size,
                     "spatial_merge": self.vision.spatial_merge,
+                    "temporal_patch_size": self.vision.temporal_patch_size,
+                    "num_position_embeddings": self.vision.num_position_embeddings,
+                    "rope_theta": self.vision.rope_theta,
+                    "rope_type": self.vision.rope_type,
                 }
             ),
         }
@@ -253,6 +330,13 @@ class ModelDescriptor:
                 hidden=int(vision_raw.get("hidden", 0)),
                 patch_size=int(vision_raw.get("patch_size", 0)),
                 spatial_merge=int(vision_raw.get("spatial_merge", 2)),
+                intermediate_size=int(vision_raw.get("intermediate_size", 0)),
+                num_heads=int(vision_raw.get("num_heads", 0)),
+                out_hidden_size=int(vision_raw.get("out_hidden_size", 0)),
+                temporal_patch_size=int(vision_raw.get("temporal_patch_size", 0)),
+                num_position_embeddings=int(vision_raw.get("num_position_embeddings", 0)),
+                rope_theta=float(vision_raw.get("rope_theta", 10000.0)),
+                rope_type=str(vision_raw.get("rope_type", "axial")),
             )
         return cls(
             family=str(data["family"]),
@@ -281,6 +365,12 @@ class ModelDescriptor:
             mtp_layers=int(data.get("mtp_layers", 0)),
             rms_eps=float(data.get("rms_eps", 1e-6)),
             vision=vision,
+            image_token_id=_opt_int(data.get("image_token_id")),
+            video_token_id=_opt_int(data.get("video_token_id")),
+            vision_start_token_id=_opt_int(data.get("vision_start_token_id")),
+            vision_end_token_id=_opt_int(data.get("vision_end_token_id")),
+            mrope_section=_opt_ints(data.get("mrope_section")),
+            mrope_interleaved=bool(data.get("mrope_interleaved", False)),
         )
 
 
@@ -300,3 +390,9 @@ def _opt_labels(value: object) -> tuple[str, ...] | None:
     if value is None:
         return None
     return tuple(str(item) for item in value)  # type: ignore[union-attr]
+
+
+def _opt_ints(value: object) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    return tuple(int(item) for item in value)  # type: ignore[union-attr]

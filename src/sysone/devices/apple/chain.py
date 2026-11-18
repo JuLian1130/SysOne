@@ -76,8 +76,27 @@ def _rope_table(theta: float, s: int, rotary_dim: int) -> tuple[np.ndarray, np.n
     文本 RoPE 的 cos/sin 两个半区相同（`Qwen3_5TextRotaryEmbedding` 里 `cat(freqs, freqs)`），
     而 `ops.apply_rotary` 按前半/后半配对，所以这里只留前一半的频率。
     """
+    return _rope_positions(theta, np.arange(s), rotary_dim)
+
+
+def _rope_positions(theta: float, positions: np.ndarray, rotary_dim: int
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """任意位置的 RoPE 正余弦表，各 `[T, rotary_dim/2]`。
+
+    `positions` 现在是一维 `(T,)`：一个 token 一个位置。带图时位置变成 `(3, T)`（时间/行/列
+    三组，再按 `mrope_section` 交错拼频率），那段与 `mrope_positions` 一起归合流（票据 07
+    §7.4）—— 现在收到非一维会明确报错，而不是拿时间轴顶替三组轴（那会让所有行/列的位置
+    退化成同一个，图看着能跑、注意力其实是错的）。
+    """
+    positions = np.asarray(positions, dtype=np.float64)
+    if positions.ndim != 1:
+        raise NotReadyError(
+            "M-RoPE 的三轴位置表还没接",
+            positions=tuple(positions.shape),
+            hint="视觉合流（票据 07 §7.4）落地时按 mrope_section 拼频率；纯文本只用 (T,)",
+        )
     frequencies = theta ** (-np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim)
-    angles = np.arange(s, dtype=np.float64)[:, None] * frequencies[None, :]
+    angles = positions[:, None] * frequencies[None, :]
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
 
 
@@ -342,9 +361,24 @@ class SplitChain:
             raise ValueError(f"prefix 必须在 0..{length}，收到 {prefix}")
         return ids, length
 
+    def _embeddings(self, ids: np.ndarray, mm: object | None = None) -> np.ndarray:
+        """token id → `[len(ids), hidden]` 的输入嵌入。
+
+        这是文本栈与视觉塔之间的**唯一接缝**：纯文本时就是码表查行；带图时 `mm` 覆盖
+        `<|image_pad|>` 那几行（票据 07 §7.4）。合流还没接，所以真的带了 `mm` 就地报错 ——
+        悄悄忽略它会让图"进去过"，注意力却按占位 token 自己那份 embedding 跑。
+        """
+        if mm is not None:
+            raise NotReadyError(
+                "图像合流还没接",
+                hint="视觉塔与前门落地之前，链只吃纯文本（票据 07 §7.3–§7.4）",
+            )
+        return self._store.read_rows(self._embed_name, ids)
+
     def logits(self, tokens: Sequence[int], *, trace: list[np.ndarray] | None = None,
                prefix: int = 0, causal: bool = False,
-               debug: dict | None = None) -> np.ndarray:
+               debug: dict | None = None,
+               mm: object | None = None) -> np.ndarray:
         """整条 prompt 走 20 层，返回 `[rows]` 原始 logits（rows = 读出表的行数）（fp32，未除温度）。
 
         `trace` 非空时把每层输出（最后一条 token 的 `[hidden]`）按顺序追加进去，
@@ -359,6 +393,8 @@ class SplitChain:
 
         只有最后一条 token 的行进读出，所以 Metal 那条路直接走 `last_hidden()`（不做整段
         读回）：16k 上整段读回归一要 87 ms，末行是 0.02 ms。
+
+        `mm` 是图像合流的入口（`_embeddings`），今天传非 `None` 会报 `NotReadyError`。
         """
         ids, length = self._ids_and_length(tokens, prefix)
         # 码表先要：没有码表的模型（h2o 是 pooled）连前向都不必跑，报错也不必等到算完。
@@ -368,8 +404,8 @@ class SplitChain:
             if trace is not None or debug is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace 或 debug（中间量留在面上）",
                                  hint="用 metal=False 的 numpy 链做逐层对拍")
-            return readout @ self.last_hidden(tokens, prefix=prefix, causal=causal)
-        x = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid, self._width)
+            return readout @ self.last_hidden(tokens, prefix=prefix, causal=causal, mm=mm)
+        x = _place(self._embeddings(ids, mm), self._geometry.hid, self._width)
         if trace is not None:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
             # 任何一层跑偏都能定位到该层本身而不是前一层。
@@ -388,7 +424,8 @@ class SplitChain:
         return readout @ final
 
     def hidden(self, tokens: Sequence[int], *, prefix: int = 0,
-               causal: bool = False, trace: list[np.ndarray] | None = None) -> np.ndarray:
+               causal: bool = False, trace: list[np.ndarray] | None = None,
+               mm: object | None = None) -> np.ndarray:
         """整条 prompt 走完全部层，返回 `[length, hidden]` 的最终归一化 hidden。
 
         这是**没有码表读出的模型**（h2o 的 `pooled`）也能用的出口，也是厂商路径对拍的抓手：
@@ -396,18 +433,21 @@ class SplitChain:
 
         整段读回只在逐位置对拍与 trace 时需要；只要末行请用 `last_hidden()`（出货的
         `pooled` 路径走那条）。
+
+        `mm` 与 `logits()` 同一个入口（`_embeddings`）：合流还没接，传非 `None` 会报
+        `NotReadyError`。
         """
         ids, length = self._ids_and_length(tokens, prefix)
         if self._pipeline is not None:
             if trace is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace；用 metal=False 的 numpy 链")
-            self._pipeline.run(self._store.read_rows(self._embed_name, ids), length=length,
+            self._pipeline.run(self._embeddings(ids, mm), length=length,
                                prefix=prefix, causal=causal)
             # 与 numpy 那条路同形：`[length, hidden]`（末位就是读出要的那一行）。以前这条
             # 分支只返回末位的一维向量，与自己的 docstring 不符 —— 逐位置对拍与
             # `PooledRunner` 的形状自检都会撞上。
             return rms_norm(self._pipeline.hidden_rows(length), self._final_norm)
-        x = _place(self._store.read_rows(self._embed_name, ids), self._geometry.hid, self._width)
+        x = _place(self._embeddings(ids, mm), self._geometry.hid, self._width)
         if trace is not None:
             trace.append(x[:, length - 1].copy())
         cos, sin = self._cos[:length], self._sin[:length]
@@ -422,7 +462,7 @@ class SplitChain:
         return rms_norm(x.T, self._final_norm)[:length]
 
     def last_hidden(self, tokens: Sequence[int], *, prefix: int = 0,
-                    causal: bool = False) -> np.ndarray:
+                    causal: bool = False, mm: object | None = None) -> np.ndarray:
         """最后一条 token 的最终归一化 hidden（`[hidden]` fp32）。
 
         `hidden(tokens)[-1]` 的那一行，但不读回整段：16k 上整段读回 + 归一 87 ms，只取末行
@@ -430,20 +470,22 @@ class SplitChain:
         """
         ids, length = self._ids_and_length(tokens, prefix)
         if self._pipeline is not None:
-            self._pipeline.run(self._store.read_rows(self._embed_name, ids), length=length,
+            self._pipeline.run(self._embeddings(ids, mm), length=length,
                                prefix=prefix, causal=causal)
             return rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
         # numpy 那条路不是热点：整段本来就是一小块 host 内存，直接复用 `hidden()`。
-        return self.hidden(tokens, prefix=prefix, causal=causal)[-1]
+        return self.hidden(tokens, prefix=prefix, causal=causal, mm=mm)[-1]
 
     def forward(self, tokens: Sequence[int], *, options: int, prefix: int = 0,
-                causal: bool = False) -> np.ndarray:
+                causal: bool = False, mm: object | None = None) -> np.ndarray:
         """前 `options` 个码的 softmax 概率（选项顺序 = `codes` 顺序）。"""
-        return self._probabilities(self.logits(tokens, prefix=prefix, causal=causal), options)
+        return self._probabilities(
+            self.logits(tokens, prefix=prefix, causal=causal, mm=mm), options
+        )
 
     def forward_shared(
         self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, options: Sequence[int],
-        causal: bool = False,
+        causal: bool = False, mm: object | None = None,
     ) -> list[np.ndarray]:
         """一个请求内多题共享前缀：前缀只算一遍，每题只跑自己那条尾巴。
 
@@ -456,11 +498,12 @@ class SplitChain:
         """
         if len(options) != len(tails):
             raise ValueError(f"options 与尾巴条数不一致：{len(options)} vs {len(tails)}")
-        logits = self.logits_shared(prefix, tails, causal=causal)
+        logits = self.logits_shared(prefix, tails, causal=causal, mm=mm)
         return [self._probabilities(row, int(count)) for row, count in zip(logits, options)]
 
     def logits_shared(
-        self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, causal: bool = False
+        self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, causal: bool = False,
+        mm: object | None = None,
     ) -> list[np.ndarray]:
         """共享前缀的整条前向：返回每题的 `[rows]` 原始 logits（未除温度）。"""
         if self._pipeline is None:
@@ -483,8 +526,8 @@ class SplitChain:
                     f"width={self._width}；用更大的 width 重新 load")
             rows.append(tail_ids)
         hidden = self._pipeline.run_shared(
-            self._store.read_rows(self._embed_name, ids),
-            [self._store.read_rows(self._embed_name, tail) for tail in rows],
+            self._embeddings(ids, mm),
+            [self._embeddings(tail, mm) for tail in rows],
             prefix=length, causal=causal,
         )
         out: list[np.ndarray] = []

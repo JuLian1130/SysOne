@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import shutil
 
 import pytest
@@ -12,7 +13,7 @@ from sysone.devices.apple.geometry import Geometry, mude_geometry
 from sysone.domain.attention import AttentionRole, MaskMode
 from sysone.domain.quant import Scheme
 from sysone.errors import ConfigError
-from sysone.models.families import h2o, mude, torchcast
+from sysone.models.families import h2o, mude, qwen35, torchcast
 
 
 def test_mude_geometry() -> None:
@@ -37,6 +38,75 @@ def test_mude_readout_and_modes() -> None:
     assert descriptor.default_mode is MaskMode.PREFIX_NONCAUSAL
     assert descriptor.supported_modes == frozenset(MaskMode)
     assert descriptor.trained_modes == frozenset({MaskMode.PREFIX_NONCAUSAL})
+
+
+def test_vision_geometry_is_read_whole() -> None:
+    """视觉塔的几何要一次读全：编 program 时少一项，装塔就会分到空缓冲。
+
+    两个出货模型的塔逐项相同，**只有 merger 的输出宽度不同**（2048 对 2560）。塔宽与文本
+    `hidden` 是两份契约：这里两个模型碰巧也相等，所以"塔宽 = 文本 hidden"这条捷径在两个
+    模型上都看着对，第三个模型就会错。
+    """
+    mude_spec = mude.parse_config(FIXTURES / "mude").vision
+    h2o_spec = h2o.parse_config(FIXTURES / "h2o").vision
+    assert mude_spec is not None and h2o_spec is not None
+    for spec in (mude_spec, h2o_spec):
+        assert spec.depth == 24
+        assert spec.hidden == 1024
+        assert spec.intermediate_size == 4096
+        assert (spec.num_heads, spec.patch_size, spec.spatial_merge) == (16, 16, 2)
+        assert spec.temporal_patch_size == 2
+        assert spec.num_position_embeddings == 2304  # 48×48 的 pos_embed 表
+    assert mude_spec.out_hidden_size == 2048
+    assert h2o_spec.out_hidden_size == 2560
+    # h2o 的 `vision_config` 没有 `rope_parameters`：这两项落到厂商 `Qwen3_5VisionConfig`
+    # 的默认值，而不是 0。取 0 会让所有位置角退化成同一个。
+    for spec in (mude_spec, h2o_spec):
+        assert spec.rope_theta == pytest.approx(10000.0)
+        assert spec.rope_type == "axial"
+    # `model_type` 只记录、不分支：两个 config 写的不是同一个值，塔却是同一个。
+    assert mude_spec.model_type == "qwen3_5_vision"
+    assert h2o_spec.model_type == "qwen3_5"
+
+
+def test_placeholder_ids_and_mrope_sections_are_read() -> None:
+    """合流要的三样：占位 token 的 id、M-RoPE 的三段与是否交错。"""
+    descriptor = mude.parse_config(FIXTURES / "mude")
+    assert (
+        descriptor.vision_start_token_id,
+        descriptor.vision_end_token_id,
+        descriptor.image_token_id,
+        descriptor.video_token_id,
+    ) == (248053, 248054, 248056, 248057)
+    assert descriptor.mrope_section == (11, 11, 10)
+    assert descriptor.mrope_interleaved is True
+    # 三段之和 = head_dim × partial_rotary_factor / 2 = 256 × 0.25 / 2
+    assert sum(descriptor.mrope_section) == 32
+
+
+def test_a_vision_config_missing_a_shape_key_is_an_error() -> None:
+    """缺一项就报错：猜 0 会把错误推迟到装塔时，那时已经看不出是 config 少了一项。"""
+    config = json.loads((FIXTURES / "h2o" / "config.json").read_text(encoding="utf-8"))
+    del config["vision_config"]["temporal_patch_size"]
+    with pytest.raises(ConfigError) as excinfo:
+        qwen35.vision_spec(config)
+    assert excinfo.value.context["missing"] == ["temporal_patch_size"]
+
+
+def test_a_tower_without_placeholder_ids_cannot_validate() -> None:
+    """带塔却说不出占位 token 的 id：合流时只能靠猜。与线性层几何同一套态度。"""
+    descriptor = mude.parse_config(FIXTURES / "mude")
+    with pytest.raises(ConfigError) as excinfo:
+        dataclasses.replace(descriptor, image_token_id=None).validate()
+    assert "image_token_id" in str(excinfo.value.context["missing"])
+
+
+def test_mrope_sections_must_add_up_to_half_the_rotary_axis() -> None:
+    """三轴分段与旋转维度对不上时会把行轴的频率灌进列轴 —— 错得很安静，所以在这里挡。"""
+    descriptor = mude.parse_config(FIXTURES / "mude")
+    with pytest.raises(ConfigError) as excinfo:
+        dataclasses.replace(descriptor, mrope_section=(11, 11, 11)).validate()
+    assert excinfo.value.context["rotary_half"] == 32
 
 
 def test_a_checkpoint_reports_the_quant_form_it_is_stored_in(tmp_path) -> None:

@@ -96,18 +96,68 @@ def partial_rotary(text: Mapping[str, object]) -> float:
     return 1.0 if value is None else float(value)  # type: ignore[arg-type]
 
 
+# 视觉塔的**形状**键。缺一项就报错：拿 0 顶上的话，错误会推迟到装塔时变成"某个维度是 0"的
+# 缓冲，那时候已经看不出是 config 少了一项。
+_VISION_SHAPE_KEYS = (
+    "depth",
+    "hidden_size",
+    "intermediate_size",
+    "num_heads",
+    "out_hidden_size",
+    "patch_size",
+    "spatial_merge_size",
+    "temporal_patch_size",
+    "num_position_embeddings",
+)
+
+
 def vision_spec(config: Mapping[str, object]) -> VisionSpec | None:
-    """视觉塔几何；M0 只记录，不加载。"""
+    """视觉塔的几何；没有 `vision_config` 的模型返回 `None`。
+
+    `model_type` 只记录、不分支：h2o 的 `vision_config` 写的是 `qwen3_5`（mude 写的是
+    `qwen3_5_vision`），按它挑构造器会在同一个塔上分叉出两条路径，而两个模型的塔几何逐项相同
+    （只有 `out_hidden_size` 不同：2048 对 2560）。
+
+    `rope_parameters` 是唯一的可选段：h2o 的 `vision_config` 没有它，而厂商
+    `Qwen3_5VisionConfig` 的默认值就是 `axial` / θ=1e4（mude 显式写的正是同一个值）。
+    """
     nested = config.get("vision_config")
     if not isinstance(nested, Mapping):
         return None
+    missing = [key for key in _VISION_SHAPE_KEYS if nested.get(key) is None]
+    if missing:
+        raise ConfigError(
+            "vision_config 缺少视觉塔的几何",
+            missing=missing,
+            hint="设备层按这些数字编 program；猜 0 只会在装塔时分到一个空缓冲",
+        )
+    rope = nested.get("rope_parameters")
+    if not isinstance(rope, Mapping):
+        rope = {}
     return VisionSpec(
         model_type=str(nested.get("model_type", "")),
-        depth=int(nested.get("depth", 0)),  # type: ignore[arg-type]
-        hidden=int(nested.get("hidden_size", 0)),  # type: ignore[arg-type]
-        patch_size=int(nested.get("patch_size", 0)),  # type: ignore[arg-type]
-        spatial_merge=int(nested.get("spatial_merge_size", 2)),  # type: ignore[arg-type]
+        depth=int(nested["depth"]),  # type: ignore[arg-type]
+        hidden=int(nested["hidden_size"]),  # type: ignore[arg-type]
+        patch_size=int(nested["patch_size"]),  # type: ignore[arg-type]
+        spatial_merge=int(nested["spatial_merge_size"]),  # type: ignore[arg-type]
+        intermediate_size=int(nested["intermediate_size"]),  # type: ignore[arg-type]
+        num_heads=int(nested["num_heads"]),  # type: ignore[arg-type]
+        out_hidden_size=int(nested["out_hidden_size"]),  # type: ignore[arg-type]
+        temporal_patch_size=int(nested["temporal_patch_size"]),  # type: ignore[arg-type]
+        num_position_embeddings=int(nested["num_position_embeddings"]),  # type: ignore[arg-type]
+        rope_theta=float(rope.get("rope_theta", 10000.0)),  # type: ignore[arg-type]
+        rope_type=str(rope.get("rope_type", "axial")),
     )
+
+
+def mrope_options(text: Mapping[str, object]) -> tuple[tuple[int, ...] | None, bool]:
+    """M-RoPE 的两项：频率分段与是否交错。Qwen3.5 把它们写在 `rope_parameters` 下。"""
+    rope = text.get("rope_parameters")
+    if not isinstance(rope, Mapping):
+        return None, False
+    section = rope.get("mrope_section")
+    sections = None if section is None else tuple(int(item) for item in section)  # type: ignore[union-attr]
+    return sections, bool(rope.get("mrope_interleaved", False))
 
 
 def rope_theta(config: Mapping[str, object]) -> float:
@@ -146,6 +196,7 @@ def descriptor_from(
     """
     text = text_config(config)
     numbers = geometry(text)
+    mrope_section, mrope_interleaved = mrope_options(text)
     descriptor = ModelDescriptor(
         family=family,
         model_id=model_id,
@@ -179,6 +230,14 @@ def descriptor_from(
         mtp_layers=int(text.get("mtp_num_hidden_layers", 0)),  # type: ignore[arg-type]
         rms_eps=float(text.get("rms_norm_eps", 1e-6)),  # type: ignore[arg-type]
         vision=vision_spec(config),
+        # 占位 token 的 id 在 config **顶层**（不在 text_config 下）；M-RoPE 在
+        # text_config.rope_parameters 下。纯文本 config 这两处都没有，留 `None`。
+        image_token_id=_opt_int(config.get("image_token_id")),
+        video_token_id=_opt_int(config.get("video_token_id")),
+        vision_start_token_id=_opt_int(config.get("vision_start_token_id")),
+        vision_end_token_id=_opt_int(config.get("vision_end_token_id")),
+        mrope_section=mrope_section,
+        mrope_interleaved=mrope_interleaved,
     )
     descriptor.validate()
     return descriptor
