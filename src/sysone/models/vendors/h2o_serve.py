@@ -33,6 +33,10 @@ from .base import wire_answer
 
 SHIM_FILE = "h2o_lightning_shim.py"
 SERVE_FILE = "serve_config.json"
+# 一个占位符一张图。厂商模板（`chat_template.jinja` 与 mude 同源）把 `{"type": "image"}` 展开成
+# 这三个 id；我们这里没有模板可走（`Serve` 只收一段文本），所以直接拼字符串 —— 分词器保证
+# 这三个是原子 token（实测 248053 / 248056 / 248054）。
+VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
 
 
 @dataclass(frozen=True)
@@ -89,13 +93,21 @@ class Serve:
         return cls(config, _load_shim(root), tokenizer)
 
     # ---------------------------------------------------------------- 题面
-    def prepare(self, state: str, spec: dict) -> Prepared:
+    def prepare(self, state: str, spec: dict, *, images: int = 0) -> Prepared:
         """题面 → 整条 prompt 的 token 与回答槽上的标签 token。
 
         `spec` 是已经转成厂商线格式的问题（`vendors.base.question_spec`）：渲染与判答案都吃
         这一种形态，两条前向的调用点才可能逐字相同。
+
+        `images > 0` 时**图块由我们拼在 `state_text` 之前**，一个 `<|image_pad|>` 一张图：厂商
+        的 `Serve` 只收一段 `state_text`（`serve_config.json` 没有 `image` 块），它的
+        `question_prompt` 不认图。位置与 mude 那边一致（题面之前），于是两个家族只差渲染方式。
         """
         state_text = self._shim.render_state(state, self._contract.state_compact)
+        if images < 0:
+            raise ConfigError("图数不能为负", images=images)
+        if images:
+            state_text = VISION_BLOCK * images + state_text
         prompt, names, descs, labels = self._contract.question_prompt(state_text, spec)
         ids = self._ids(prompt)
         if not ids:

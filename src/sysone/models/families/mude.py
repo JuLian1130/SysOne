@@ -125,9 +125,18 @@ def option_plan(question: Question) -> tuple[tuple[str, ...], tuple[str, ...], t
 
 
 def render_messages(
-    state: str, question: Question, texts: Sequence[str], codes: Sequence[str]
-) -> list[dict[str, str]]:
-    """一道题的 system + user 轮（`d3_format.messages` 的逐字复刻）。"""
+    state: str, question: Question, texts: Sequence[str], codes: Sequence[str],
+    *, images: int = 0,
+) -> list[dict]:
+    """一道题的 system + user 轮（`d3_format.messages` 的逐字复刻）。
+
+    `images > 0` 时 user 轮改用 **content parts**，图块打在题面之前 —— 模板会把每个
+    `{"type": "image"}` 渲染成 `<|vision_start|><|image_pad|><|vision_end|>`（`chat_template.jinja`
+    的 `render_content`），一个占位符一张图。位置选在 `State:` 之前有两个理由：它与"所有题共享
+    同一张图"这件事一致（图块落在共享前缀里，所以一个请求只编码一次图），而且与 h2o 那条
+    "厂商只收 `state_text`、图块由我们拼在 state 前面"走同一个位置 —— 两个家族的题面因此只差
+    渲染方式，不差结构。
+    """
     room = min(CODE_ROWS, len(codes))
     if not 1 <= len(texts) <= room:
         raise ConfigError("选项数超出码表", options=len(texts), room=room)
@@ -142,9 +151,15 @@ def render_messages(
     ]
     parts.extend(f"{code}: {text}" for code, text in zip(codes, texts))
     parts += ["", _CLOSING_LINE]
+    if images < 0:
+        raise ConfigError("图数不能为负", images=images)
+    body = "\n".join(parts)
+    user: object = body if not images else (
+        [{"type": "image"} for _ in range(images)] + [{"type": "text", "text": body}]
+    )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": "\n".join(parts)},
+        {"role": "user", "content": user},
     ]
 
 
@@ -171,18 +186,23 @@ class MudePrompter:
         self._codes = tuple(codes)
         # 前缀只由 state 决定，而一次请求的所有题共享同一个 state：缓存一条就够，
         # 也不要无上限地堆（服务跑长了每条请求都是新 state）。
-        self._prefix_state: str | None = None
+        self._prefix_state: tuple[str, int] | None = None
         self._prefix_value: tuple[int, ...] = ()
 
     def encode(
-        self, state: str, question: Question
+        self, state: str, question: Question, *, images: int = 0
     ) -> tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]:
-        """一道题的 (整条 prompt 的 id, 前缀长度, 答案标签, 标签对应的选项序号)。"""
-        texts, labels, indexes = option_plan(question)
-        sequence = self._ids(self._chat(render_messages(state, question, texts, self._codes)))
-        return sequence, common_prefix(sequence, self._prefix_ids(state)), labels, indexes
+        """一道题的 (整条 prompt 的 id, 前缀长度, 答案标签, 标签对应的选项序号)。
 
-    def _chat(self, conversation: list[dict[str, str]]) -> str:
+        `images` 是这道题题面里的图数；给出的 id 里仍然**一张图一个占位符**（展开成 `L/4` 个是
+        合流那一步的事，见 `models/vision/merge.expand_image_tokens`）。
+        """
+        texts, labels, indexes = option_plan(question)
+        sequence = self._ids(
+            self._chat(render_messages(state, question, texts, self._codes, images=images)))
+        return sequence, common_prefix(sequence, self._prefix_ids(state, images)), labels, indexes
+
+    def _chat(self, conversation: list[dict]) -> str:
         return self._tokenizer.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
@@ -191,19 +211,24 @@ class MudePrompter:
         values = self._tokenizer(text, add_special_tokens=False)["input_ids"]
         return tuple(int(value) for value in values)
 
-    def _prefix_ids(self, state: str) -> tuple[int, ...]:
-        """"题干之前"那一串 id：把题干换成哨兵，量哨兵之前的那段文本。"""
-        if self._prefix_state is not None and self._prefix_state == state:
+    def _prefix_ids(self, state: str, images: int = 0) -> tuple[int, ...]:
+        """"题干之前"那一串 id：把题干换成哨兵，量哨兵之前的那段文本。
+
+        哨兵那次**必须带上同样的图块**：图块在题干之前，不带它量出来的前缀短一整块，而
+        `common_prefix` 会在图块处提前断开 —— 多题共享前缀就静默退化成逐题整趟（答案还对，
+        但等于没复用），带图的请求里更糟的是前缀长度与尾巴错位。
+        """
+        if self._prefix_state is not None and self._prefix_state == (state, images):
             return self._prefix_value
         probe = Question(text=PREFIX_SENTINEL, options=("x",), kind="choice")
-        text = self._chat(render_messages(state, probe, ("x",), self._codes))
+        text = self._chat(render_messages(state, probe, ("x",), self._codes, images=images))
         if PREFIX_SENTINEL not in text:
             raise ConfigError(
                 "chat 模板把题干哨兵吃掉了，量不出前缀",
                 format_id=FORMAT_ID,
                 tokenizer=type(self._tokenizer).__name__,
             )
-        self._prefix_state = state
+        self._prefix_state = (state, images)
         self._prefix_value = self._ids(text[: text.index(PREFIX_SENTINEL)])
         return self._prefix_value
 

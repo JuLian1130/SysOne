@@ -12,6 +12,7 @@ import pytest
 from sysone.devices.apple.chain import SplitChain, artifact_state
 from sysone.errors import NotReadyError
 from sysone.models.families import mude
+from sysone.models.vision.merge import Placement
 
 MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
 WEIGHTS = MUDE_DIR / "model.safetensors"
@@ -51,12 +52,16 @@ def test_chain_probabilities_and_repeat(tmp_path: Path) -> None:
         assert np.all(probabilities >= 0.0)
         assert float(probabilities.sum()) == pytest.approx(1.0, abs=1e-5)
         assert chain.logits(tokens).shape == (255,)
-        # 图像合流（票据 07 §7.4）还没接：带 `mm` 进来的调用必须当场报错。悄悄忽略它会让
-        # 图"进去过"，注意力却按 `<|image_pad|>` 自己那份 embedding 跑 —— 跑得通、答案是错的。
-        for call in (lambda: chain.forward(tokens, options=3, mm=object()),
-                     lambda: chain.last_hidden(tokens, mm=object())):
-            with pytest.raises(NotReadyError):
-                call()
+        # 图像合流（票据 07 §7.4）：`mm` 覆盖的那几行必须**就是**换成那些 token 的效果。
+        # 这条断言抓的错很具体 —— 忽略 `mm`（图"进去过"、注意力按占位符自己的 embedding 跑）
+        # 或改错行，都会让它当场变红；而它不需要跑塔，所以在这条最便宜的用例里就能钉住。
+        spliced = np.asarray(
+            chain._store.read_rows(chain._embed_name, np.array([7, 7, 7])), np.float32)
+        placement = Placement(spans=((1, 3),), rows=spliced,
+                              positions=np.tile(np.arange(len(tokens)), (3, 1)))
+        got = chain.forward(tokens, options=3, mm=placement)
+        want = chain.forward([tokens[0], 7, 7, 7], options=3)
+        assert np.array_equal(got, want), "splice 之后与直接用那些 token 不等价"
         # ANE 程序与 numpy 一侧都是确定性的：重复调用必须逐位相同。
         assert np.array_equal(chain.forward(tokens, options=3), probabilities)
     finally:

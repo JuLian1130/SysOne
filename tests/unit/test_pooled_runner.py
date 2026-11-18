@@ -31,7 +31,7 @@ class FakeChain:
         self._last = np.asarray(last, dtype=np.float32)
         self._width = width
 
-    def last_hidden(self, tokens, *, causal=False):
+    def last_hidden(self, tokens, *, causal=False, mm=None):
         self.calls.append((tuple(tokens), bool(causal)))
         return self._last
 
@@ -125,7 +125,7 @@ def test_restarted_warm_up_reports_bad_probabilities():
     """预热时概率不合法要按未就绪报出去，而不是变成第一道真实题的答案。"""
 
     class BrokenServe:
-        def prepare(self, state, spec):
+        def prepare(self, state, spec, *, images=0):
             return Prepared(ids=(1, 2), label_ids=(3, 4), labels=("A", "B"), names=("A", "B"),
                             descs=("a", "b"), kind="choice", temperature=1.0, threshold=None)
 

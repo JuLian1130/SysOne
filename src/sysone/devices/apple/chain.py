@@ -24,6 +24,7 @@ from ...domain.attention import AttentionRole
 from ...errors import ConfigError, NotReadyError
 from ...models.descriptor import ModelDescriptor
 from ...models.layer_plan import WeightPlan
+from ...models.vision.merge import splice_rows, split_placement
 from ...weights.checkpoint import WeightStore, int8_parts, open_checkpoint
 from ...weights.packing.ane_blob import build as build_blob, build_quantized
 from ...weights.store import SafeTensorFile
@@ -79,24 +80,53 @@ def _rope_table(theta: float, s: int, rotary_dim: int) -> tuple[np.ndarray, np.n
     return _rope_positions(theta, np.arange(s), rotary_dim)
 
 
-def _rope_positions(theta: float, positions: np.ndarray, rotary_dim: int
-                    ) -> tuple[np.ndarray, np.ndarray]:
+def _rope_positions(theta: float, positions: np.ndarray, rotary_dim: int,
+                    *, section: Sequence[int] | None = None,
+                    interleaved: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """任意位置的 RoPE 正余弦表，各 `[T, rotary_dim/2]`。
 
-    `positions` 现在是一维 `(T,)`：一个 token 一个位置。带图时位置变成 `(3, T)`（时间/行/列
-    三组，再按 `mrope_section` 交错拼频率），那段与 `mrope_positions` 一起归合流（票据 07
-    §7.4）—— 现在收到非一维会明确报错，而不是拿时间轴顶替三组轴（那会让所有行/列的位置
-    退化成同一个，图看着能跑、注意力其实是错的）。
+    一维 `(T,)`：文本，一个 token 一个位置，三轴相同。`(3, T)`：带图，三轴分别是
+    `(时间, 行, 列)`，先各算一遍角度再**按频率轴拼**（`section` / `interleaved`），顺序与厂商
+    `Qwen3VLTextRotaryEmbedding.recomposition_frequencies` 一致：
+
+        freqs_thw = freq[0]                                   # 时间轴打底
+        for dim, offset in ((1, 1), (2, 2)):                  # 行轴、列轴
+            length = section[dim] * 3                         # 每三个频率里取一个
+            freqs_thw[..., offset:length:3] = freq[dim][..., offset:length:3]
+
+    那个 `*3` 就是"三轴交错"本身：行轴占 `i % 3 == 1` 的频率，列轴占 `i % 3 == 2` 的，其余
+    留在时间轴。三段的长度加起来恰好是 `rotary_dim/2`（descriptor 的 `validate()` 钉着）。
+
+    cos/sin 两个半区相同（厂商最后 `cat(freqs, freqs)`），`ops.apply_rotary` 按前半/后半配对，
+    所以这里只留前一半。
     """
     positions = np.asarray(positions, dtype=np.float64)
-    if positions.ndim != 1:
-        raise NotReadyError(
-            "M-RoPE 的三轴位置表还没接",
-            positions=tuple(positions.shape),
-            hint="视觉合流（票据 07 §7.4）落地时按 mrope_section 拼频率；纯文本只用 (T,)",
-        )
     frequencies = theta ** (-np.arange(0, rotary_dim, 2, dtype=np.float64) / rotary_dim)
-    angles = positions[:, None] * frequencies[None, :]
+    if positions.ndim == 1:
+        angles = positions[:, None] * frequencies[None, :]
+    elif positions.ndim == 2 and positions.shape[0] == 3:
+        angles = positions[:, :, None] * frequencies[None, None, :]     # (3, T, half)
+        if section is not None:
+            # 先按轴拼**角度**再取三角函数：拼的是逐元素的选取，与厂商"先 cos 再拼"等价。
+            composed = angles[0].copy()
+            if interleaved:
+                for axis, offset in ((1, 1), (2, 2)):
+                    length = min(int(section[axis]) * 3, angles.shape[2])
+                    window = slice(offset, length, 3)
+                    composed[:, window] = angles[axis][:, window]
+            else:
+                # 非交错：三段在频率轴上连续排（`section[0]`、`section[1]`、`section[2]`）
+                bounds = np.cumsum((0, *section))
+                for axis in range(3):
+                    composed[:, bounds[axis]:bounds[axis + 1]] = \
+                        angles[axis][:, bounds[axis]:bounds[axis + 1]]
+            angles = composed
+    else:
+        raise NotReadyError(
+            "RoPE 位置表只认 (T,) 与 (3, T)",
+            positions=tuple(positions.shape),
+            hint="带图的题面由 models/vision/merge.mrope_positions 给出 (3, T)",
+        )
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
 
 
@@ -123,6 +153,7 @@ class SplitChain:
         temperature: float,
         cos: np.ndarray,
         sin: np.ndarray,
+        rope_theta: float,
         geometry: Geometry,
         s: int,
         width: int,
@@ -133,6 +164,8 @@ class SplitChain:
         metal_runtime: object | None = None,
         load_s: float = 0.0,
         compile_s: float = 0.0,
+        mrope_section: Sequence[int] | None = None,
+        mrope_interleaved: bool = False,
     ) -> None:
         self._load_s = float(load_s)
         self._compile_s = float(compile_s)
@@ -153,6 +186,13 @@ class SplitChain:
         self._temperature = float(temperature)
         self._cos = cos
         self._sin = sin
+        # M-RoPE 的两项（带图题面才用到）。纯文本模型留 `None` / `False`，此时 `_rope_for()`
+        # 直接用装载期那张 `arange` 表 —— 与合流之前逐位相同。
+        self._mrope_section = None if mrope_section is None else tuple(int(v) for v in mrope_section)
+        self._mrope_interleaved = bool(mrope_interleaved)
+        self._rope_theta = rope_theta
+        # 流水线的 RoPE 表被改成过三轴表的行数（0 = 表还是装载期那张 `arange`）。
+        self._rope_dirty = 0
         # 形状只有一个来源：几何对象。它同时被 MIL 生成、缓冲分配与下面这些 numpy 段用，
         # 抄成局部标量就会有两份真相（GDN 的 v 头数就曾经这样被写死成 k 头数）。
         self._geometry = geometry
@@ -338,14 +378,61 @@ class SplitChain:
             runtime=runtime, layers=layers, params=params, roles=roles, store=store,
             embed_name=f"{prefix}.embed_tokens.weight", final_norm=final_norm,
             readout=readout, readout_kind=weights.descriptor.readout.kind,
-            temperature=temperature, cos=cos, sin=sin,
+            temperature=temperature, cos=cos, sin=sin, rope_theta=weights.rope_theta,
             geometry=geometry, s=s, width=width,
+            mrope_section=weights.descriptor.mrope_section,
+            mrope_interleaved=weights.descriptor.mrope_interleaved,
             own_runtime=own_runtime, pipeline=pipeline, pool=pool,
             own_metal=metal_runtime is not None, metal_runtime=metal_runtime,
             load_s=time.perf_counter() - started - compile_s, compile_s=compile_s,
         )
 
     # ------------------------------------------------------------------ 前向
+
+    def _rope_for(self, mm: object | None, length: int) -> tuple[np.ndarray, np.ndarray]:
+        """本请求的 `(cos, sin)`，各 `[length, rotary_dim/2]`。
+
+        纯文本（`mm is None`）直接用装载期那张 `arange` 表切片 —— 与合流之前完全同一条路径，
+        所以带图这件事在文本请求上是**零代价**的（不是"重算一遍恰好一样"）。
+
+        带图时位置是 `(3, T)`：三轴先各算角度、再按 `mrope_section` 拼（见 `_rope_positions`）。
+        表只建到 `length`（不是整条 `width`）：一张图 1024 个 token 时半宽 32，整条 16k 的表是
+        1 MB，而每次请求都要重建。
+        """
+        if mm is None:
+            return self._cos[:length], self._sin[:length]
+        positions = np.asarray(mm.positions)
+        if positions.shape[1] < length:
+            # 共享前缀时，别的题的尾巴可能比手上这道长。前缀之后**一定**全是文本（图块只在题面
+            # 之前），而文本位置是 `st_idx + k`，`st_idx = 已产出的最大值 + 1`，所以续上去就是
+            # 三轴同时从 `max + 1` 起等差 —— 与厂商 `if st_idx: arange(st_idx, st_idx+n)` 同一条。
+            base = int(positions.max()) + 1
+            extra = base + np.arange(length - positions.shape[1], dtype=np.int32)
+            positions = np.concatenate(
+                [positions, np.repeat(extra[None, :], 3, axis=0)], axis=1)
+        return _rope_positions(self._rope_theta, positions[:, :length], self._geometry.rotary_dim,
+                               section=self._mrope_section,
+                               interleaved=self._mrope_interleaved)
+
+    def _prepare_rope(self, mm: object | None, length: int) -> tuple[np.ndarray, np.ndarray]:
+        """`_rope_for` 加上"把表送进流水线"：Metal 链的核从缓冲里读 cos/sin。
+
+        **带了图就要把表盖回去**：流水线的表是缓冲，带图那一次写进去的是三轴表，下一次纯文本
+        请求若沿用就会拿图像位置算文本 token —— 实测（P3 的门）合流之后纯文本的 logits 会变，
+        而这条路径本该与合流之前逐位相同。所以只要上一次写过非默认表，这次就恢复，且恢复到
+        上一次写过的那一行为止（否则更长的文本请求会读到残留的图像行）。
+        """
+        cos, sin = self._rope_for(mm, length)
+        if self._pipeline is None:
+            return cos, sin
+        if mm is not None:
+            self._pipeline.set_rope(cos, sin)
+            self._rope_dirty = max(int(length), self._rope_dirty)
+        elif self._rope_dirty:
+            rows = min(self._rope_dirty, self._width)
+            self._pipeline.set_rope(self._cos[:rows], self._sin[:rows])
+            self._rope_dirty = 0
+        return cos, sin
 
     def _ids_and_length(self, tokens: Sequence[int], prefix: int) -> tuple[np.ndarray, int]:
         """三条前向入口共用的门禁：token 数组、长度，与 `prefix` 的越界检查。"""
@@ -364,16 +451,16 @@ class SplitChain:
     def _embeddings(self, ids: np.ndarray, mm: object | None = None) -> np.ndarray:
         """token id → `[len(ids), hidden]` 的输入嵌入。
 
-        这是文本栈与视觉塔之间的**唯一接缝**：纯文本时就是码表查行；带图时 `mm` 覆盖
-        `<|image_pad|>` 那几行（票据 07 §7.4）。合流还没接，所以真的带了 `mm` 就地报错 ——
-        悄悄忽略它会让图"进去过"，注意力却按占位 token 自己那份 embedding 跑。
+        这是文本栈与视觉塔之间的**唯一接缝**：纯文本时就是码表查行；带图时 `mm`（一个
+        `merge.Placement`）的行盖掉 `<|image_pad|>` 那几段（`merge.splice_rows`）。
+
+        占位符自己那份 embedding 是垃圾，必须被盖掉：悄悄忽略 `mm` 会让图"进去过"、注意力却
+        按占位 token 自己那份跑 —— 形状全对、答案是错的。
         """
+        embedded = np.asarray(self._store.read_rows(self._embed_name, ids), np.float32)
         if mm is not None:
-            raise NotReadyError(
-                "图像合流还没接",
-                hint="视觉塔与前门落地之前，链只吃纯文本（票据 07 §7.3–§7.4）",
-            )
-        return self._store.read_rows(self._embed_name, ids)
+            splice_rows(embedded, mm.spans, np.asarray(mm.rows, np.float32))
+        return embedded
 
     def logits(self, tokens: Sequence[int], *, trace: list[np.ndarray] | None = None,
                prefix: int = 0, causal: bool = False,
@@ -410,7 +497,7 @@ class SplitChain:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
             # 任何一层跑偏都能定位到该层本身而不是前一层。
             trace.append(x[:, length - 1].copy())
-        cos, sin = self._cos[:length], self._sin[:length]
+        cos, sin = self._prepare_rope(mm, length)
         for index, layer in enumerate(self._layers):
             params = self._params[index]
             layer_debug = debug if (debug is not None and index == 0) else None
@@ -441,6 +528,7 @@ class SplitChain:
         if self._pipeline is not None:
             if trace is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace；用 metal=False 的 numpy 链")
+            self._prepare_rope(mm, length)
             self._pipeline.run(self._embeddings(ids, mm), length=length,
                                prefix=prefix, causal=causal)
             # 与 numpy 那条路同形：`[length, hidden]`（末位就是读出要的那一行）。以前这条
@@ -450,7 +538,7 @@ class SplitChain:
         x = _place(self._embeddings(ids, mm), self._geometry.hid, self._width)
         if trace is not None:
             trace.append(x[:, length - 1].copy())
-        cos, sin = self._cos[:length], self._sin[:length]
+        cos, sin = self._prepare_rope(mm, length)
         for index, layer in enumerate(self._layers):
             params = self._params[index]
             if self._roles[index] is AttentionRole.FULL:
@@ -470,6 +558,7 @@ class SplitChain:
         """
         ids, length = self._ids_and_length(tokens, prefix)
         if self._pipeline is not None:
+            self._prepare_rope(mm, length)
             self._pipeline.run(self._embeddings(ids, mm), length=length,
                                prefix=prefix, causal=causal)
             return rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
@@ -525,9 +614,15 @@ class SplitChain:
                     f"前缀 + 尾巴 {length + int(tail_ids.size)} 超过链的缓冲宽度 "
                     f"width={self._width}；用更大的 width 重新 load")
             rows.append(tail_ids)
+        # 表要覆盖到 `prefix + 最长尾巴`：共享前缀只算一遍，但每一列都得有位置。
+        self._prepare_rope(mm, length + max(int(tail.size) for tail in rows))
+        # 落点是整条序列上的绝对列号，而这条路径把序列拆成前缀与尾巴分别嵌入 —— 所以按
+        # `length` 切一刀：图块在题面之前，正常都落进前缀段（落在尾巴里/跨边界都会在
+        # `split_placement` 里显形，不会静默丢）。
+        head, rest = split_placement(mm, length) if mm is not None else (None, None)
         hidden = self._pipeline.run_shared(
-            self._embeddings(ids, mm),
-            [self._embeddings(tail, mm) for tail in rows],
+            self._embeddings(ids, head),
+            [self._embeddings(tail, rest) for tail in rows],
             prefix=length, causal=causal,
         )
         out: list[np.ndarray] = []

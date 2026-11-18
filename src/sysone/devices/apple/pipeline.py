@@ -162,6 +162,10 @@ class MudePipeline:
                 self._load_weights(entry, params[index])
             self._cos = _float_buffer(runtime, cos, np.float32)
             self._sin = _float_buffer(runtime, sin, np.float32)
+            # 表是 `[width, rotary_dim/2]`，核按位置列号取行。带图的请求会把前 `length` 行换成
+            # M-RoPE 的三轴表（`set_rope`），下一趟纯文本请求再盖回来 —— 表只按请求变、不按层变。
+            self._rope_rows = int(cos.shape[0])
+            self._rope_half = int(cos.shape[1])
             self._alloc_shared()
             # 每一列往下游推进的层数预算（对应旧引擎的 `RING = 8 // NCH`）：它是"注意力窗口里
             # 填多少 ANE 活"的旋钮 —— 取 4 时一列能推 3 个线性层 + 下一个全注意力层的投影，
@@ -1003,6 +1007,25 @@ class MudePipeline:
             )
 
     # ------------------------------------------------------------------ 收尾
+
+    def set_rope(self, cos: np.ndarray, sin: np.ndarray) -> None:
+        """把本请求的 RoPE 表盖到前 `cos.shape[0]` 行（`[width, rotary_dim/2]` 的前缀）。
+
+        带图的题面三轴位置不同（`models/vision/merge.mrope_positions`），而核是从缓冲里按列号
+        读表的，所以表必须逐请求更新。只盖用得到的那几行是够的（核按 `pos < length` 取址），
+        但**盖过之后要负责盖回去**：这张表是缓冲，下一次纯文本请求若沿用就会拿图像位置算文本
+        token（实测会让文本 logits 变）。调用方（`SplitChain._prepare_rope`）用 `_rope_dirty`
+        记着写过多少行，恢复时盖上同样的行数。
+        """
+        rows = int(cos.shape[0])
+        if rows > self._rope_rows or cos.shape[1] != self._rope_half:
+            raise ValueError(
+                f"RoPE 表形状 {tuple(cos.shape)} 与流水线的 "
+                f"({self._rope_rows}, {self._rope_half}) 不符")
+        self._cos.array(np.float32, (self._rope_rows, self._rope_half))[:rows] = np.asarray(
+            cos, np.float32)
+        self._sin.array(np.float32, (self._rope_rows, self._rope_half))[:rows] = np.asarray(
+            sin, np.float32)
 
     def last_hidden(self, length: int) -> np.ndarray:
         """最后一层的最后一条 token（`[hidden]` fp32），供 norm + 读出。"""

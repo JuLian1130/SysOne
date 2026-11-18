@@ -28,8 +28,10 @@ from ...errors import (
     ConfigError,
     NotReadyError,
     RequestTooLongError,
+    UnsupportedMediaError,
     UnsupportedModeError,
 )
+from ...models.vision import merge
 from ...models.vendors.base import question_spec
 from ...models.vendors.h2o_serve import Prepared, Serve
 
@@ -43,7 +45,8 @@ _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one"
 class PooledChain(Protocol):
     """这条策略只需要链的两件事：末位 token 的最终 hidden 与卸载。"""
 
-    def last_hidden(self, tokens: Sequence[int], *, causal: bool = False) -> np.ndarray: ...
+    def last_hidden(self, tokens: Sequence[int], *, causal: bool = False,
+                    mm: object | None = None) -> np.ndarray: ...
 
     def close(self) -> None: ...
 
@@ -62,6 +65,7 @@ class PooledRunner:
         rows: Callable[[Sequence[int]], np.ndarray],
         *,
         max_len: int,
+        image_token_id: int | None = None,
     ) -> None:
         if max_len < 1:
             raise ConfigError("max_len 必须为正", max_len=max_len)
@@ -69,6 +73,7 @@ class PooledRunner:
         self._serve = serve
         self._rows = rows
         self._max_len = int(max_len)
+        self._image_token = image_token_id
         self._chain: PooledChain | None = None
         self._load_s = 0.0
         self._warm_ok = False
@@ -123,7 +128,7 @@ class PooledRunner:
 
     # ------------------------------------------------------------------ 前向
     def answers_for(
-        self, request: DecisionRequest, mode: MaskMode
+        self, request: DecisionRequest, mode: MaskMode, *, media: object | None = None
     ) -> tuple[tuple[Answer, ...], int, float]:
         """一次请求内的所有题：返回 (答案元组, 输入 token 数, 读出耗时)。"""
         chain = self._require_chain()
@@ -138,18 +143,27 @@ class PooledRunner:
         started = time.perf_counter()
         answers: list[Answer] = []
         tokens = 0
+        images = 0 if media is None else int(media.images)
+        if images and self._image_token is None:
+            raise UnsupportedMediaError("这个模型没有视觉塔，收不了图", images=images)
         for index, question in enumerate(request.questions):
-            prepared = self._serve.prepare(request.state, question_spec(question))
-            length = len(prepared.ids)
-            if length > self._max_len:
+            prepared = self._serve.prepare(request.state, question_spec(question),
+                                           images=images)
+            ids, placement = prepared.ids, None
+            if media is not None:
+                # 与 mude 同一条路：厂商给的 prompt 里一张图一个占位符，展开与定位都在合流里。
+                ids, placement = merge.attach(prepared.ids, media,
+                                              image_token_id=self._image_token)
+            if len(ids) > self._max_len:
                 raise RequestTooLongError(
                     "prompt 超过链的缓冲宽度",
-                    length=length,
+                    length=len(ids),
                     max_len=self._max_len,
                     question=index,
                 )
-            answers.append(self._answer(chain, prepared, question, causal, index))
-            tokens += length
+            answers.append(self._answer(chain, prepared, question, causal, index,
+                                        ids=ids, mm=placement))
+            tokens += len(ids)
         return tuple(answers), tokens, time.perf_counter() - started
 
     def _answer(
@@ -159,11 +173,15 @@ class PooledRunner:
         question: Question,
         causal: bool,
         index: int,
+        *,
+        ids: Sequence[int] | None = None,
+        mm: object | None = None,
     ) -> Answer:
         # 读出只取最后一行的**最终归一化** hidden（厂商 `last_hidden_state` 就是它，见
         # `Qwen3_5TextModel.forward` 末尾的 `self.norm`），再点积标签那几行词表权重。
         # 链只读回这一行：整段读回 + 归一在 16k 上是 87 ms，末行 0.02 ms，而这里只需要末行。
-        logits = self._rows(prepared.label_ids) @ chain.last_hidden(prepared.ids, causal=causal)
+        logits = self._rows(prepared.label_ids) @ chain.last_hidden(
+            prepared.ids if ids is None else ids, causal=causal, mm=mm)
         value, labels, probs = self._serve.answer(prepared, logits)
         return Answer(
             question_index=index,
@@ -246,7 +264,8 @@ def h2o_runner(
     def rows(label_ids: Sequence[int]) -> np.ndarray:
         return np.asarray(store.read_rows(embed_name, list(label_ids)), np.float32)
 
-    return PooledRunner(load_chain, serve, rows, max_len=buffer_width)
+    return PooledRunner(load_chain, serve, rows, max_len=buffer_width,
+                        image_token_id=weights.descriptor.image_token_id)
 
 
 __all__ = ["PooledRunner", "h2o_runner"]

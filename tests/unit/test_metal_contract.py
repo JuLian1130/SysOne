@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 
 from sysone.devices.apple import metal as metal_module
-from sysone.devices.apple.chain import SplitChain
+from sysone.devices.apple.chain import SplitChain, _rope_table
 from sysone.devices.apple.geometry import Geometry
 from sysone.devices.apple.ops import rms_norm
 
@@ -66,6 +66,11 @@ def make_chain(rows: np.ndarray, *, final_norm: np.ndarray, width: int) -> Split
                                l_k_heads=1, l_k_dim=2, l_v_heads=1, l_v_dim=2)
     chain._s = width
     chain._width = width
+    chain._cos, chain._sin = _rope_table(10_000.0, width, chain._geometry.rotary_dim)
+    chain._rope_theta = 10_000.0
+    chain._mrope_section = None
+    chain._rope_dirty = 0
+    chain._mrope_interleaved = False
     chain._layers = []
     chain._params = []
     chain._roles = []

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from helpers import OPTIONS, load_tiny_descriptor, make_request
 
@@ -24,9 +25,11 @@ from sysone.errors import (
     NotReadyError,
     RequestTooLongError,
     UnsupportedKindError,
+    UnsupportedMediaError,
     UnsupportedModeError,
 )
 from sysone.models.families import mude
+from sysone.models.vision import merge
 
 CODES = tuple(f"K{index:03d}" for index in range(mude.CODE_ROWS))
 
@@ -61,7 +64,7 @@ class FakeChain:
         self.closed = False
         self._shares = shares
 
-    def forward(self, tokens, *, options, prefix=0, causal=False):
+    def forward(self, tokens, *, options, prefix=0, causal=False, mm=None):
         self.calls.append((tuple(tokens), int(options), int(prefix), int(bool(causal))))
         if self._shares is not None:
             values = list(self._shares[:options])
@@ -358,7 +361,7 @@ def test_prompt_over_max_len_is_422() -> None:
 
 def test_warmup_failure_blocks_start() -> None:
     class UnnormalizedChain(FakeChain):
-        def forward(self, tokens, *, options, prefix=0, causal=False):
+        def forward(self, tokens, *, options, prefix=0, causal=False, mm=None):
             self.calls.append((tuple(tokens), int(options), int(prefix)))
             return [0.1] * options  # 和为 0.1，不是归一化的概率
 
@@ -369,7 +372,7 @@ def test_warmup_failure_blocks_start() -> None:
 
 def test_bad_readout_is_reported_not_rounded() -> None:
     class NaNChain(FakeChain):
-        def forward(self, tokens, *, options, prefix=0, causal=False):
+        def forward(self, tokens, *, options, prefix=0, causal=False, mm=None):
             self.calls.append((tuple(tokens), int(options), int(prefix)))
             return [float("nan")] + [0.3] * (options - 1)
 
@@ -456,7 +459,7 @@ class SharedChain(FakeChain):
         super().__init__(shares=shares)
         self.shared: list[tuple[tuple[int, ...], list[tuple[int, ...]], tuple[int, ...]]] = []
 
-    def forward_shared(self, prefix, tails, *, options, causal=False):
+    def forward_shared(self, prefix, tails, *, options, causal=False, mm=None):
         self.shared.append(
             (tuple(prefix), [tuple(tail) for tail in tails], tuple(int(value) for value in options),
              bool(causal))
@@ -477,7 +480,7 @@ class ScriptedPrompter:
         self.plans = list(plans)
         self.calls = 0
 
-    def encode(self, state, question):
+    def encode(self, state, question, *, images=0):
         plan = self.plans[self.calls]
         self.calls += 1
         return plan
@@ -547,3 +550,14 @@ def test_the_shared_path_gives_the_same_answers_and_usage() -> None:
     serial = serial_runner.answers_for(request, MaskMode.PREFIX_NONCAUSAL)
     assert shared[0] == serial[0]
     assert shared[1] == serial[1]
+
+
+def test_images_are_refused_by_a_model_without_a_tower() -> None:
+    """没有视觉塔的装配收到图：当场拒（422 那一类），不能变成"占位符数不对"的裸 ValueError。"""
+    chain = FakeChain()
+    runner = SplitRunner(lambda: chain, _prompter()[0], max_len=4096)      # 没给 image_token_id
+    runner.load_weights()
+    media = merge.Media(counts=(4,), grids=((2, 2),), rows=np.zeros((4, 8), np.float32))
+    with pytest.raises(UnsupportedMediaError):
+        runner.answers_for(make_request(questions=1), MaskMode.PREFIX_NONCAUSAL, media=media)
+    assert chain.calls == [], "拒收之前不该发生任何前向"
