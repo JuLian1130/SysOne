@@ -1,11 +1,10 @@
 #!/bin/bash
-# 重建 Apple 后端 dylib：libe8ane.dylib（ANE 投影/FFN）与 libe8mtl.dylib（Metal 核）。
+# 重建 Apple 后端的三份 dylib：libe8ane.dylib（ANE 投影/FFN）、libe8mtl.dylib（Metal 核）、
+# libe8image.dylib（视觉的 ImageIO 解码 shim）。
 #
 # 源码仍住在 docs/ANE/anebench（旧研究引擎的位置），产物落在 SYS1_E8_DIR，默认 /tmp/e8。
 # /tmp 是易失目录：重启或清理后 dylib 就没了，旧引擎会直接跑不起来。所以"能从源码重建"
 # 是这条链路的前提，M2 的每一步都依赖它。
-#
-# 有意不编译 e8_image.m（视觉解码 shim）：M2 只做 mude 的文本路径，视觉塔在 M4。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,4 +29,9 @@ clang -dynamiclib -fobjc-arc -O2 -framework Foundation -framework Metal -framewo
 clang -dynamiclib -fobjc-arc -O2 -ffp-contract=off -framework Foundation -framework IOSurface \
       -o "$OUT/libe8ane.dylib" e8_ane.m
 
-ls -l "$OUT/libe8mtl.dylib" "$OUT/libe8ane.dylib"
+# 视觉的图片解码（P1）：ImageIO 的系统解码器，不应用 EXIF 方向、丢 alpha 不合成。
+# 与 `docs/ANE/anebench/build_e8img.sh` 同一条命令行，搬进来是为了"三份 dylib 一条命令重建"。
+clang -dynamiclib -fobjc-arc -O2 -framework Foundation -framework ImageIO \
+      -framework CoreGraphics -o "$OUT/libe8image.dylib" e8_image.m
+
+ls -l "$OUT/libe8mtl.dylib" "$OUT/libe8ane.dylib" "$OUT/libe8image.dylib"
