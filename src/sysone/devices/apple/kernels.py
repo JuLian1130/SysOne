@@ -30,6 +30,7 @@ __all__ = [
     "norm_residual",
     "norm_to",
     "q_prep",
+    "vattn",
 ]
 
 # ---- 几何（默认 = mude 2B，与 e8_common.h:52-67 的默认宏一致）------------------------------
@@ -59,6 +60,7 @@ _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
 _ATTN = struct.Struct("<IIIfIIIIIIIIIIIIII")  # struct AttnArgs，72 B
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
+_VATTN = struct.Struct("<IIIIIf")  # struct VAttnArgs，24 B
 
 
 def nrm_args(
@@ -132,6 +134,17 @@ def attn_args(
         T, stile, s0, scale, nk, nq, nka, segw, nkw, qgT, out_stride, out_s0,
         qseq, words[0], words[1], words[2], words[3], caus,
     )
+
+
+def vattn_args(
+    *, T: int, nq: int, s0: int, hidden: int, dim: int, scale: float
+) -> bytes:
+    """`k_vattn`（`shaders/e8_vattn.metal`）。
+
+    视觉塔的注意力参数比 `k_attn` 少一大半，因为视觉没有 GQA、没有 mask、没有 gate、没有环、
+    没有槽位：`T`/`nq`/`s0` 是 qkv 与 out 的列布局，`hidden`/`dim` 是通道布局，`scale` 是 1/√d。
+    """
+    return _VATTN.pack(T, nq, s0, hidden, dim, scale)
 
 
 def gdn_args(
@@ -455,6 +468,35 @@ def attention(
         ),
         grid=grid,
         tg=tg,
+        lane=lane,
+    )
+
+
+def vattn(
+    runtime: MetalRuntime,
+    qkv: MetalBuffer,
+    out: MetalBuffer,
+    *,
+    T: int,
+    nq: int,
+    hidden: int,
+    dim: int,
+    scale: float,
+    s0: int = 0,
+    lane: int = LANE_LONG,
+) -> None:
+    """视觉塔的非因果注意力：`qkv` 依次是 `[q | k | v]` 各 `hidden` 行，结果写 `out` 的前 `hidden` 行。
+
+    q/k 的轴向 RoPE 由调用方先做完（`vision.py::rope_qk`）：核不读 cos/sin，所以它只是
+    softmax(QKᵀ)·V —— 给定 q/k 之后，注意力本身没有别的约定。
+    一个线程组管 (一个 query, 一个 head)：`grid = (nq, heads)`、`tg = (dim)`。
+    """
+    runtime.dispatch(
+        "k_vattn",
+        [qkv, out],
+        args=vattn_args(T=T, nq=nq, s0=s0, hidden=hidden, dim=dim, scale=scale),
+        grid=(nq, hidden // dim, 1),
+        tg=(dim, 1, 1),
         lane=lane,
     )
 

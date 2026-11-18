@@ -11,11 +11,12 @@
 from __future__ import annotations
 
 import re
+import struct
 
 import numpy as np
 import pytest
 
-from sysone.devices.apple import vision_plan as vp
+from sysone.devices.apple import kernels, vision_plan as vp
 from sysone.errors import NotReadyError
 from sysone.weights.packing.ane_blob import build as build_blob
 
@@ -115,3 +116,39 @@ def test_gelu_carries_the_string_mode_and_layernorm_one_dimensional_tables() -> 
     assert f"tensor<fp16, [{HIDDEN}]> n1_g = const()" in mil
     assert f"tensor<fp16, [{HIDDEN}]> n1_b = const()" in mil
     assert f"tensor<fp16, [1, {HIDDEN}, 1, 1]> n1_g" not in mil
+
+
+def test_io_helpers_are_the_plans_own_numbers() -> None:
+    """`*_io()` 是三个构造器与**缓存命中路径**共用的那一份：命中时不重读权重、不重装 blob，
+    但面还得按同一份布局开 —— 两处各写一遍就会在命中与未命中之间漂开。
+    """
+    entries = _entries(
+        n1_g=(HIDDEN,), n1_b=(HIDDEN,), n2_g=(HIDDEN,), n2_b=(HIDDEN,),
+        qkv=(3 * HIDDEN, HIDDEN), qkv_b=(3 * HIDDEN,),
+        proj=(HIDDEN, HIDDEN), proj_b=(HIDDEN,),
+        fc1=(FFN, HIDDEN), fc1_b=(FFN,), fc2=(HIDDEN, FFN), fc2_b=(HIDDEN,),
+    )
+    blob, table = _blob(entries)
+    assert vp.block_plan(hidden=HIDDEN, ffn=FFN, s=S, entries=entries,
+                         blob=table).io == vp.block_io(hidden=HIDDEN, ffn=FFN, s=S)
+    patch = _entries(pe=(HIDDEN, 3 * 2 * 16 * 16), pe_b=(HIDDEN,))
+    patch_blob, patch_table = _blob(patch)
+    assert vp.patch_plan(hidden=HIDDEN, s=S, entries=patch,
+                         blob=patch_table).io == vp.patch_io(cin=1536, hidden=HIDDEN, s=S)
+    merger = _entries(mn_g=(HIDDEN,), mn_b=(HIDDEN,), m1=(FFN, FFN), m1_b=(FFN,),
+                      m2=(OUT, FFN), m2_b=(OUT,))
+    merger_blob, merger_table = _blob(merger)
+    assert vp.merger_plan(hidden=HIDDEN, ffn=FFN, out_hidden=OUT, s=S, entries=merger,
+                          blob=merger_table).io == vp.merger_io(hidden=HIDDEN, ffn=FFN,
+                                                                out_hidden=OUT, s=S)
+
+
+def test_vattn_args_layout_is_the_msl_struct() -> None:
+    """`k_vattn` 的参数是 24 B：5 个 u32 + 1 个 f32，字段顺序见 `shaders/e8_vattn.metal`。
+
+    dylib 把整块结构体写进 `E8_ARGS_INDEX`，所以格式串就是 ABI 本身：字段顺序错一位，核读到
+    的 `T` 会是 `nq`，形状合法而结果错。
+    """
+    args = kernels.vattn_args(T=4096, nq=4096, s0=0, hidden=1024, dim=64, scale=0.125)
+    assert len(args) == 24
+    assert struct.unpack("<IIIIIf", args) == (4096, 4096, 0, 1024, 64, 0.125)

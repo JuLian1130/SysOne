@@ -35,7 +35,12 @@ MTL_DYLIB_NAME = "libe8mtl.dylib"
 # 代码走，而 `docs/` 是独立的本地仓库、不进主仓库也不进安装包。唯一的功能改动写在
 # `shaders/e8_attn.metal` 顶部：原实现的分片搬运用了 lambda，本机 MSL 编译器不支持，已展开成
 # `at_stage()`，循环体逐字保留。
-SOURCES = ("e8_common.h", "e8_kernels.metal", "e8_attn.metal", "e8_gdn.metal")
+#
+# `e8_vattn.metal`（视觉塔的非因果注意力）**没有旧引擎的对应物**：旧引擎的视觉注意力是另一份
+# 核，本机跑不起来那份源码，所以票据 07 §7.6 先做了可行性探针（5 份源码同一次 `e8m_init_src`
+# 编译通过、两个新核都能 dispatch），这里照那个结论把视觉核并进同一份编译。
+SOURCES = ("e8_common.h", "e8_kernels.metal", "e8_attn.metal", "e8_gdn.metal",
+           "e8_vattn.metal")
 
 # 两条命令队列（`docs/ANE/anebench/e8_mtl.m:51-72` 的 `E8_NLANE`）：
 #   lane 0 —— 长任务：`k_attn` / `k_q_prep` / `k_kv_prep`，以及 ANE 藏在其后的那些 stage；

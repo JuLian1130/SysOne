@@ -279,7 +279,7 @@ class SplitChain:
                       for index, role in enumerate(roles)]
             # 产物目录按 (模型, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
             # 的测试就会把 `s=1024` 的缓存顶掉，下一次装载要多花 9 s 重算权重与量化。
-            program_root = _program_root(scratch, weights, s=s)
+            program_root = _program_root(scratch, weights.descriptor, s=s)
             # 逐层的 (目录, 身份) 与 `artifact_state` 共用同一份计算：两处各写一遍，
             # `doctor` 报的"命中"就会与装载的实际复用慢慢漂开。
             plan = _artifact_plan(store, weights=weights, program_root=program_root,
@@ -730,7 +730,7 @@ def _artifacts_root(artifacts_dir: str | Path | None) -> Path:
     return Path(tempfile.gettempdir()) / "sysone-mude-chain"
 
 
-def _program_root(artifacts_root: Path, weights: WeightPlan, *, s: int) -> Path:
+def _program_root(artifacts_root: Path, descriptor: ModelDescriptor, *, s: int) -> Path:
     """这份权重的产物目录：`<root>/<family>-<model>/s<s>`。
 
     家族名进键是因为 `model_id` **只是目录名**（`models/families/*.py` 里都写
@@ -738,7 +738,6 @@ def _program_root(artifacts_root: Path, weights: WeightPlan, *, s: int) -> Path:
     模型顶掉同一层目录，每次切换都重编一遍。桶宽进键是因为一次 `s=256` 的探针不该顶掉
     `s=1024` 的缓存。
     """
-    descriptor = weights.descriptor
     return Path(artifacts_root) / f"{descriptor.family}-{descriptor.model_id}" / f"s{int(s)}"
 
 
@@ -803,7 +802,7 @@ def artifact_state(
     + 同一个 `cached_program`），所以这里说命中、`serve` 的那一段就真的是 0 秒。
     """
     store = open_checkpoint(Path(model_dir))
-    program_root = _program_root(_artifacts_root(artifacts_dir), weights, s=int(s))
+    program_root = _program_root(_artifacts_root(artifacts_dir), weights.descriptor, s=int(s))
     plan = _artifact_plan(store, weights=weights, program_root=program_root, s=int(s),
                           quantize=quantize)
     return ArtifactState(

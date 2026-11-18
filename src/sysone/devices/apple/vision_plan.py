@@ -44,6 +44,25 @@ class ProgramPlan:
     io: dict[str, tuple[int, int, int, int]]
 
 
+def patch_io(*, cin: int, hidden: int, s: int) -> dict[str, tuple[int, int, int, int]]:
+    """patch 投影的面尺寸。与 `patch_plan` 分开是因为**缓存命中时也要它** —— 产物命中就不该
+    再读权重、装 blob，但面还是要按同一份布局开。"""
+    return {"main": (cin, s, hidden, s)}
+
+
+def block_io(*, hidden: int, ffn: int, s: int) -> dict[str, tuple[int, int, int, int]]:
+    """一个 block 三个 procedure 的面尺寸（见 `block_plan` 的说明）。"""
+    return {"main": (hidden, s, 3 * hidden, s), "p1": (2 * hidden, s, hidden, s),
+            "p2": (hidden, s, hidden, s)}
+
+
+def merger_io(*, hidden: int, ffn: int, out_hidden: int, s: int
+              ) -> dict[str, tuple[int, int, int, int]]:
+    """merger 两趟的面尺寸：`main` 在趟内把列数从 `s` 掉到 `s//4`。"""
+    q = s // 4
+    return {"main": (hidden, s, ffn, q), "p1": (ffn, q, out_hidden, q)}
+
+
 def patch_plan(*, hidden: int, s: int, entries: dict[str, np.ndarray],
                blob: dict[str, BlobEntry]) -> ProgramPlan:
     """patch 投影：`[1, 3×2×16×16, 1, s]` → `[1, hidden, 1, s]`。
@@ -56,7 +75,7 @@ def patch_plan(*, hidden: int, s: int, entries: dict[str, np.ndarray],
     body += _bias("pe", c=hidden, s=s, src="pt", out="y", entry=blob["pe_b"])
     mil = _program([_func("main", func_input=f"tensor<fp16, [1, {patch}, 1, {s}]> x",
                           body=body)])
-    return ProgramPlan(mil=mil, io={"main": (patch, s, hidden, s)})
+    return ProgramPlan(mil=mil, io=patch_io(cin=patch, hidden=hidden, s=s))
 
 
 def block_plan(*, hidden: int, ffn: int, s: int, entries: dict[str, np.ndarray],
@@ -97,11 +116,7 @@ def block_plan(*, hidden: int, ffn: int, s: int, entries: dict[str, np.ndarray],
         _func("p1", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x", body=body1),
         _func("p2", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x", body=body2),
     ])
-    return ProgramPlan(mil=mil, io={
-        "main": (hidden, s, 3 * hidden, s),
-        "p1": (2 * hidden, s, hidden, s),
-        "p2": (hidden, s, hidden, s),
-    })
+    return ProgramPlan(mil=mil, io=block_io(hidden=hidden, ffn=ffn, s=s))
 
 
 def merger_plan(*, hidden: int, ffn: int, out_hidden: int, s: int,
@@ -128,7 +143,7 @@ def merger_plan(*, hidden: int, ffn: int, out_hidden: int, s: int,
         _func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x", body=body0),
         _func("p1", func_input=f"tensor<fp16, [1, {ffn}, 1, {q}]> x", body=body1),
     ])
-    return ProgramPlan(mil=mil, io={"main": (hidden, s, ffn, q), "p1": (ffn, q, out_hidden, q)})
+    return ProgramPlan(mil=mil, io=merger_io(hidden=hidden, ffn=ffn, out_hidden=out_hidden, s=s))
 
 
 # ---------------------------------------------------------------- MIL 片段
