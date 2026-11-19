@@ -1,8 +1,9 @@
-"""长 pass 闸的语义：跨 fd 互斥、短 pass 不挡、异常与进程退出都会释放。
+"""在飞长度预算的语义：单条永远整趟跑、合计超预算才排队、锁随 fd 释放。
 
-`flock` 的锁跟 fd 走，所以同一进程里**两个不同的 fd** 也会互相阻塞 —— 这正是它比
-`threading.Semaphore` 更适合这里的原因（闸要管的是另一个 worker 进程，不是另一个线程）。
-真跨进程那一段用子进程验，其余用线程：都属于毫秒级、不碰 ANE。
+要点（票 §7.25h）：
+- 预算按**合计**算，不按单条 —— 单条 16k 拿满 4 格，自己永远能跑；
+- 两条的合计超过预算时，后来的那条排队，先来的不会被抢；
+- 锁是 `flock`，所以**跨进程**有效，且进程崩溃/被 kill 时由内核释放。
 """
 
 from __future__ import annotations
@@ -16,15 +17,16 @@ from pathlib import Path
 
 import pytest
 
-from sysone.devices.apple.longpass import LONG_PASS_TOKENS, LongPass
+from sysone.devices.apple.longpass import BUDGET_TOKENS, QUANTUM_TOKENS, LongPass
 
 SRC = Path(__file__).resolve().parents[2] / "src"
 
 
-def _hold_for(slot: LongPass, length: int, seconds: float, *, name: str,
-              events: dict[str, float]) -> threading.Thread:
+def _hold(slot: LongPass, length: int, seconds: float, *, name: str,
+          events: dict[str, float]) -> threading.Thread:
+    """跑一条 pass；记**绝对**单调时刻（各线程记相对时刻基线不同，比较没有意义）。"""
+
     def body() -> None:
-        # 记**绝对**单调时刻：两个线程各记相对时刻的话，基线不同，比较就没有意义。
         with slot.hold(length):
             events[f"{name}_at"] = time.monotonic()
             time.sleep(seconds)
@@ -35,52 +37,74 @@ def _hold_for(slot: LongPass, length: int, seconds: float, *, name: str,
     return thread
 
 
-def test_the_threshold_is_the_documented_one() -> None:
-    """阈值是票里的数：超出桶宽（1024）四倍才算长 pass。"""
-    assert LONG_PASS_TOKENS == 4096
+def test_the_budget_is_one_full_width_sequence() -> None:
+    assert BUDGET_TOKENS == 16_384, "预算 = SchedulerConfig.max_len"
+    assert QUANTUM_TOKENS * 4 == BUDGET_TOKENS
     slot = LongPass()
-    assert not slot.blocked(LONG_PASS_TOKENS), "等于阈值不算长"
-    assert slot.blocked(LONG_PASS_TOKENS + 1)
+    assert slot.quanta_for(1) == 1
+    assert slot.quanta_for(QUANTUM_TOKENS) == 1
+    assert slot.quanta_for(QUANTUM_TOKENS + 1) == 2
+    assert slot.quanta_for(8_192) == 2
+    assert slot.quanta_for(BUDGET_TOKENS) == 4
 
 
-def test_a_long_pass_waits_for_another_long_pass(tmp_path: Path) -> None:
-    slot = LongPass(tmp_path / "gate.lock")
+def test_a_single_long_sequence_always_runs_whole(tmp_path: Path) -> None:
+    """单条超过一格预算也要整趟跑完 —— 只是它会把全部格子占满。"""
+    slot = LongPass(tmp_path)
+    with slot.hold(BUDGET_TOKENS):
+        assert slot.acquired == 1
+    assert slot.quanta_for(BUDGET_TOKENS) == slot.quanta
+
+
+def test_two_short_passes_run_at_the_same_time(tmp_path: Path) -> None:
+    """合计在预算以内：第二条不等。"""
+    slot = LongPass(tmp_path)
     events: dict[str, float] = {}
-    first = _hold_for(slot, 16_384, 0.30, name="first", events=events)
-    time.sleep(0.05)                      # 让第一条先进闸
-    second = _hold_for(slot, 16_384, 0.0, name="second", events=events)
+    first = _hold(slot, 2_048, 0.30, name="a", events=events)
+    time.sleep(0.05)
+    second = _hold(slot, 2_048, 0.30, name="b", events=events)
     first.join()
     second.join()
-    assert events["second_at"] >= events["first_done"] - 0.01, "第二条必须等第一条退出"
-    assert events["second_at"] - events["first_at"] >= 0.20, "第二条没有真的等"
-    assert slot.acquired == 2
+    assert events["b_at"] - events["a_at"] < 0.15, "两条短的应该并行"
 
 
-def test_a_short_pass_never_waits(tmp_path: Path) -> None:
-    port = LongPass(tmp_path / "gate.lock")
+def test_two_long_passes_serialize_when_the_sum_exceeds_the_budget(tmp_path: Path) -> None:
+    """8k + 12k = 20k > 16k ⇒ 后来的排队（8k+8k 恰好等于预算，是并行的那一侧）。"""
+    slot = LongPass(tmp_path)
     events: dict[str, float] = {}
-    holder = _hold_for(port, 16_384, 0.30, name="long", events=events)
+    first = _hold(slot, 8_192, 0.30, name="a", events=events)
     time.sleep(0.05)
-    with port.hold(2048):                 # 短 pass 直接过，不等那把锁
-        pass
-    holder.join()
-    assert port.acquired == 1, "只有长 pass 记账"
+    second = _hold(slot, 12_288, 0.0, name="b", events=events)
+    first.join()
+    second.join()
+    assert events["b_at"] >= events["a_done"] - 0.01, "合计 20k 超过 16k，不该并行"
+    assert events["b_at"] - events["a_at"] >= 0.20
 
 
-def test_the_lock_is_released_when_the_pass_raises(tmp_path: Path) -> None:
-    slot = LongPass(tmp_path / "gate.lock")
+def test_the_budget_is_exactly_reachable(tmp_path: Path) -> None:
+    """8k + 8k = 16k 恰好等于预算 ⇒ 并行（边界按"不超过"算）。"""
+    slot = LongPass(tmp_path)
+    events: dict[str, float] = {}
+    first = _hold(slot, 8_192, 0.30, name="a", events=events)
+    time.sleep(0.05)
+    second = _hold(slot, 8_192, 0.30, name="b", events=events)
+    first.join()
+    second.join()
+    assert events["b_at"] - events["a_at"] < 0.15, "合计正好等于预算时应该并行"
+
+
+def test_a_failed_pass_gives_its_budget_back(tmp_path: Path) -> None:
+    slot = LongPass(tmp_path)
     with pytest.raises(RuntimeError):
-        with slot.hold(8192):
+        with slot.hold(BUDGET_TOKENS):
             raise RuntimeError("pass 炸了")
-    # 还能再拿到 —— 异常没把锁留下
-    with slot.hold(8192):
+    with slot.hold(BUDGET_TOKENS):       # 4 格都还回来了
         pass
     assert slot.acquired == 2
 
 
-def test_another_process_blocks_on_the_same_gate(tmp_path: Path) -> None:
-    """真跨进程：子进程拿锁期间，父进程的长 pass 必须等。"""
-    gate = tmp_path / "gate.lock"
+def test_another_process_holds_the_budget(tmp_path: Path) -> None:
+    """真跨进程：子进程占满预算期间，父进程的 pass 必须排队。"""
     child = textwrap.dedent(
         """
         import sys, time
@@ -93,25 +117,24 @@ def test_another_process_blocks_on_the_same_gate(tmp_path: Path) -> None:
             time.sleep(0.6)
         """
     )
-    proc = subprocess.Popen([sys.executable, "-c", child, str(SRC), str(gate)],
+    proc = subprocess.Popen([sys.executable, "-c", child, str(SRC), str(tmp_path)],
                             stdout=subprocess.PIPE, text=True)
     try:
         assert proc.stdout is not None
-        assert proc.stdout.readline().strip() == "held"     # 子进程已进闸
-        slot = LongPass(gate)
+        assert proc.stdout.readline().strip() == "held"
+        slot = LongPass(tmp_path)
         started = time.monotonic()
-        with slot.hold(16_384):
+        with slot.hold(2_048):
             waited = time.monotonic() - started
-        assert waited >= 0.3, f"父进程只等了 {waited:.2f} s，闸没生效"
+        assert waited >= 0.3, f"父进程只等了 {waited:.2f} s，预算没生效"
     finally:
         proc.kill()
         proc.wait(timeout=5)
 
 
-def test_disabling_the_gate_makes_every_length_a_pass(tmp_path: Path) -> None:
-    """`tokens <= 0` 是"关掉"—— 部署在内存宽裕的机器上时用这一档。"""
-    slot = LongPass(tmp_path / "gate.lock", tokens=0)
-    assert not slot.blocked(1 << 20)
+def test_disabling_the_budget_lets_everything_through(tmp_path: Path) -> None:
+    slot = LongPass(tmp_path, budget=0)
+    assert slot.quanta_for(1 << 20) == 0
     with slot.hold(1 << 20):
         pass
     assert slot.acquired == 0

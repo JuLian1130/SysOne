@@ -122,7 +122,8 @@ class MudePipeline:
         residency: Residency | None = None,
     ) -> None:
         self._runtime = runtime
-        # 长 pass 的闸：跨进程、只对 `length > 4096` 生效（见 `longpass.py` 的推导）。
+        # 在飞长度的跨进程预算：合计超过一条满宽序列时后来者排队，单条永远整趟跑
+        # （`longpass.py` 有预算与实测的推导）。
         self._longpass = LongPass()
         self._geometry = mude_geometry() if geometry is None else geometry
         self._geometry.validate()
@@ -293,8 +294,8 @@ class MudePipeline:
             raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
         if int(np.asarray(rows).shape[0]) != length:
             raise ConfigError("行数与长度不一致", rows=int(np.asarray(rows).shape[0]), length=length)
-        # 长 pass 串行化：画布与工作区按这一趟的长度分配，两个进程同时跑长的会把整机压垮
-        # （`longpass.py`）。短 pass 不过闸，所以常态请求不受影响。
+        # 占住这一趟的预算：画布与工作区按在飞的最长 pass 分配，两个进程同时跑长的会把整机
+        # 压垮（`longpass.py`）。合计不超预算时这里不会阻塞。
         with self._longpass.hold(length):
             view = self.x.array(np.float16, (self._hidden, self._width))
             self._write_rows(view, rows, 0)
@@ -342,7 +343,7 @@ class MudePipeline:
         lengths = [int(np.asarray(tail).shape[0]) for tail in tails]
         if min(lengths) <= 0:
             raise ConfigError("尾巴至少要有一个 token", lengths=lengths)
-        # 这个请求最长的那一趟是 `prefix + 最长尾巴`，闸按它算（批量路径同宽）。
+        # 这个请求最长的那一趟是 `prefix + 最长尾巴`，预算按它算（批量路径同宽）。
         with self._longpass.hold(prefix + max(lengths)):
             layout = self._slot_layout(prefix, lengths)
             if layout is not None:
