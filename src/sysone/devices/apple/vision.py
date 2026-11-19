@@ -362,13 +362,18 @@ class VisionTower:
         cos, sin = rope_tables(rows, cols, head_dim=self.head_dim, theta=float(spec.rope_theta))
         cos16, sin16 = cos.astype(np.float16), sin.astype(np.float16)
 
-        residual = np.empty((length, self.hidden), np.float16)
+        # 残差按**通道主序** `(hidden, L)` 存，与 ANE 的表面同序：token 主序时每一次进出表面
+        # 都要转一次置，实测 3.3 GB/s，一图（1024²）付 216 ms —— 旧引擎 §4.10.1 的同一个坑。
+        # 改成通道主序后同一条语句是 13–41 GB/s，整图拷贝账 216 → 26 ms（票据 07 §7.13）。
+        residual = np.empty((self.hidden, length), np.float16)
+        pos_cm = np.ascontiguousarray(pos.T)          # 每图一次，别放进瓦片循环
         try:
             # 1) patch 投影 + pos_embed（两块 fp16 相加，与厂商的 `h + pos` 同一步）
             for lo, n in self._tiles(length):
                 self._put("patch_in", self.cin, tokens[lo:lo + n].T)
                 self._call(self._programs["patch"], "main")
-                residual[lo:lo + n] = self._take(self._programs["patch"], "main", n).T + pos[lo:lo + n]
+                residual[:, lo:lo + n] = self._take(self._programs["patch"], "main", n) \
+                    + pos_cm[:, lo:lo + n]
 
             # 2) 24 个 block：每层先把整图的 qkv 收齐，注意力按**整图**算，再分趟喂回去。
             # q、k 的轴向 RoPE 在 GPU 上做（`k_vrope`），所以主机上不再需要那块整宽数组：每个瓦片
@@ -390,7 +395,7 @@ class VisionTower:
                 for index in range(int(spec.depth)):
                     block = self._programs[f"block{index:02d}"]
                     for lo, n in tiles:
-                        self._put("hidden_in", self.hidden, residual[lo:lo + n].T)
+                        self._put("hidden_in", self.hidden, residual[:, lo:lo + n])
                         self._call(block, "main")
                         qkv_view[:, lo:lo + n] = self._take(block, "main", n)
                     vrope(self.metal, qkv_dev, cos_dev, sin_dev, T=length,
@@ -411,9 +416,9 @@ class VisionTower:
                             self.metal.commit()
                         attn = self._view("attn", 2 * self.hidden)
                         attn[:self.hidden, :n] = ctx_view[:, lo:lo + n]
-                        attn[self.hidden:, :n] = residual[lo:lo + n].T
+                        attn[self.hidden:, :n] = residual[:, lo:lo + n]
                         self._call(block, "p1")          # proj → 残差 → norm2 → FFN → 残差
-                        residual[lo:lo + n] = self._take(block, "p1", n).T
+                        residual[:, lo:lo + n] = self._take(block, "p1", n)
             finally:
                 for dev in (qkv_dev, ctx_dev, cos_dev, sin_dev):
                     dev.free()
@@ -421,7 +426,7 @@ class VisionTower:
             # 3) merger：每趟把 2×2 合成 4·hidden，再 fc1 → gelu → fc2
             merged = np.empty((length // self.unit, self.out_hidden), np.float16)
             for lo, n in self._tiles(length):
-                self._put("hidden_in", self.hidden, residual[lo:lo + n].T)
+                self._put("hidden_in", self.hidden, residual[:, lo:lo + n])
                 self._call(self._programs["merger"], "main")
                 self._call(self._programs["merger"], "p1")
                 merged[lo // self.unit:(lo + n) // self.unit] = \
