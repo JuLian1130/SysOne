@@ -23,7 +23,7 @@ CoreGraphics 另一套），只在色度有高频的地方显形。这一层的�
 的基线是 1e-2 而不是 1e-3（票据 07 §2.3 #3.2）。
 
 dylib 由 `tools/build_ane.sh` 从 `docs/ANE/anebench/e8_image.m` 编译到 `SYS1_E8_DIR`
-（默认 `/tmp/e8`）。那是易失目录，所以"找不到就报 `NotReadyError`"而不是静默降级 ——
+（默认 `<仓库>/.tmp/e8`），所以"找不到就报 `NotReadyError`"而不是静默降级 ——
 与 `runtime.py` 同一个形态。**导入这个模块不需要编译**：库在第一次 `decode` 时才加载。
 
 这里的错误分两种，别混：**dylib 不在**是 `NotReadyError`（503，运维该去重建），**字节不是
@@ -40,6 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from ...errors import NotReadyError, UnsupportedMediaError
+from .paths import dylib_dir
 
 DYLIB_NAME = "libe8image.dylib"
 _REQUIRED = ("e8_img_decode", "e8_img_free", "e8_img_size")
@@ -52,7 +53,7 @@ _lib_path: str | None = None
 def _dylib_path(explicit: str | os.PathLike | None) -> Path:
     if explicit is not None:
         return Path(explicit)
-    return Path(os.environ.get("SYS1_E8_DIR", "/tmp/e8")) / DYLIB_NAME
+    return dylib_dir() / DYLIB_NAME
 
 
 def _load(path: str | os.PathLike | None) -> ctypes.CDLL:

@@ -30,7 +30,9 @@ TOL = 5e-3  # prep/attention 的算术都在 fp32 里做，5e-3 已经比 fp16 �
 
 
 def _skip_reason() -> str | None:
-    e8 = Path(os.environ.get("SYS1_E8_DIR", "/tmp/e8"))
+    from sysone.devices.apple.paths import dylib_dir
+
+    e8 = dylib_dir()
     if not (e8 / "libe8mtl.dylib").is_file():
         return "没有 libe8mtl.dylib（先跑 tools/build_ane.sh）"
     if not _WEIGHTS.is_file():

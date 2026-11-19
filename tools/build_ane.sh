@@ -2,14 +2,14 @@
 # 重建 Apple 后端的三份 dylib：libe8ane.dylib（ANE 投影/FFN）、libe8mtl.dylib（Metal 核）、
 # libe8image.dylib（视觉的 ImageIO 解码 shim）。
 #
-# 源码仍住在 docs/ANE/anebench（旧研究引擎的位置），产物落在 SYS1_E8_DIR，默认 /tmp/e8。
-# /tmp 是易失目录：重启或清理后 dylib 就没了，旧引擎会直接跑不起来。所以"能从源码重建"
-# 是这条链路的前提，M2 的每一步都依赖它。
+# 源码仍住在 docs/ANE/anebench（旧研究引擎的位置），产物落在 SYS1_E8_DIR，默认 $REPO/.tmp/e8。
+# 不放 /tmp：本机开机会把它整个清空，清空后整条 ANE 路径都以"找不到 dylib"失败（测试会
+# 全套 skip/失败），而代价只是重编一次。`.tmp/` 被 .gitignore 忽略，可随时 rm -rf。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${ANE_SRC:-$REPO/docs/ANE/anebench}"
-OUT="${SYS1_E8_DIR:-/tmp/e8}"
+OUT="${SYS1_E8_DIR:-$REPO/.tmp/e8}"
 
 if [ ! -d "$SRC" ]; then
   echo "找不到 ANE 源码目录：$SRC（可用 ANE_SRC 指定）" >&2

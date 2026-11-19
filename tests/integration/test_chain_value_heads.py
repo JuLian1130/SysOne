@@ -30,7 +30,9 @@ TOKENS = [7, 11, 13, 17, 19, 23]
 def _skip_reason() -> str | None:
     if sys.platform != "darwin":
         return "ANE / Metal 只在 macOS 上"
-    e8 = Path(os.environ.get("SYS1_E8_DIR", "/tmp/e8"))
+    from sysone.devices.apple.paths import dylib_dir
+
+    e8 = dylib_dir()
     if not (e8 / "libe8mtl.dylib").is_file():
         return "没有 libe8mtl.dylib（先跑 tools/build_ane.sh）"
     from sysone.devices.apple import available

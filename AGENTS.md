@@ -19,6 +19,17 @@ issue 与 spec 以本地 markdown 形式存放于 `.scratch/`（不走 GitHub Is
 
 单上下文（single-context）：仓库根目录的 `GLOSSARY.md`，加上 `docs/adr/`。详见 `docs/agents/domain.md`。
 
+### Local scratch（本机临时产物）
+
+本机临时产物放仓库根的 `.tmp/`（已被 `.gitignore` 忽略），**不要**放 `/tmp` 或 `$TMPDIR`：本机开机会清空 `/tmp`（2026-11-19 实测：重启后 `/tmp` 里没有一项早于 boottime），macOS 还会按访问时间清理 `$TMPDIR` 里的条目。两种失效都表现为"重启后一切重算"，而代价本该只是重编一次。
+
+| 东西 | 落点 |
+|---|---|
+| dylib、Metal 几何头、测试依赖、探针输出 | `.tmp/`（`bash tools/build_ane.sh` 默认写 `.tmp/e8`） |
+| 编译产物（GB 级，与 `serve` 共用） | 平台缓存目录（`StorageConfig.resolved_artifacts_dir()`） |
+
+`.tmp/` 随时可以 `rm -rf`。
+
 
 ## 复杂度控制原则
 

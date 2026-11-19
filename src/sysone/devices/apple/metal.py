@@ -8,7 +8,7 @@ Metal 的 kernel 是启动时现场编译的。本机只有 Command Line Tools�
 这一层只做三件事：绑定符号、把错误串变成异常、把一块内存抽象成 `MetalBuffer`。
 kernel 的参数结构体与启动网格在 `kernels.py`，接进模型链在 `chain.py`。
 
-dylib 由 `tools/build_ane.sh` 重建，产物在 `SYS1_E8_DIR`（默认 `/tmp/e8`）——易失目录，
+dylib 由 `tools/build_ane.sh` 重建，产物在 `SYS1_E8_DIR`（默认 `<仓库>/.tmp/e8`），
 所以"找不到就报 `NotReadyError`"，不静默降级。
 """
 
@@ -18,13 +18,14 @@ import ctypes
 import hashlib
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
+from ...env import scratch_root
 from ...errors import ConfigError, NotReadyError, SysOneError
 from .geometry import Geometry, mude_geometry
+from .paths import dylib_dir
 
 MTL_DYLIB_NAME = "libe8mtl.dylib"
 
@@ -75,7 +76,7 @@ _REQUIRED = (
 def _dylib_path(explicit: str | os.PathLike | None) -> Path:
     if explicit is not None:
         return Path(explicit)
-    return Path(os.environ.get("SYS1_E8_DIR", "/tmp/e8")) / MTL_DYLIB_NAME
+    return dylib_dir() / MTL_DYLIB_NAME
 
 
 def _sources_dir(explicit: str | os.PathLike | None) -> Path:
@@ -99,7 +100,7 @@ def _write_geometry_header(geometry: Geometry) -> Path:
     digest = hashlib.sha256(
         "|".join(f"{name}={value}" for name, value in sorted(geometry.defines().items())).encode()
     ).hexdigest()[:16]
-    directory = Path(tempfile.gettempdir()) / "sysone-metal"
+    directory = scratch_root() / "metal"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"e8_geometry_{digest}.h"
     text = geometry.header()
@@ -210,7 +211,7 @@ class MetalRuntime:
             raise NotReadyError(
                 "找不到 libe8mtl.dylib",
                 path=str(dylib),
-                hint="运行 tools/build_ane.sh 重建（/tmp/e8 是易失目录）",
+                hint="运行 tools/build_ane.sh 重建（产物在 .tmp/e8，被 .gitignore 忽略）",
             )
         self.path = dylib
         self._geometry = geometry

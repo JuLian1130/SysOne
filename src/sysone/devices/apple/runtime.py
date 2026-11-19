@@ -4,7 +4,7 @@
 都在 M2.1 的 `compile.py`，不放这里。
 
 dylib 由 `tools/build_ane.sh` 从 `docs/ANE/anebench/e8_ane.m` 重建；产物在
-`SYS1_E8_DIR`（默认 `/tmp/e8`），那是易失目录，所以"找不到就报 NotReady"而不是静默降级。
+`SYS1_E8_DIR`（默认 `<仓库>/.tmp/e8`），所以"找不到就报 NotReady"而不是静默降级。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from ...errors import NotReadyError
+from .paths import dylib_dir
 
 DYLIB_NAME = "libe8ane.dylib"
 
@@ -50,7 +51,7 @@ _REQUIRED = (
 def _dylib_path(explicit: str | os.PathLike | None) -> Path:
     if explicit is not None:
         return Path(explicit)
-    return Path(os.environ.get("SYS1_E8_DIR", "/tmp/e8")) / DYLIB_NAME
+    return dylib_dir() / DYLIB_NAME
 
 
 class Surface:
