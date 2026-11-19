@@ -86,7 +86,9 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument(
         "--vision-idle", type=float, default=_VISION_IDLE, dest="vision_idle",
         help=f"视觉塔空闲多少秒后真卸载（默认 {_VISION_IDLE:.0f}；0 = 每请求后立刻卸）。"
-             "卸载是把 26 个 program 卸掉、面释放，不是挂起",
+             "卸载是把 26 个 program 卸掉、面释放，不是挂起。代价已实测：卸一次 31 ms，"
+             "装回来 80 ms（其中 64 是 ANE 装载），端到端每图 +119 ms（1024²）/ +78 ms（512²）；"
+             "换来空闲时释放 629–690 MiB（随桶宽）",
     )
     common.add_argument(
         "--vision-bucket", type=int, default=None, dest="vision_bucket", metavar="COLS",
