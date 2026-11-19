@@ -15,7 +15,9 @@ class SchedulerConfig:
     - `attention_mode=None`：跟随模型自身的 `default_mode`（mude 建议 prefix_noncausal）。
     - `resident_w` / `ring`：常驻窗口与层环大小（M0 只做校验，M2 才真正分块）。
     - `tile`：掩码分窗的 token 粒度，0 表示整段一个窗口。
-    - `queue`：准入等待队列上限（服务层用，M0 CLI 不用）。
+    - `queue`：准入等待队列上限（服务层用）。默认 8 而不是 2：批处理要有原料才能攒批，
+      排队位太少时请求还没进来就被拒了（旧引擎的出厂值也是 8）。
+    - `batch`：一个 pass 最多装几条请求，0/1 表示不攒批。实测收益见票据 07 §7.25j。
     - `max_len`：序列上限，超了直接 422。
     """
 
@@ -23,7 +25,8 @@ class SchedulerConfig:
     resident_w: int = 4
     ring: int = 4
     tile: int = 0
-    queue: int = 2
+    queue: int = 8
+    batch: int = 4
     max_len: int = 16384
 
     def validate(self) -> None:
@@ -33,6 +36,8 @@ class SchedulerConfig:
             raise ConfigError("ring 必须 >= 1", ring=self.ring)
         if self.queue < 0:
             raise ConfigError("queue 必须 >= 0", queue=self.queue)
+        if self.batch < 0:
+            raise ConfigError("batch 必须 >= 0", batch=self.batch)
         if self.tile < 0:
             raise ConfigError("tile 必须 >= 0", tile=self.tile)
         if self.max_len < 1:

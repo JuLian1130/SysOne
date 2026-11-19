@@ -90,8 +90,15 @@ class Engine:
         self._startup = times
         return times
 
-    def run(self, request: DecisionRequest) -> DecisionResult:
-        started = time.perf_counter()
+    @property
+    def batch_limit(self) -> int:
+        """一个 pass 最多装几条请求：执行器支持 `answers_batch` 才有得装，否则 1。"""
+        if not callable(getattr(self._runner, "answers_batch", None)):
+            return 1
+        return max(1, int(self._config.scheduler.batch))
+
+    def _mode_of(self, request: DecisionRequest) -> MaskMode:
+        """校验请求能不能跑，并定下这次用哪个掩码。"""
         if request.media:
             reason = self.vision_unavailable()
             if reason is not None:
@@ -109,6 +116,42 @@ class Engine:
                 mode=mode.value,
                 supported=sorted(item.value for item in self._descriptor.supported_modes),
             )
+        return mode
+
+    def batch(self, requests: Sequence[DecisionRequest]) -> list[DecisionResult]:
+        """多条请求合进一个 pass —— 只要它们都没有图、且落在同一个掩码上。
+
+        调用方（服务层的攒批器）负责"同 mode、无图"这两条；这里再核一遍是因为**静默跑错**
+        比**报错**贵得多：模式不同的两条拼进一个 pass，答案是错的但看不出来。
+
+        每条请求的 `timings.prefill` / `readout` 拿到的是**整批**的墙时（它确实等了这么久），
+        单元计数仍按各自的实际 token 数记。
+        """
+        if not requests:
+            return []
+        modes = {self._mode_of(request) for request in requests}
+        if len(modes) > 1:
+            raise ConfigError("一个批里的注意力模式必须相同", modes=sorted(m.value for m in modes))
+        mode = modes.pop()
+        if any(request.media for request in requests):
+            raise ConfigError("批里不能有带图的请求", images=sum(1 for r in requests if r.media))
+        started = time.perf_counter()
+        prepared = time.perf_counter()
+        ran = self._runner.answers_batch(tuple(requests), mode)
+        prefill_s = time.perf_counter() - prepared
+        vendor_name = getattr(self._runner, "bridge_name", None)
+        return [
+            self._result(request, mode, answers, tokens, prefill_s, prefill_s,
+                         started, prepared, vendor_name, batched=len(requests))
+            for request, (answers, tokens, _) in zip(requests, ran)
+        ]
+
+    def run(self, request: DecisionRequest) -> DecisionResult:
+        if self.batch_limit > 1 and not request.media:
+            # 单条也走批那条路：免得"批里 1 条"和"直接跑 1 条"是两条代码路。
+            return self.batch([request])[0]
+        started = time.perf_counter()
+        mode = self._mode_of(request)
         vendor = getattr(self._runner, "answers_for", None)
         prepared = time.perf_counter()
         vendor_name: str | None = None
@@ -138,6 +181,19 @@ class Engine:
             tails = sum(plan.seq_len() - plan.prefix_len for plan in plans)
             usage = Usage(input_tokens=prefix_len + tails, prefill_calls=len(plans))
 
+        return self._result(request, mode, answers, usage.input_tokens, prefill_s, readout_s,
+                           started, prepared, vendor_name, batched=0)
+
+    def _result(
+        self, request: DecisionRequest, mode: MaskMode, answers: Sequence[Answer],
+        tokens: int, prefill_s: float, readout_s: float, started: float, prepared: float,
+        vendor_name: str | None, *, batched: int,
+    ) -> DecisionResult:
+        """一次（或一批里的一条）请求的收尾：告警、provenance、计数、`DecisionResult`。
+
+        `batched` 只是记账用的旁证（0 = 不是批路径），不改变结果。
+        """
+        usage = Usage(input_tokens=tokens, prefill_calls=len(answers))
         trained = mode in self._descriptor.trained_modes
         if not trained and mode not in self._warned_modes:
             self._warned_modes.add(mode)
@@ -175,6 +231,7 @@ class Engine:
             provenance=provenance,
             timings=timings,
         )
+
 
     def step(self) -> StepResult:
         plans = self._scheduler.schedule()

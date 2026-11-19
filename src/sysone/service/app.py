@@ -27,6 +27,7 @@ from ..engine.stats import RunStats
 from ..errors import NotReadyError, SysOneError
 from . import protocol
 from .admission import Admission
+from .batching import Batcher
 
 IDLE_SECONDS = 120
 RETRY_AFTER_SECONDS = 1
@@ -73,6 +74,10 @@ class EngineDecider:
         self.model_name = model_name
         self.max_input_tokens = int(max_input_tokens)
         self.debug_timings = bool(debug_timings)
+        # 攒批器只在执行器支持 `batch` 时才有：不支持的装配（reference、替身）走原来的直路。
+        self.batcher = Batcher(engine) if callable(getattr(engine, "batch", None)) else None
+        if self.batcher is not None:
+            self.batcher.start()
 
     def contract(self) -> dict[str, Any] | None:
         """执行器收不收图、收的话四条预算是多少（一次问、两处用）。"""
@@ -106,6 +111,7 @@ class EngineDecider:
             },
             # 塔在不在、占多少字节、装过几次：`--vision-idle` 卸载之后这里要能看出来回到 0。
             "vision": self.engine.vision_stats(),
+            "batching": self.batcher.stats() if self.batcher is not None else None,
         }
 
     def models(self) -> dict[str, Any]:
@@ -118,7 +124,10 @@ class EngineDecider:
     def answer(self, body: Any) -> dict[str, Any]:
         """一次 `/v1/systemone`：解析 → 引擎 → 回包（引擎的异常原样往上抛）。"""
         request, wire = protocol.parse_request(body, image_contract=self.contract())
-        result = self.engine.run(request)  # type: ignore[attr-defined]
+        if self.batcher is None:
+            result = self.engine.run(request)  # type: ignore[attr-defined]
+        else:
+            result = self.batcher.submit(request).result()
         return protocol.answer_payload(
             result,
             model_name=self.model_name,

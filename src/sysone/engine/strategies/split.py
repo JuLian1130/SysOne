@@ -211,11 +211,75 @@ class SplitRunner(VisionRunner):
         forward_shared = getattr(chain, "forward_shared", None)
         mm = placements[0] if placements else None
         if shared is not None and len(encoded) > 1 and callable(forward_shared):
-            answers = _answer_shared(forward_shared, shared, encoded, request, causal, mm=mm)
+            answers = _answer_shared(forward_shared, shared, encoded,
+                                     [item.kind for item in request.questions], causal, mm=mm)
         else:
-            answers = _answer_serial(chain, encoded, use_prefix, request, causal, mm=mm)
+            answers = _answer_serial(chain, encoded, use_prefix,
+                                     [item.kind for item in request.questions], causal, mm=mm)
         tokens = sum(len(sequence) for sequence, *_ in encoded)
         return tuple(answers), tokens, time.perf_counter() - started
+
+    def answers_batch(
+        self, requests: Sequence[DecisionRequest], mode: MaskMode
+    ) -> list[tuple[tuple[Answer, ...], int, float]]:
+        """多条**互不相干**的请求走一个 pass，返回每条各自的 `(答案, token 数, 前向秒)`。
+
+        两条请求合成一个 pass 的前提是它们**共用同一条前缀** —— 在决策负载里这就是"同一个
+        state、不同的问题"，`split` 本来就在一次请求内用 `forward_shared` 批尾巴，这里只是把
+        批的原料从"一条请求的多道题"扩到"多条请求的所有题"。实测收益（票据 07 §7.25j，
+        `bucket=256`）：2 条 1.53×、4 条 2.01×、1k 的请求 1.31×。
+
+        三条约束，调用方（`Engine.batch`）负责满足：**都没有图**（图的塔与像素管线按请求走，
+        塞进批里会把调度搅乱）、**同一个 mode**（掩码不同就打不到一起）、**非空**。
+        共用前缀拿不到时退回逐题整趟（`_answer_serial`），结果与逐条调用**逐位相同** ——
+        这只是没有收益，不是另一种答案。
+        """
+        if not requests:
+            return []
+        chain = self._require_chain()
+        if mode not in _SUPPORTED_MODES:
+            raise UnsupportedModeError(
+                "mude 链没有这个掩码",
+                mode=mode.value,
+                strategy="split",
+                supported=sorted(item.value for item in _SUPPORTED_MODES),
+            )
+        if any(request.media for request in requests):
+            raise ConfigError("批里不能有带图的请求（图片按请求走塔）",
+                              images=sum(1 for r in requests if r.media))
+        causal = mode is MaskMode.CAUSAL
+        use_prefix = mode is not MaskMode.NONCAUSAL_FULL
+        started = time.perf_counter()
+        encoded: list[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]] = []
+        kinds: list[str] = []
+        # 每条请求的题在扁平列表里的区间，用来把答案切回去。
+        spans: list[tuple[int, int]] = []
+        for request in requests:
+            first = len(encoded)
+            for index, question in enumerate(request.questions):
+                encoded.append(self._prompter.encode(request.state, question, images=0))
+                if len(encoded[-1][0]) > self._max_len:
+                    raise RequestTooLongError(
+                        "prompt 超过链的缓冲宽度",
+                        length=len(encoded[-1][0]),
+                        max_len=self._max_len,
+                        question=index,
+                    )
+                kinds.append(question.kind)
+            spans.append((first, len(encoded)))
+        shared = _shared_prefix(encoded) if use_prefix else None
+        forward_shared = getattr(chain, "forward_shared", None)
+        if shared is not None and len(encoded) > 1 and callable(forward_shared):
+            answers = _answer_shared(forward_shared, shared, encoded, kinds, causal)
+        else:
+            answers = _answer_serial(chain, encoded, use_prefix, kinds, causal)
+        elapsed = time.perf_counter() - started
+        out: list[tuple[tuple[Answer, ...], int, float]] = []
+        for request, (first, last) in zip(requests, spans):
+            own = tuple(answers[first:last])
+            tokens = sum(len(encoded[index][0]) for index in range(first, last))
+            out.append((own, tokens, elapsed))
+        return out
 
     def _warm(self) -> None:
         answers, _, _ = self.answers_for(
@@ -270,7 +334,7 @@ def _answer_shared(
     forward_shared: Callable[..., Sequence[object]],
     prefix: tuple[int, ...],
     encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
-    request: DecisionRequest,
+    kinds: Sequence[str],
     causal: bool = False,
     mm: object | None = None,
 ) -> list[Answer]:
@@ -286,7 +350,7 @@ def _answer_shared(
         answers.append(
             Answer(
                 question_index=index,
-                kind=request.questions[index].kind,
+                kind=kinds[index],
                 value=labels[best],
                 probs=values,
                 labels=labels,
@@ -300,7 +364,7 @@ def _answer_serial(
     chain: ModelChain,
     encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
     use_prefix: bool,
-    request: DecisionRequest,
+    kinds: Sequence[str],
     causal: bool = False,
     mm: object | None = None,
 ) -> list[Answer]:
@@ -315,7 +379,7 @@ def _answer_serial(
         answers.append(
             Answer(
                 question_index=index,
-                kind=request.questions[index].kind,
+                kind=kinds[index],
                 value=labels[best],
                 probs=values,
                 labels=labels,
