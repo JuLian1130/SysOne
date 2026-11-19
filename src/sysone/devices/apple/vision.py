@@ -30,6 +30,7 @@ from __future__ import annotations
 import itertools
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -54,6 +55,9 @@ from .runtime import AneRuntime, Surface
 
 # 一个进程里可以有多个塔（对拍脚本会同时开两个模型），ANE 的程序名必须唯一。
 _TOWERS = itertools.count()
+
+# 按网格缓存的位置表最多留几个尺寸（1024² 的一份是 8 MB；塔空闲时整体卸载）。
+_GRID_CACHE = 4
 
 
 # ------------------------------------------------------------ host 侧的四段约定
@@ -225,6 +229,7 @@ class VisionTower:
                                        s=self.s) / "vision"
         self.stats = {"evals": 0, "ane_ms": 0.0, "gpu_ms": 0.0, "gpu_busy_ms": 0.0,
                       "host_ms": 0.0}
+        self._grid_cache: OrderedDict[tuple[int, int], tuple[np.ndarray, ...]] = OrderedDict()
         self._header = f"vision{next(_TOWERS)}"
 
         # patch 的输入宽度从**权重形状**取：写死 1536 就是第二份塔的形状。
@@ -354,23 +359,22 @@ class VisionTower:
             raise NotReadyError("patch 网格必须是空间合并的整数倍", grid=[grid_h, grid_w],
                                 merge=merge)
         length = grid_h * grid_w
-        tokens = patchify(img, patch=patch, merge=merge,
-                          temporal=int(spec.temporal_patch_size)).astype(np.float16)
-        pos = pos_embed_rows(self.pos_table, grid_h=grid_h, grid_w=grid_w, merge=merge,
-                             side=self.side).astype(np.float16)
-        rows, cols = block_positions(grid_h, grid_w, merge=merge)
-        cos, sin = rope_tables(rows, cols, head_dim=self.head_dim, theta=float(spec.rope_theta))
-        cos16, sin16 = cos.astype(np.float16), sin.astype(np.float16)
+        # patch 的出口按**通道主序**摊一次（一次 12 MB 的连续转置），而不是每个瓦片各转一次
+        # （每次 3 MB、目标跨步，实测 3.3 GB/s）。
+        tokens = np.ascontiguousarray(
+            patchify(img, patch=patch, merge=merge,
+                     temporal=int(spec.temporal_patch_size)).T).astype(np.float16)
+        # 位置表、cos、sin 只取决于网格尺寸，与像素无关：按 (gh, gw) 缓存。
+        pos_cm, cos16, sin16 = self._grid_tables(grid_h, grid_w)
 
         # 残差按**通道主序** `(hidden, L)` 存，与 ANE 的表面同序：token 主序时每一次进出表面
         # 都要转一次置，实测 3.3 GB/s，一图（1024²）付 216 ms —— 旧引擎 §4.10.1 的同一个坑。
         # 改成通道主序后同一条语句是 13–41 GB/s，整图拷贝账 216 → 26 ms（票据 07 §7.13）。
         residual = np.empty((self.hidden, length), np.float16)
-        pos_cm = np.ascontiguousarray(pos.T)          # 每图一次，别放进瓦片循环
         try:
             # 1) patch 投影 + pos_embed（两块 fp16 相加，与厂商的 `h + pos` 同一步）
             for lo, n in self._tiles(length):
-                self._put("patch_in", self.cin, tokens[lo:lo + n].T)
+                self._put("patch_in", self.cin, tokens[:, lo:lo + n])
                 self._call(self._programs["patch"], "main")
                 residual[:, lo:lo + n] = self._take(self._programs["patch"], "main", n) \
                     + pos_cm[:, lo:lo + n]
@@ -437,6 +441,32 @@ class VisionTower:
             self.stats["host_ms"] += (time.perf_counter() - started) * 1e3 - busy
         return merged
 
+    def _grid_tables(self, grid_h: int, grid_w: int) -> tuple[np.ndarray, ...]:
+        """`(gh, gw)` 决定的三张表：pos_embed（通道主序 fp16）、cos、sin（各 `(L, ½dim)` fp16）。
+
+        只取决于网格尺寸，与像素无关，所以同尺寸的第二张图起是白拿的（旧引擎 §4.10.1 记
+        `pos_embed` 1024² 要 46.5 ms、同尺寸第二张起 0.002 ms；我们现在是 15 ms）。
+        容量按 4 个尺寸封顶：一张 1024² 的表是 8 MB，塔空闲时整个卸载，不需要更复杂的策略。
+        """
+        key = (int(grid_h), int(grid_w))
+        hit = self._grid_cache.get(key)
+        if hit is not None:
+            self._grid_cache.move_to_end(key)
+            return hit
+        spec = self.spec
+        rows, cols = block_positions(grid_h, grid_w, merge=self.merge)
+        pos = pos_embed_rows(self.pos_table, grid_h=grid_h, grid_w=grid_w, merge=self.merge,
+                             side=self.side).astype(np.float16)
+        cos, sin = rope_tables(rows, cols, head_dim=self.head_dim,
+                               theta=float(spec.rope_theta))
+        half = self.head_dim // 2
+        entry = (np.ascontiguousarray(pos.T),
+                 cos[:, :half].astype(np.float16), sin[:, :half].astype(np.float16))
+        self._grid_cache[key] = entry
+        if len(self._grid_cache) > _GRID_CACHE:
+            self._grid_cache.popitem(last=False)
+        return entry
+
     # -- 面与小工具 -----------------------------------------------------------
     def _tiles(self, length: int):
         for lo in range(0, length, self.s):
@@ -481,9 +511,14 @@ class VisionTower:
 
     @property
     def bytes(self) -> int:
-        """常驻字节：26 份 blob（ANE 权重）+ 一套面 —— 与 `programs` 的装载期账一致。"""
+        """常驻字节：26 份 blob（ANE 权重）+ 一套面 + 按网格缓存的位置表。
+
+        缓存那一项是**跑起来之后才涨**的（一张 1024² 的表 8 MB，最多 4 个尺寸），所以刚装好的塔
+        报的还是 663.9 MB；`/metrics` 要的是"现在占多少"，这里就得跟着涨。
+        """
         blobs = sum(p.files.blob_path.stat().st_size for p in self._programs.values())
-        return blobs + sum(surface.nbytes for surface in self._surfaces.values())
+        cached = sum(a.nbytes for entry in self._grid_cache.values() for a in entry)
+        return blobs + sum(surface.nbytes for surface in self._surfaces.values()) + cached
 
     def close(self) -> None:
         for program in self._programs.values():
