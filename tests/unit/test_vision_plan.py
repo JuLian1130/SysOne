@@ -2,10 +2,11 @@
 
 这里断言的都是**会让数值静默错掉**的那些约定，不是字符串的字面：
 
-- procedure 的面槽位按函数名字典序排（不是 MIL 文本顺序）⇒ 三段必须叫 `main`/`p1`/`p2`；
+- procedure 的面槽位按函数名字典序排（不是 MIL 文本顺序）⇒ block 的两段叫 `a_p1`/`z_main`
+  （双输入那段必须排 0 号：只有 0 号 procedure 的多输入会被接线，票据 07 §7.23）；
 - 每个 procedure 的输入宽度在 MIL 里声明、在 `ProgramPlan.io` 里再声明一次 ⇒ 两处必须一致，
   对不上时 ANE 会拿错宽的面来算（旧引擎那次 rel 5.8 就是这么来的）；
-- merger 的 2×2 合并让列数在趟内 4:1 ⇒ `io` 必须写四元组，而且桶宽要能整除 4。
+- merger 的 2×2 合并让列数在趟内 4:1 ⇒ 输入与输出的列数必须分开写，而且桶宽要能整除 4。
 """
 
 from __future__ import annotations
@@ -32,9 +33,14 @@ def _blob(entries):
     return build_blob(entries, quantize=False)
 
 
-def _func_inputs(mil: str) -> dict[str, tuple[int, int]]:
-    pattern = r"func (\w+)<ios18>\(tensor<fp16, \[1, (\d+), 1, (\d+)\]> x\)"
-    return {name: (int(a), int(b)) for name, a, b in re.findall(pattern, mil)}
+def _func_inputs(mil: str) -> dict[str, tuple[tuple[int, ...], int]]:
+    """`func 名 -> (每张输入面的行数, 列数)`。多张输入面用逗号隔开，所以按 `func` 整块切。"""
+    out: dict[str, tuple[tuple[int, ...], int]] = {}
+    for body in re.findall(r"func (\w+)<ios18>\((.*?)\) \{", mil):
+        name, args = body
+        shapes = re.findall(r"tensor<fp16, \[1, (\d+), 1, (\d+)\]> \w+", args)
+        out[name] = (tuple(int(a) for a, _ in shapes), int(shapes[0][1]))
+    return out
 
 
 def test_procedure_names_sort_in_execution_order() -> None:
@@ -42,17 +48,23 @@ def test_procedure_names_sort_in_execution_order() -> None:
 
     叫 `qkv`/`out`/`ffn` 会让 `ffn` 抢到 0 号面（旧引擎实测 rel 5.8），所以这里钉住排名。
     """
-    names = sorted(vp.PROCS, key=vp.PROCS.get)
-    assert names == sorted(vp.PROCS), "PROCS 的序号不是按名字的字典序排的"
-    assert vp.PROCS == {"main": 0, "p1": 1}
+    for name, index in vp.PROCS.items():
+        assert name, index
+    # 每个 program 里用到的段名各自按字典序排名，必须与 PROCS 报的序号一致。
+    for group in ({"main"}, {"main", "p1"}, {vp.P1, vp.MAIN}):
+        for index, name in enumerate(sorted(group)):
+            assert vp.PROCS[name] == index, f"{name} 的序号与字典序排名不符"
+    # 双输入的那一段必须是最小名（0 号）：只有 0 号 procedure 的多输入会被接线。
+    assert min(vp.P1, vp.MAIN) == vp.P1
+    assert vp.PROCS[vp.P1] == 0 and vp.PROCS[vp.MAIN] == 1
 
 
 def test_patch_program_declares_what_the_plan_allocates() -> None:
     entries = _entries(pe=(HIDDEN, 3 * 2 * 16 * 16), pe_b=(HIDDEN,))
     blob, table = _blob(entries)
     plan = vp.patch_plan(hidden=HIDDEN, s=S, entries=entries, blob=table)
-    assert plan.io == {"main": (1536, S, HIDDEN, S)}
-    assert _func_inputs(plan.mil) == {"main": (1536, S)}
+    assert plan.io == {"main": ((1536,), HIDDEN, S)}
+    assert _func_inputs(plan.mil) == {"main": ((1536,), S)}
 
 
 def test_block_program_declares_what_the_plan_allocates() -> None:
@@ -64,21 +76,21 @@ def test_block_program_declares_what_the_plan_allocates() -> None:
     )
     blob, table = _blob(entries)
     plan = vp.block_plan(hidden=HIDDEN, ffn=FFN, s=S, entries=entries, blob=table)
-    # p1 的入口是 `[attn_ctx | residual]`：两段各 HIDDEN 行、两段不同所以不能共用一张面；
+    # p1 的入口是**两张**面（上下文、残差）：各 HIDDEN 行，都按 hidden 开；
     # proj 之后的 norm2+FFN 与它在同一段里（`h` 是这一段的残差），所以只有两段。
-    assert plan.io == {"main": (HIDDEN, S, 3 * HIDDEN, S),
-                       "p1": (2 * HIDDEN, S, HIDDEN, S)}
-    assert _func_inputs(plan.mil) == {"main": (HIDDEN, S), "p1": (2 * HIDDEN, S)}
+    assert plan.io == {vp.MAIN: ((HIDDEN,), 3 * HIDDEN, S),
+                       vp.P1: ((HIDDEN, HIDDEN), HIDDEN, S)}
+    assert _func_inputs(plan.mil) == {vp.MAIN: ((HIDDEN,), S), vp.P1: ((HIDDEN, HIDDEN), S)}
     # 出口宽度也要与声明一致：`y` 是每个 func 的返回值。
     for cout in (3 * HIDDEN, HIDDEN):
         assert f"tensor<fp16, [1, {cout}, 1, {S}]> y = " in plan.mil
     # 两段各自只加一次残差：p1 里 `h = proj_out + r`、`y = fc2_out + h`。
-    assert 'add(x = ovb, y = r)' in plan.mil
+    assert 'add(x = ovb, y = res)' in plan.mil
     assert 'add(x = ybb, y = h)' in plan.mil
 
 
 def test_merger_changes_width_inside_one_procedure() -> None:
-    """norm+合并+fc1 在同一趟里把列数从 S 掉到 S/4 —— 用"同宽三元组"会把输入面开成 4 倍。"""
+    """norm+合并+fc1 在同一趟里把列数从 S 掉到 S/4 —— 输入与输出的列数写成一个就会开错面。"""
     entries = _entries(
         mn_g=(HIDDEN,), mn_b=(HIDDEN,),
         m1=(FFN, FFN), m1_b=(FFN,), m2=(OUT, FFN), m2_b=(OUT,),
@@ -87,8 +99,8 @@ def test_merger_changes_width_inside_one_procedure() -> None:
     plan = vp.merger_plan(hidden=HIDDEN, ffn=FFN, out_hidden=OUT, s=S,
                           entries=entries, blob=table)
     q = S // 4
-    assert plan.io == {"main": (HIDDEN, S, FFN, q), "p1": (FFN, q, OUT, q)}
-    assert _func_inputs(plan.mil) == {"main": (HIDDEN, S), "p1": (FFN, q)}
+    assert plan.io == {"main": ((HIDDEN,), FFN, q), "p1": ((FFN,), OUT, q)}
+    assert _func_inputs(plan.mil) == {"main": ((HIDDEN,), S), "p1": ((FFN,), q)}
 
 
 def test_merger_refuses_a_bucket_that_cannot_split_into_four() -> None:

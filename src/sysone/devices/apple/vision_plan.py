@@ -28,38 +28,48 @@ from ...weights.packing.ane_blob import BlobEntry
 from .compile import _conv, _func, _program, _slice
 
 
-# procedure 名 -> 序号：`main` < `p1` 的字典序正好是 0/1（见模块 docstring）。
-PROCS = {"main": 0, "p1": 1}
+# procedure 名 -> 序号：**字典序就是序号**（见模块 docstring）。block 的两段叫 `a_p1` / `z_main`
+# 而不是 `p1` / `main`，因为**只有 0 号 procedure 的多输入会被接线**（票据 07 §7.23）：`p1` 要
+# 两张输入面（上下文与残差），它必须排在最前面。patch 与 merger 各只有一段或两段单输入，沿用
+# `main` 这个名字。
+MAIN = "z_main"
+P1 = "a_p1"
+PROCS = {"main": 0, "p1": 1, P1: 0, MAIN: 1}
 
 
 @dataclass(frozen=True)
 class ProgramPlan:
     """一份视觉 program：MIL 文本 + 每个 procedure 的面尺寸。
 
-    `io` 是 `procedure -> (cin, sin, cout, sout)`，**四元组**而不是"输入输出同宽的三元组"：
-    merger 的 4:1 合并在同一趟里换列数（`s → s//4`），按同宽分配会把输入面开成 4 倍。
+    `io` 是 `procedure -> (每张输入面的行数, 输出行数, 列数)`。列数只写一个：merger 的 4:1 合并
+    在同一趟里换列数（出参 `s//4`），而面是按出口列数分的（`m1o`/`m2o` 用 `q`），入口那侧的列数
+    就是桶宽本身。
     """
 
     mil: str
     io: dict[str, tuple[int, int, int, int]]
 
 
-def patch_io(*, cin: int, hidden: int, s: int) -> dict[str, tuple[int, int, int, int]]:
+def patch_io(*, cin: int, hidden: int, s: int) -> dict[str, tuple[tuple[int, ...], int, int]]:
     """patch 投影的面尺寸。与 `patch_plan` 分开是因为**缓存命中时也要它** —— 产物命中就不该
     再读权重、装 blob，但面还是要按同一份布局开。"""
-    return {"main": (cin, s, hidden, s)}
+    return {"main": ((cin,), hidden, s)}
 
 
-def block_io(*, hidden: int, ffn: int, s: int) -> dict[str, tuple[int, int, int, int]]:
-    """一个 block 两个 procedure 的面尺寸（见 `block_plan` 的说明）。"""
-    return {"main": (hidden, s, 3 * hidden, s), "p1": (2 * hidden, s, hidden, s)}
+def block_io(*, hidden: int, ffn: int, s: int) -> dict[str, tuple[tuple[int, ...], int, int]]:
+    """一个 block 两段的面尺寸：`(每张输入面的行数, 输出行数, 列数)`。
+
+    `P1` 有**两张**输入面（上下文、残差），所以"一个输入宽"的三元组表达不了它。段名见 `PROCS`：
+    双输入的那段必须排在 0 号。
+    """
+    return {MAIN: ((hidden,), 3 * hidden, s), P1: ((hidden, hidden), hidden, s)}
 
 
 def merger_io(*, hidden: int, ffn: int, out_hidden: int, s: int
-              ) -> dict[str, tuple[int, int, int, int]]:
+              ) -> dict[str, tuple[tuple[int, ...], int, int]]:
     """merger 两趟的面尺寸：`main` 在趟内把列数从 `s` 掉到 `s//4`。"""
     q = s // 4
-    return {"main": (hidden, s, ffn, q), "p1": (ffn, q, out_hidden, q)}
+    return {"main": ((hidden,), ffn, q), "p1": ((ffn,), out_hidden, q)}
 
 
 def patch_plan(*, hidden: int, s: int, entries: dict[str, np.ndarray],
@@ -81,10 +91,14 @@ def block_plan(*, hidden: int, ffn: int, s: int, entries: dict[str, np.ndarray],
                blob: dict[str, BlobEntry]) -> ProgramPlan:
     """一个视觉 block 的线性半边（两段，注意力在 GPU 上）：
 
-    - `main`：`norm1` → `qkv`(+bias)，出口是 `[3·hidden]`（q/k/v 还没切）；
-    - `p1`：入口是 `[attn_ctx | residual]`（两段不同，所以要分开切片）→ `proj`(+bias) → 加残差
-      → `norm2` → `fc1`(+bias) → gelu → `fc2`(+bias) → 再加一次残差。第二段的残差就是 `norm2`
-      读的那块（`h + mlp(norm2(h))`），所以只需要一次加法，不需要第二张切片。
+    - `z_main`：`norm1` → `qkv`(+bias)，出口是 `[3·hidden]`（q/k/v 还没切）；
+    - `a_p1`：**两张输入面** `ctx`（注意力上下文）与 `res`（残差）→ `proj`(+bias) → 加残差
+      → `norm2` → `fc1`(+bias) → gelu → `fc2`(+bias) → 再加一次残差。第二个残差就是 `norm2`
+      读的那块（`h + mlp(norm2(h))`），所以只需要一次加法。
+
+    `a_p1` 拆成两张面（而不是一张 `[attn_ctx | residual]`）之后，残差可以直接待在它上一层写好的
+    那张面里，不必先拷进入口 —— 但**只有 0 号 procedure 的多输入会被接线**，所以两段按"双输入的
+    在前"取名（票据 07 §7.23）。两张面的顺序按参数名字典序：`ctx` 是 0 号、`res` 是 1 号。
 
     这两段原来各是一次 eval（`p1`/`p2`），中间过一张 `hidden × s` 的面。合成一段省掉的是每次
     tile 一次 eval 加一次面的往返，代价是同一趟里两段矩阵乘互相争用（旧引擎 §4.19 量到
@@ -97,11 +111,9 @@ def block_plan(*, hidden: int, ffn: int, s: int, entries: dict[str, np.ndarray],
     body0 += _conv("q", cin=hidden, cout=3 * hidden, s=s, entry=blob["qkv"], src="xn", out="qf")
     body0 += _bias("q", c=3 * hidden, s=s, src="qf", out="y", entry=blob["qkv_b"])
 
-    body1 = _slice("sv", begin=0, size=hidden, s=s, src="x", out="v")
-    body1 += _slice("sr", begin=hidden, size=hidden, s=s, src="x", out="r")
-    body1 += _conv("o", cin=hidden, cout=hidden, s=s, entry=blob["proj"], src="v", out="ov")
+    body1 = _conv("o", cin=hidden, cout=hidden, s=s, entry=blob["proj"], src="ctx", out="ov")
     body1 += _bias("o", c=hidden, s=s, src="ov", out="ovb", entry=blob["proj_b"])
-    body1.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> h = add(x = ovb, y = r)'
+    body1.append(f'        tensor<fp16, [1, {hidden}, 1, {s}]> h = add(x = ovb, y = res)'
                  f'[name = string("h")];')
     body1 += _layernorm("n2", c=hidden, s=s, src="h", out="xn",
                         gamma=blob["n2_g"], beta=blob["n2_b"])
@@ -114,8 +126,9 @@ def block_plan(*, hidden: int, ffn: int, s: int, entries: dict[str, np.ndarray],
                  f'[name = string("y")];')
 
     mil = _program([
-        _func("main", func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x", body=body0),
-        _func("p1", func_input=f"tensor<fp16, [1, {2 * hidden}, 1, {s}]> x", body=body1),
+        _func(P1, func_input=(f"tensor<fp16, [1, {hidden}, 1, {s}]> ctx, "
+                              f"tensor<fp16, [1, {hidden}, 1, {s}]> res"), body=body1),
+        _func(MAIN, func_input=f"tensor<fp16, [1, {hidden}, 1, {s}]> x", body=body0),
     ])
     return ProgramPlan(mil=mil, io=block_io(hidden=hidden, ffn=ffn, s=s))
 

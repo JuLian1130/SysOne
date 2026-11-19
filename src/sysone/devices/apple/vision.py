@@ -49,8 +49,8 @@ from . import image
 from . import vision_plan as vp
 from .chain import _artifacts_root, _program_root
 from .compile import ProgramFiles, cached_program, write_program
-from .kernels import vattn, vrope
-from .metal import MetalBuffer, MetalRuntime
+from .kernels import copy_columns, vrope, vattn
+from .metal import LANE_SMALL, MetalBuffer, MetalRuntime
 from .runtime import AneRuntime, Surface
 
 # 一个进程里可以有多个塔（对拍脚本会同时开两个模型），ANE 的程序名必须唯一。
@@ -169,7 +169,7 @@ class _Program:
 
     name: str
     files: ProgramFiles
-    io: dict[str, tuple[int, int, int, int]]
+    io: dict[str, tuple[tuple[int, ...], int, int]]
     # 产物是**缓存命中**（没读权重、没装 blob），而不是"重算了一遍、结果恰好一样"。
     # `files.reused` 是后者：`write_program` 拿新算出的字节与磁盘比，一样就置 True —— 那 6 s
     # 的 blob 构建已经花掉了。`doctor` 报的命中率必须与装载同一判据，所以分开记。
@@ -195,9 +195,8 @@ class _Tile:
     `MTLBuffer` 包装（`e8m_wrap`），所以 GPU 直接从 ANE 的面上读 q、往 ANE 的面上写上下文，
     两个方向都不经过主机。
 
-    `ctx` 是 `2·hidden` 高：上半是注意力上下文（GPU 写），下半是残差（从残差面拷进来）。
-    `p1` 的入口就是这样一张面 —— 一个 procedure 只能有一段连续入口，而程序级的"两段输入数
-    必须一致"这条约束把双输入面的路堵死了（票据 07 §7.20）。
+    `ctx` 是 `hidden` 高：GPU 把注意力上下文直接写进它，`p1` 把它当作 0 号输入面（1 号是残差
+    面）。两者都不经过主机 —— 双输入 `p1` 是 §7.23 之后的形状。
     """
 
     qkv: Surface
@@ -320,13 +319,13 @@ class VisionTower:
         while len(self._tiles) < count:
             index = len(self._tiles)
             qkv = self.runtime.surface(3 * self.hidden * self.s * 2)
-            ctx = self.runtime.surface(2 * self.hidden * self.s * 2)
+            ctx = self.runtime.surface(self.hidden * self.s * 2)
             try:
                 tile = _Tile(
                     qkv=qkv, ctx=ctx,
                     qkv_dev=self.metal.wrap(qkv), ctx_dev=self.metal.wrap(ctx),
                     qkv_view=qkv.array(np.float16, (1, 3 * self.hidden, 1, self.s))[0, :, 0],
-                    ctx_view=ctx.array(np.float16, (1, 2 * self.hidden, 1, self.s))[0, :, 0],
+                    ctx_view=ctx.array(np.float16, (1, self.hidden, 1, self.s))[0, :, 0],
                 )
                 for slot in (0, 1):
                     surface = self.runtime.surface(self.hidden * self.s * 2)
@@ -354,10 +353,14 @@ class VisionTower:
         for layer in range(self._depth):
             block = self._programs[f"block{layer:02d}"]
             parity = layer % 2
-            attach(block.name, vp.PROCS["main"], index, self._hidden[parity][index], tile.qkv)
-            attach(block.name, vp.PROCS["p1"], index, tile.ctx, self._hidden[1 - parity][index])
-            self._outputs[(block.name, "main")] = tile.qkv
-            self._outputs[(block.name, "p1")] = self._hidden[1 - parity][index]
+            # `p1` 是双输入（上下文 + 残差）→ 用 attach_multi；`main` 单输入走 attach_slot。
+            attach(block.name, vp.PROCS[vp.MAIN], index,
+                   self._hidden[parity][index], tile.qkv)
+            self.runtime.attach_multi(block.name, vp.PROCS[vp.P1],
+                                      [tile.ctx, self._hidden[parity][index]],
+                                      self._hidden[1 - parity][index], slot=index)
+            self._outputs[(block.name, vp.MAIN)] = tile.qkv
+            self._outputs[(block.name, vp.P1)] = self._hidden[1 - parity][index]
         merger = self._programs["merger"]
         attach(merger.name, vp.PROCS["main"], index,
                self._hidden[self._tail_set][index], self._surfaces["m1o"])
@@ -374,7 +377,7 @@ class VisionTower:
         return _identity(self.store, self.spec, self.s, kind, index)
 
     def _assemble(self, name: str, directory: Path, source: dict,
-                  io: dict[str, tuple[int, int, int, int]], build: "callable") -> _Program:
+                  io: dict[str, tuple[tuple[int, ...], int, int]], build: "callable") -> _Program:
         """产物命中就只装载；不命中才读权重、装 blob、生成 MIL。
 
         `build()` 只在未命中时调用 —— 一个 block 的 12 张张量读成 fp32、再摊成 fp16 blob 是
@@ -483,15 +486,16 @@ class VisionTower:
             cos_dev = self.metal.alloc(half_dim * length * 2)
             sin_dev = self.metal.alloc(half_dim * length * 2)
             try:
-                qkv_views = [buf.array(np.float16, (3 * self.hidden, length))
-                             for buf in qkv_bufs]
                 # 转置成 `(½dim, L)`：核里一格的 32 个 lane 读同一行 `k` 的 32 个连续 token
                 cos_dev.array(np.float16, (half_dim, length))[...] = cos16[:, :half_dim].T
                 sin_dev.array(np.float16, (half_dim, length))[...] = sin16[:, :half_dim].T
                 # 第 0 层没有"上一层"可以配对，先整层做完
-                self._layer_main(0, tiles, qkv_views[0])
+                self._layer_main(0, tiles, qkv_bufs[0], length)
                 for layer in range(depth):
                     block = self._programs[f"block{layer:02d}"]
+                    # 上一层的 qkv 是 GPU 抄进这条缓冲的（lane 1），vrope 之前必须抄完。
+                    # 它在上一层的整整一个注意力窗口里跑，所以这一步通常已经完成。
+                    self.stats["gpu_ms"] += self.metal.wait(LANE_SMALL)
                     vrope(self.metal, qkv_bufs[layer % 2], cos_dev, sin_dev, T=length,
                           hidden=self.hidden, dim=self.head_dim)
                     # 注意力**整层一次发出去**（各瓦片之间没有依赖），再逐片等、逐片跑 p1。
@@ -499,19 +503,19 @@ class VisionTower:
                     for j, (lo, n) in enumerate(tiles):
                         self._attention(qkv_bufs[layer % 2], j, n, lo, length)
                         self.metal.commit()
-                    # p1 逐片跟在注意力后面。入口是一张 `[ctx | res]` 面：上半 GPU 刚写完，下半
-                    # 是这一层的残差。这次拷贝是唯一剩下的、每层每瓦片一次的搬运 —— 双输入面能
-                    # 删掉它，但一个 program 里各段的输入数必须一致（票据 07 §7.20）。
+                    # p1 逐片跟在注意力后面。它有两张输入面：GPU 刚写完的上下文，与上一层写好的
+                    # 残差 —— 两张都不经过主机（§7.23 的双输入）。
                     following = layer + 1
                     for j, (lo, n) in enumerate(tiles):
                         self._await_gpu()
-                        np.copyto(self._tiles[j].ctx_view[self.hidden:, :n],
-                                  self._hidden_views[layer % 2][j][:, :n])
-                        self._call(block, "p1", slot=j)
+                        self._call(block, vp.P1, slot=j)
                         if following < depth:
-                            self._call(self._programs[f"block{following:02d}"], "main", slot=j)
-                            qkv_views[following % 2][:, lo:lo + n] = \
-                                self._tiles[j].qkv_view[:, :n]
+                            self._call(self._programs[f"block{following:02d}"], vp.MAIN, slot=j)
+                            copy_columns(
+                                self.metal, self._tiles[j].qkv_dev, qkv_bufs[following % 2],
+                                nchan=3 * self.hidden, src_c0=0, dst_c0=0, stile=n, s0=lo,
+                                src_stride=self.s, dst_stride=length)
+                            self.metal.commit(LANE_SMALL)
             finally:
                 for dev in (*qkv_bufs, cos_dev, sin_dev):
                     dev.free()
@@ -530,16 +534,22 @@ class VisionTower:
             self.stats["host_ms"] += (time.perf_counter() - started) * 1e3 - busy
         return merged
 
-    def _layer_main(self, layer: int, tiles: list, view: np.ndarray) -> None:
-        """一整层的 `main`，随后把每个瓦片的 qkv 面拷进这一层的设备缓冲。
+    def _layer_main(self, layer: int, tiles: list, buffer: MetalBuffer,
+                    length: int) -> None:
+        """一整层的 `main`，随后把每个瓦片的 qkv 面抄进这一层的设备缓冲。
 
-        那次拷贝是 §7.21 之后唯一还经过主机的 qkv 搬运；删掉它要求注意力直接按瓦片读面
-        （核里按 `t/S` 选面），那要动 `k_vattn` 的 staging 段，是下一步。
+        抄一次是因为注意力要读**整图**的键，而 ANE 一次只写一个瓦片的宽度。抄的动作放在 GPU 上
+        （`k_copy`）：主机上那 67 ms（1024²）变成设备上的几毫秒，而且**排在 lane 1**——注意力在
+        lane 0 上跑，两条队互不排队。`wait(LANE_SMALL)` 在下一层的 `vrope` 之前把它们排空。
         """
         block = self._programs[f"block{layer:02d}"]
         for index, (lo, n) in enumerate(tiles):
-            self._call(block, "main", slot=index)
-            view[:, lo:lo + n] = self._tiles[index].qkv_view[:, :n]
+            self._call(block, vp.MAIN, slot=index)
+            copy_columns(
+                self.metal, self._tiles[index].qkv_dev, buffer,
+                nchan=3 * self.hidden, src_c0=0, dst_c0=0, stile=n, s0=lo,
+                src_stride=self.s, dst_stride=length)
+            self.metal.commit(LANE_SMALL)
 
     def _attention(self, qkv_dev, tile: int, nq: int, s0: int, length: int) -> None:
         """发一个瓦片的注意力：读整图的 qkv，写这个瓦片的上下文面（GPU 直接写面）。"""
@@ -593,9 +603,9 @@ class VisionTower:
         输出面由 `_attach_tile` 记在 `_outputs` 上（面归塔所有，程序不认识它），行列规格来自
         `io`。瓦片只有一块出口面会被外部读（merger 的最终出口），所以这里不区分瓦片。
         """
-        _, _, cout, s_out = program.io[proc]
+        _, cout, cols_out = program.io[proc]
         surface = self._outputs[(program.name, proc)]
-        return surface.array(np.float16, (1, cout, 1, s_out))[0, :, 0][:, :cols]
+        return surface.array(np.float16, (1, cout, 1, cols_out))[0, :, 0][:, :cols]
 
     def _await_gpu(self) -> None:
         """等**队首**那一片注意力完成，两个口径分开记。

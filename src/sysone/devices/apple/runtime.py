@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -38,6 +39,7 @@ _REQUIRED = (
     "e8_surface_free",
     "e8_attach",
     "e8_attach_slot",
+    "e8_attach_n",
     "e8_avail_gb",
     "e8_wired_gb",
     "e8_footprint_gb",
@@ -156,6 +158,16 @@ class AneRuntime:
             ctypes.c_uint64,
         ]
         lib.e8_attach_slot.restype = ctypes.c_int
+        lib.e8_attach_n.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_uint64,
+        ]
+        lib.e8_attach_n.restype = ctypes.c_int
         lib.e8_eval_slot.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
         lib.e8_eval_slot.restype = ctypes.c_double
         lib.e8_unload.argtypes = [ctypes.c_char_p]
@@ -287,6 +299,29 @@ class AneRuntime:
                 int(surf_in.handle), int(surf_out.handle),
             ),
             f"attach_slot({name}, {procedure}, slot={slot})",
+        )
+
+    def attach_multi(
+        self, name: str, procedure: int, surfaces: Sequence[Surface], surf_out: Surface,
+        *, slot: int = 0,
+    ) -> None:
+        """把**多张**输入面 + 一张输出面绑到同一个 (program, procedure, slot) 上。
+
+        两条实测约束（票据 07 §7.19 / §7.23）：面的顺序按**输入名的字典序**接，不按声明序；而
+        **只有 procedure 0 的多输入会被接线** —— 1 号及以后的 procedure 声明两张输入面时，
+        eval 一律 `Program Inference error 0x2`。所以双输入的那一半必须排在最前面。
+        """
+        count = len(surfaces)
+        if count == 0:
+            raise NotReadyError("attach_multi 至少要一张输入面", program=name)
+        ins = (ctypes.c_uint64 * count)(*[int(item.handle) for item in surfaces])
+        indices = (ctypes.c_int * count)(*range(count))
+        self._check(
+            self.lib.e8_attach_n(
+                name.encode(), int(procedure), int(slot), ins, indices, count,
+                int(surf_out.handle),
+            ),
+            f"attach_multi({name}, {procedure}, slot={slot})",
         )
 
     # ------------------------------------------------------------ 异步执行
