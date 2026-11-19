@@ -50,7 +50,7 @@ from . import vision_plan as vp
 from .chain import _artifacts_root, _program_root
 from .compile import ProgramFiles, cached_program, write_program
 from .kernels import vattn, vrope
-from .metal import MetalRuntime
+from .metal import MetalBuffer, MetalRuntime
 from .runtime import AneRuntime, Surface
 
 # 一个进程里可以有多个塔（对拍脚本会同时开两个模型），ANE 的程序名必须唯一。
@@ -165,17 +165,20 @@ def _taps(pos: np.ndarray, size: int, side: int) -> tuple[np.ndarray, np.ndarray
 
 @dataclass(frozen=True)
 class _Program:
-    """一个 ANE program、它的产物、以及每个 procedure 的面尺寸 `(cin, s, cout, s)`。"""
+    """一个 ANE program、它的产物、以及每个 procedure 的面规格 `(cin, s, cout, s)`。"""
 
     name: str
     files: ProgramFiles
     io: dict[str, tuple[int, int, int, int]]
-    procs: dict[str, tuple[Surface, Surface]]
+    # 产物是**缓存命中**（没读权重、没装 blob），而不是"重算了一遍、结果恰好一样"。
+    # `files.reused` 是后者：`write_program` 拿新算出的字节与磁盘比，一样就置 True —— 那 6 s
+    # 的 blob 构建已经花掉了。`doctor` 报的命中率必须与装载同一判据，所以分开记。
+    hit: bool = False
 
-    def run(self, runtime: AneRuntime, proc: str) -> float:
-        ms = runtime.eval(self.name, vp.PROCS[proc])
+    def run(self, runtime: AneRuntime, proc: str, slot: int = 0) -> float:
+        ms = runtime.eval_slot(self.name, vp.PROCS[proc], int(slot))
         if ms < 0:
-            raise NotReadyError("ANE 执行失败", program=self.name, proc=proc,
+            raise NotReadyError("ANE 执行失败", program=self.name, proc=proc, slot=slot,
                                 reason=runtime.error())
         return ms
 
@@ -183,12 +186,42 @@ class _Program:
         runtime.unload(self.name)
 
 
-class VisionTower:
-    """一座塔：26 个 program + 一套复用的面 + 每次 `encode` 的两块 Metal buffer。
+@dataclass(frozen=True)
+class _Tile:
+    """一个 token 瓦片独占的两张面，以及它们在 GPU 侧的零拷贝包装。
 
-    面的所有权在塔上（不归 program）：ANE 只有一条固件队列、一次只有一个 eval 在飞，所以 24 个
-    block 轮流用同一套面（与文本链 20 层共享一套面是同一条理由）。`close()` 先卸 program 再放面
-    —— 卸载会把每次 `attach` 加在面上的引用 CFRelease 掉，面才真的回收。
+    瓦片**不共享面**：qkv 与注意力上下文都是"这一片刚算出来、下一片才用"的，共享就要拷，
+    而拷贝正是要删掉的东西（票据 07 §7.19）。`qkv_dev` / `ctx_dev` 是同一块内存的
+    `MTLBuffer` 包装（`e8m_wrap`），所以 GPU 直接从 ANE 的面上读 q、往 ANE 的面上写上下文，
+    两个方向都不经过主机。
+
+    `ctx` 是 `2·hidden` 高：上半是注意力上下文（GPU 写），下半是残差（从残差面拷进来）。
+    `p1` 的入口就是这样一张面 —— 一个 procedure 只能有一段连续入口，而程序级的"两段输入数
+    必须一致"这条约束把双输入面的路堵死了（票据 07 §7.20）。
+    """
+
+    qkv: Surface
+    ctx: Surface
+    qkv_dev: MetalBuffer
+    ctx_dev: MetalBuffer
+    qkv_view: np.ndarray
+    ctx_view: np.ndarray
+
+
+class VisionTower:
+    """一座塔：26 个 program + 按瓦片划分的面 + 每次 `encode` 的整图设备缓冲。
+
+    面的所有权在塔上（不归 program）：ANE 只有一条固件队列、一次只有一个 eval 在飞。**但面
+    按瓦片分**，每个瓦片一对 (qkv, ctx)，各自按槽位绑到同一个 program 上（`attach_slot` 的
+    `slot`）。这不是为了并发，而是为了让相邻两段接力：`p1` 的输出就是下一层 `main` 的入口，
+    `main` 的 qkv 出口就是注意力的入口 —— 面在 ANE 与 GPU 之间传来传去，主机一次都不碰。
+
+    残差流是例外：它按**奇偶**两套面轮转（第 i 层读一套、写另一套）。同一套面既当入口又当出口
+    不行，因为 `p1` 一边读 `res` 一边往同一段写；两套就够，因为第 i+1 层的入口正是第 i 层的
+    出口。
+
+    瓦片数由图像尺寸决定（`s` 是列数上限），所以面与槽位都是**第一次见这个瓦片数时**才建、
+    才绑 —— 一张 512² 的图只建 1 个瓦片，不会为 1024² 预留。
     """
 
     def __init__(
@@ -244,29 +277,37 @@ class VisionTower:
                                 columns=self.cin, patch=spec.patch_size,
                                 temporal=spec.temporal_patch_size)
         self.pos_table = vw.pos_embed(store, self.root)
-        self._programs: dict[str, _Program] = {}
+        # 不随瓦片变的四张面：patch 的入口（每片覆写一次）、merger 的两张中间面。
         self._surfaces = self._make_surfaces()
+        self._tiles: list[_Tile] = []
+        # 残差流：两套（奇偶轮转）× 瓦片数。`_hidden_views` 与之一一对应，省掉每次的 ctypes。
+        self._hidden: tuple[list[Surface], list[Surface]] = ([], [])
+        self._hidden_views: tuple[list[np.ndarray], list[np.ndarray]] = ([], [])
+        self._depth = int(spec.depth)
+        self._programs: dict[str, _Program] = {}
+        # `(program, procedure) -> 输出面`。面归塔所有，程序本身不认识它，所以这块账记在塔上：
+        # 读输出（merger 的最终出口）时按它开视图，瓦片切换时它也只有一个值（同一种输出）。
+        self._outputs: dict[tuple[str, str], Surface] = {}
         self._programs["patch"] = self._build_patch()
-        for index in range(int(spec.depth)):
+        for index in range(self._depth):
             self._programs[f"block{index:02d}"] = self._build_block(index)
         self._programs["merger"] = self._build_merger()
 
     # -- 构造 ----------------------------------------------------------------
     def _make_surfaces(self) -> dict[str, Surface]:
-        """一套复用的面（`(行, s)` fp16，通道在前）。所有权在塔上，`close()` 统一释放。"""
+        """不随瓦片变的四张面。
+
+        `patch_in` 每片覆写一次（它的读者是同一次 eval，顺序很紧）；merger 的两张中间面本来就
+        只有一个瓦片在用，且 `merged` 要回主机，所以它们不按瓦片分。
+        """
         plan = (
-            ("patch_in", self.cin),
-            ("hidden_in", self.hidden),
-            ("qkv", 3 * self.hidden),
-            ("attn", 2 * self.hidden),
-            ("hidden_out", self.hidden),
-            ("m1o", self.ffn),
-            ("m2o", self.out_hidden),
+            ("patch_in", self.cin, self.s),
+            ("m1o", self.ffn, self.q),
+            ("m2o", self.out_hidden, self.q),
         )
         surfaces: dict[str, Surface] = {}
         try:
-            for key, rows in plan:
-                cols = self.q if key in ("m1o", "m2o") else self.s
+            for key, rows, cols in plan:
                 surfaces[key] = self.runtime.surface(rows * cols * 2)
         except NotReadyError:
             for surface in surfaces.values():
@@ -274,13 +315,66 @@ class VisionTower:
             raise
         return surfaces
 
+    def _ensure_tiles(self, count: int) -> None:
+        """把瓦片 0..count-1 的面建出来、绑好。第一次见这个尺寸时付一次，之后白拿。"""
+        while len(self._tiles) < count:
+            index = len(self._tiles)
+            qkv = self.runtime.surface(3 * self.hidden * self.s * 2)
+            ctx = self.runtime.surface(2 * self.hidden * self.s * 2)
+            try:
+                tile = _Tile(
+                    qkv=qkv, ctx=ctx,
+                    qkv_dev=self.metal.wrap(qkv), ctx_dev=self.metal.wrap(ctx),
+                    qkv_view=qkv.array(np.float16, (1, 3 * self.hidden, 1, self.s))[0, :, 0],
+                    ctx_view=ctx.array(np.float16, (1, 2 * self.hidden, 1, self.s))[0, :, 0],
+                )
+                for slot in (0, 1):
+                    surface = self.runtime.surface(self.hidden * self.s * 2)
+                    self._hidden[slot].append(surface)
+                    self._hidden_views[slot].append(
+                        surface.array(np.float16, (1, self.hidden, 1, self.s))[0, :, 0])
+            except NotReadyError:
+                qkv.free()
+                ctx.free()
+                raise
+            self._tiles.append(tile)
+            self._attach_tile(index)
+
+    def _attach_tile(self, index: int) -> None:
+        """把一个瓦片的槽位绑到所有相关的 (program, procedure) 上。
+
+        `p1` 有两张输入面：`ctx`（注意力上下文）与 `res`（残差）。两张面按字典序命名，所以
+        `ctx` 是 0 号、`res` 是 1 号，面的顺序就是参数顺序（`vision_plan` 的模块说明）。
+        """
+        tile = self._tiles[index]
+        attach = self.runtime.attach_slot
+        self._outputs[("patch", "main")] = self._hidden[0][index]
+        attach(self._programs["patch"].name, vp.PROCS["main"], index,
+               self._surfaces["patch_in"], self._hidden[0][index])
+        for layer in range(self._depth):
+            block = self._programs[f"block{layer:02d}"]
+            parity = layer % 2
+            attach(block.name, vp.PROCS["main"], index, self._hidden[parity][index], tile.qkv)
+            attach(block.name, vp.PROCS["p1"], index, tile.ctx, self._hidden[1 - parity][index])
+            self._outputs[(block.name, "main")] = tile.qkv
+            self._outputs[(block.name, "p1")] = self._hidden[1 - parity][index]
+        merger = self._programs["merger"]
+        attach(merger.name, vp.PROCS["main"], index,
+               self._hidden[self._tail_set][index], self._surfaces["m1o"])
+        self._outputs[(merger.name, "main")] = self._surfaces["m1o"]
+        self._outputs[(merger.name, "p1")] = self._surfaces["m2o"]
+
+    @property
+    def _tail_set(self) -> int:
+        """最后一层的残差落在哪一套面上（`depth` 为偶数时是 0 号）。"""
+        return 1 - ((self._depth - 1) % 2)
+
     def _source(self, kind: str, index: int | None = None) -> dict:
         """产物的身份 —— 与 `artifact_state` 是同一个函数（`doctor` 报的命中率不能与装载分家）。"""
         return _identity(self.store, self.spec, self.s, kind, index)
 
     def _assemble(self, name: str, directory: Path, source: dict,
-                  io: dict[str, tuple[int, int, int, int]],
-                  build: "callable", procs: dict[str, tuple[str, str]]) -> _Program:
+                  io: dict[str, tuple[int, int, int, int]], build: "callable") -> _Program:
         """产物命中就只装载；不命中才读权重、装 blob、生成 MIL。
 
         `build()` 只在未命中时调用 —— 一个 block 的 12 张张量读成 fp32、再摊成 fp16 blob 是
@@ -288,13 +382,11 @@ class VisionTower:
         所以命中路径不需要 blob 的位置表。
         """
         files = cached_program(directory, source=source, s=self.s)
+        hit = files is not None
         if files is None:
             files = build(directory, source)
         files.load(self.runtime, name)
-        bound = {proc: (self._surfaces[src], self._surfaces[dst]) for proc, (src, dst) in procs.items()}
-        for proc, (src, dst) in bound.items():
-            self.runtime.attach(name, vp.PROCS[proc], src, dst)
-        return _Program(name=name, files=files, io=io, procs=bound)
+        return _Program(name=name, files=files, io=io, hit=hit)
 
     def _build_patch(self) -> _Program:
         io = vp.patch_io(cin=self.cin, hidden=self.hidden, s=self.s)
@@ -307,8 +399,7 @@ class VisionTower:
                                  meta={"kind": "patch", "cin": self.cin}, source=source)
 
         return self._assemble(f"{self._header}_patch", self.directory / "patch",
-                              self._source("patch"), io, build,
-                              {"main": ("patch_in", "hidden_out")})
+                              self._source("patch"), io, build)
 
     def _build_block(self, index: int) -> _Program:
         io = vp.block_io(hidden=self.hidden, ffn=self.ffn, s=self.s)
@@ -321,11 +412,9 @@ class VisionTower:
             return write_program(directory, mil=plan.mil, blob=blob, s=self.s,
                                  meta={"kind": "block", "index": index}, source=source)
 
-        return self._assemble(
-            f"{self._header}_block_{index:02d}", self.directory / f"block{index:02d}",
-            self._source("block", index), io, build,
-            {"main": ("hidden_in", "qkv"), "p1": ("attn", "hidden_out")},
-        )
+        return self._assemble(f"{self._header}_block_{index:02d}",
+                              self.directory / f"block{index:02d}",
+                              self._source("block", index), io, build)
 
     def _build_merger(self) -> _Program:
         io = vp.merger_io(hidden=self.hidden, ffn=self.ffn,
@@ -340,9 +429,12 @@ class VisionTower:
             return write_program(directory, mil=plan.mil, blob=blob, s=self.s,
                                  meta={"kind": "merger"}, source=source)
 
-        return self._assemble(f"{self._header}_merger", self.directory / "merger",
-                              self._source("merger"), io, build,
-                              {"main": ("hidden_in", "m1o"), "p1": ("m1o", "m2o")})
+        program = self._assemble(f"{self._header}_merger", self.directory / "merger",
+                                 self._source("merger"), io, build)
+        # merger 的 `p1` 只有一张面（中间面 m1o → m2o），与瓦片无关，所以绑槽 0 就够。
+        self.runtime.attach(program.name, vp.PROCS["p1"],
+                            self._surfaces["m1o"], self._surfaces["m2o"])
+        return program
 
     # -- 跑 ------------------------------------------------------------------
     def encode(self, img: np.ndarray) -> np.ndarray:
@@ -371,79 +463,75 @@ class VisionTower:
         # 位置表、cos、sin 只取决于网格尺寸，与像素无关：按 (gh, gw) 缓存。
         pos_cm, cos16, sin16 = self._grid_tables(grid_h, grid_w)
 
-        # 残差按**通道主序** `(hidden, L)` 存，与 ANE 的表面同序：token 主序时每一次进出表面
-        # 都要转一次置，实测 3.3 GB/s，一图（1024²）付 216 ms —— 旧引擎 §4.10.1 的同一个坑。
-        # 改成通道主序后同一条语句是 13–41 GB/s，整图拷贝账 216 → 26 ms（票据 07 §7.13）。
-        residual = np.empty((self.hidden, length), np.float16)
+        tiles = list(self._tiles_of(length))
+        self._ensure_tiles(len(tiles))
         try:
-            # 1) patch 投影 + pos_embed（两块 fp16 相加，与厂商的 `h + pos` 同一步）
-            for lo, n in self._tiles(length):
+            # 1) patch 投影 + pos_embed：出口直接落在这个瓦片的残差面上，位置编码就地加上。
+            for index, (lo, n) in enumerate(tiles):
                 self._put("patch_in", self.cin, tokens[:, lo:lo + n])
-                self._call(self._programs["patch"], "main")
-                residual[:, lo:lo + n] = self._take(self._programs["patch"], "main", n) \
-                    + pos_cm[:, lo:lo + n]
+                self._call(self._programs["patch"], "main", slot=index)
+                self._hidden_views[0][index][:, :n] += pos_cm[:, lo:lo + n]
 
-            # 2) 24 个 block：每层先把整图的 qkv 收齐，注意力按**整图**算，再分趟喂回去。
-            # q、k 的轴向 RoPE 在 GPU 上做（`k_vrope`），所以主机上不再需要那块整宽数组：每个瓦片
-            # 的 ANE 输出直接写进 device buffer 的对应列。这不是"把同一份工作挪个地方"——
-            # 主机上那趟是 25 MB 的 f32 重写（rope 占整图 33–39 %），设备上只多一次 25 MB 的读写。
-            # 实测 512² 395 → 239 ms、1024² 1 872 → 1 243 ms（票据 07 §7.9）。
+            # 2) 24 个 block：每层先把整图的 qkv 收齐，注意力按**整图**算，再分瓦片喂回去。
+            # q、k 的轴向 RoPE 在 GPU 上做（`k_vrope`）。每个瓦片的 ANE 输出直接写进 device
+            # buffer 的对应列 —— 这一步是唯一还经过主机的搬运，§7.19 之后的目标是把它也去掉
+            # （让注意力按瓦片选面），在那之前它按瓦片拷，不按整图原地换算。
             qkv_dev = self.metal.alloc(3 * self.hidden * length * 2)
-            ctx_dev = self.metal.alloc(self.hidden * length * 2)
             half_dim = self.head_dim // 2
             cos_dev = self.metal.alloc(half_dim * length * 2)
             sin_dev = self.metal.alloc(half_dim * length * 2)
             try:
                 qkv_view = qkv_dev.array(np.float16, (3 * self.hidden, length))
-                ctx_view = ctx_dev.array(np.float16, (self.hidden, length))
                 # 转置成 `(½dim, L)`：核里一格的 32 个 lane 读同一行 `k` 的 32 个连续 token
                 cos_dev.array(np.float16, (half_dim, length))[...] = cos16[:, :half_dim].T
                 sin_dev.array(np.float16, (half_dim, length))[...] = sin16[:, :half_dim].T
-                tiles = list(self._tiles(length))
-                for index in range(int(spec.depth)):
-                    block = self._programs[f"block{index:02d}"]
-                    for lo, n in tiles:
-                        self._put("hidden_in", self.hidden, residual[:, lo:lo + n])
-                        self._call(block, "main")
-                        qkv_view[:, lo:lo + n] = self._take(block, "main", n)
+                for layer in range(self._depth):
+                    block = self._programs[f"block{layer:02d}"]
+                    for index, (lo, n) in enumerate(tiles):
+                        self._call(block, "main", slot=index)
+                        qkv_view[:, lo:lo + n] = self._tiles[index].qkv_view[:, :n]
                     vrope(self.metal, qkv_dev, cos_dev, sin_dev, T=length,
                           hidden=self.hidden, dim=self.head_dim)
-                    # 注意力按 query 瓦片发、与 p1 的同一片交错：p1 的第 j 片只读注意力的第 j
-                    # 段，所以"发第 j+1 段、同时跑第 j 片"没有依赖问题。每层第一段是躲不掉的
-                    # 头部（24 层合计 ~107 ms @1024²），其余三段藏在 p1 后面（票据 07 §7.12）。
+                    # 注意力**整层一次发出去**（各瓦片之间没有依赖），再逐片等、逐片跑 p1。
+                    # 只留一段在飞（§7.12 的排布）时，每层开头有一段完全躲不掉、每片又有
+                    # 4.7 − 3.2 = 1.5 ms 露在外面（GPU 每片比 p1 长）；把四段都压进队里，露出的
+                    # 就只有"等第 j 片"那一截，队首永远有活干。`commit` 必须逐片做：一个命令
+                    # 缓冲里的几段只能一起结算，那就退化成串行了（票据 07 §7.20）。
                     for j, (lo, n) in enumerate(tiles):
-                        if j == 0:
-                            vattn(self.metal, qkv_dev, ctx_dev, T=length, nq=n, s0=lo,
-                                  hidden=self.hidden, dim=self.head_dim, scale=self.scale)
-                            self.metal.commit()
+                        self._attention(qkv_dev, j, n, lo, length)
+                        self.metal.commit()
+                    # p1 逐片跟在注意力后面。入口是一张 `[ctx | res]` 面：上半 GPU 刚写完，下半
+                    # 是这一层的残差（就是 `main` 读的那张面）。这次拷贝是唯一剩下的、每层每
+                    # 瓦片一次的搬运 —— 双输入面能删掉它，但一个 program 里各段的输入数必须
+                    # 一致（票据 07 §7.20）。
+                    for j, (lo, n) in enumerate(tiles):
                         self._await_gpu()
-                        if j + 1 < len(tiles):
-                            lo2, n2 = tiles[j + 1]
-                            vattn(self.metal, qkv_dev, ctx_dev, T=length, nq=n2, s0=lo2,
-                                  hidden=self.hidden, dim=self.head_dim, scale=self.scale)
-                            self.metal.commit()
-                        attn = self._view("attn", 2 * self.hidden)
-                        attn[:self.hidden, :n] = ctx_view[:, lo:lo + n]
-                        attn[self.hidden:, :n] = residual[:, lo:lo + n]
-                        self._call(block, "p1")          # proj → 残差 → norm2 → FFN → 残差
-                        residual[:, lo:lo + n] = self._take(block, "p1", n)
+                        np.copyto(self._tiles[j].ctx_view[self.hidden:, :n],
+                                  self._hidden_views[layer % 2][j][:, :n])
+                        self._call(block, "p1", slot=j)
             finally:
-                for dev in (qkv_dev, ctx_dev, cos_dev, sin_dev):
+                for dev in (qkv_dev, cos_dev, sin_dev):
                     dev.free()
 
             # 3) merger：每趟把 2×2 合成 4·hidden，再 fc1 → gelu → fc2
+            merger = self._programs["merger"]
             merged = np.empty((length // self.unit, self.out_hidden), np.float16)
-            for lo, n in self._tiles(length):
-                self._put("hidden_in", self.hidden, residual[:, lo:lo + n])
-                self._call(self._programs["merger"], "main")
-                self._call(self._programs["merger"], "p1")
+            for index, (lo, n) in enumerate(tiles):
+                self._call(merger, "main", slot=index)
+                self._call(merger, "p1")
                 merged[lo // self.unit:(lo + n) // self.unit] = \
-                    self._take(self._programs["merger"], "p1", n // self.unit).T
+                    self._take(merger, "p1", n // self.unit).T
         finally:
             after = (self.stats["ane_ms"], self.stats["gpu_ms"])
             busy = (after[0] - before[0]) + (after[1] - before[1])
             self.stats["host_ms"] += (time.perf_counter() - started) * 1e3 - busy
         return merged
+
+    def _attention(self, qkv_dev, tile: int, nq: int, s0: int, length: int) -> None:
+        """发一个瓦片的注意力：读整图的 qkv，写这个瓦片的上下文面（GPU 直接写面）。"""
+        vattn(self.metal, qkv_dev, self._tiles[tile].ctx_dev, T=length, nq=nq, s0=s0,
+              hidden=self.hidden, dim=self.head_dim, scale=self.scale,
+              out_cols=self.s, out_offset=0)
 
     def _grid_tables(self, grid_h: int, grid_w: int) -> tuple[np.ndarray, ...]:
         """`(gh, gw)` 决定的三张表：pos_embed（通道主序 fp16）、cos、sin（各 `(L, ½dim)` fp16）。
@@ -472,7 +560,7 @@ class VisionTower:
         return entry
 
     # -- 面与小工具 -----------------------------------------------------------
-    def _tiles(self, length: int):
+    def _tiles_of(self, length: int):
         for lo in range(0, length, self.s):
             yield lo, min(self.s, length - lo)
 
@@ -486,48 +574,70 @@ class VisionTower:
         view[:, :data.shape[1]] = data
 
     def _take(self, program: _Program, proc: str, cols: int) -> np.ndarray:
-        """读输出面的前 `cols` 列（**视图**，调用方要么当场用完，要么自己拷走）。"""
-        out = program.procs[proc][1]
-        cout = program.io[proc][2]
-        s_out = program.io[proc][3]
-        view = out.array(np.float16, (1, cout, 1, s_out))[0, :, 0]
-        return view[:, :cols]
+        """读输出面的前 `cols` 列（**视图**，调用方要么当场用完，要么自己拷走）。
+
+        输出面由 `_attach_tile` 记在 `_outputs` 上（面归塔所有，程序不认识它），行列规格来自
+        `io`。瓦片只有一块出口面会被外部读（merger 的最终出口），所以这里不区分瓦片。
+        """
+        _, _, cout, s_out = program.io[proc]
+        surface = self._outputs[(program.name, proc)]
+        return surface.array(np.float16, (1, cout, 1, s_out))[0, :, 0][:, :cols]
 
     def _await_gpu(self) -> None:
-        """等队首那一片注意力完成，两个口径分开记。
+        """等**队首**那一片注意力完成，两个口径分开记。
 
         `gpu_ms` 是"等了多少"（墙钟）：串行时它等于 GPU 忙时，交错之后它只剩没藏住的那一截，
         所以它同时也是"这次重叠亏了多少"的度量。`gpu_busy_ms` 是 GPU 真在跑的时间
         （`e8m_wait_upto` 里的 `g_last_gpu_ms`），两条排布下应当相同——不同就是争用。
+
+        **必须是 `wait_upto(0, 1)` 而不是 `wait()`**：`wait()` 等于 `wait_upto(0, -1)`，把整条
+        队列一起结算 —— 队里压着几片就等几片，还会把它们的 GPU 时间**各自累加一遍**。实测把
+        四片一次发出去之后仍用 `wait()`：GPU 忙时从 448 涨到 1 768（正好 4 倍），墙钟 749 → 950。
         """
-        self.stats["gpu_ms"] += self.metal.wait()
+        self.stats["gpu_ms"] += self.metal.wait_upto(0, 1)
         self.stats["gpu_busy_ms"] += self.metal.gpu_ms()
 
-    def _call(self, program: _Program, proc: str) -> None:
-        self.stats["ane_ms"] += program.run(self.runtime, proc)
+    def _call(self, program: _Program, proc: str, slot: int = 0) -> None:
+        self.stats["ane_ms"] += program.run(self.runtime, proc, slot)
         self.stats["evals"] += 1
 
     # -- 生命周期 ------------------------------------------------------------
     @property
     def reuse(self) -> tuple[int, int]:
         """产物命中数 / 总数：与 `cached_program` 同一判据（`doctor` 与门共用这一个）。"""
-        return (sum(1 for p in self._programs.values() if p.files.reused), len(self._programs))
+        return (sum(1 for p in self._programs.values() if p.hit), len(self._programs))
 
     @property
     def bytes(self) -> int:
-        """常驻字节：26 份 blob（ANE 权重）+ 一套面 + 按网格缓存的位置表。
+        """常驻字节：26 份 blob（ANE 权重）+ 面 + 按网格缓存的位置表。
 
-        缓存那一项是**跑起来之后才涨**的（一张 1024² 的表 8 MB，最多 4 个尺寸），所以刚装好的塔
-        报的还是 663.9 MB；`/metrics` 要的是"现在占多少"，这里就得跟着涨。
+        缓存那一项是**跑起来之后才涨**的（一张 1024² 的表 8 MB，最多 4 个尺寸），所以刚装好的
+        塔报的还是小块；`/metrics` 要的是"现在占多少"，这里就得跟着涨。
         """
         blobs = sum(p.files.blob_path.stat().st_size for p in self._programs.values())
         cached = sum(a.nbytes for entry in self._grid_cache.values() for a in entry)
-        return blobs + sum(surface.nbytes for surface in self._surfaces.values()) + cached
+        fixed = sum(surface.nbytes for surface in self._surfaces.values())
+        hidden = sum(surface.nbytes for slot in self._hidden for surface in slot)
+        tiles = sum(tile.qkv.nbytes + tile.ctx.nbytes for tile in self._tiles)
+        return blobs + fixed + hidden + tiles + cached
 
     def close(self) -> None:
         for program in self._programs.values():
             program.close(self.runtime)
         self._programs.clear()
+        for tile in self._tiles:
+            # 包装句柄只能解绑、不能 free（dylib 按 IOSurface 指针缓存它）——
+            # 顺序也重要：先解绑再放面，否则句柄会指向已释放的内存。
+            tile.qkv_dev.free()
+            tile.ctx_dev.free()
+            tile.qkv.free()
+            tile.ctx.free()
+        self._tiles.clear()
+        for slot in self._hidden:
+            for surface in slot:
+                surface.free()
+            slot.clear()
+        self._hidden_views = ([], [])
         for surface in self._surfaces.values():
             surface.free()
         self._surfaces.clear()

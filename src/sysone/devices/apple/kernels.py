@@ -61,7 +61,7 @@ _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
 _ATTN = struct.Struct("<IIIfIIIIIIIIIIIIII")  # struct AttnArgs，72 B
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
-_VATTN = struct.Struct("<IIIIIf")  # struct VAttnArgs，24 B
+_VATTN = struct.Struct("<IIIIIfII")  # struct VAttnArgs，32 B
 _VROPE = struct.Struct("<III")  # struct VRopeArgs，12 B
 
 
@@ -139,14 +139,18 @@ def attn_args(
 
 
 def vattn_args(
-    *, T: int, nq: int, s0: int, hidden: int, dim: int, scale: float
+    *, T: int, nq: int, s0: int, hidden: int, dim: int, scale: float,
+    out_cols: int = 0, out_offset: int | None = None,
 ) -> bytes:
     """`k_vattn`（`shaders/e8_vattn.metal`）。
 
     视觉塔的注意力参数比 `k_attn` 少一大半，因为视觉没有 GQA、没有 mask、没有 gate、没有环、
-    没有槽位：`T`/`nq`/`s0` 是 qkv 与 out 的列布局，`hidden`/`dim` 是通道布局，`scale` 是 1/√d。
+    没有槽位：`T`/`nq`/`s0` 是 **qkv** 的列布局（qkv 是整图的连续缓冲），`out_cols`/`out_offset`
+    是 **out** 的列布局 —— 两者分开是因为 out 常常是"一个瓦片一张面"（列数是桶宽，不是整图
+    长度），而 qkv 与键总数仍是整图的。`hidden`/`dim` 是通道布局，`scale` 是 1/√d。
     """
-    return _VATTN.pack(T, nq, s0, hidden, dim, scale)
+    return _VATTN.pack(T, nq, s0, hidden, dim, scale, out_cols or T,
+                       s0 if out_offset is None else out_offset)
 
 
 def vrope_args(*, T: int, hidden: int, dim: int) -> bytes:
@@ -528,6 +532,8 @@ def vattn(
     dim: int,
     scale: float,
     s0: int = 0,
+    out_cols: int = 0,
+    out_offset: int | None = None,
     lane: int = LANE_LONG,
 ) -> None:
     """视觉塔的非因果注意力：`qkv` 依次是 `[q | k | v]` 各 `hidden` 行，结果写 `out` 的前 `hidden` 行。
@@ -536,7 +542,11 @@ def vattn(
     softmax(QKᵀ)·V —— 给定 q/k 之后，注意力本身没有别的约定。
     一格管 **64 列 query × 一个头**：`grid = (ceil(nq/64), hidden//dim)`、`tg = (256)`，键按
     32 一档。`nq` 不是 64 的倍数时，最后一格只写前 `nq % 64` 列；`s0 + nq <= T` 是调用方的
-    约定（`out` 里只有 `[s0, s0+nq)` 这些列会被写）。
+    约定（qkv 里只有 `[s0, s0+nq)` 这些列会被读）。
+
+    `out_cols` 是**输出缓冲**的行跨距（0 = 与 `T` 相同），`out_offset` 是这一片在 out 里的首列
+    （`None` = 与 `s0` 相同，也就是"qkv 与 out 是同一份整图布局"的老行为）。塔把每个瓦片写成
+    独立的一张面时，出参是 `(out_cols = 桶宽, out_offset = 0)`。
     """
     if dim != 64:
         # 核里"8 档通道 × 8 个分片"是按 head_dim == 64 写死的。`k_attn` 对 `E8_HEAD_DIM` 用
@@ -545,7 +555,9 @@ def vattn(
     runtime.dispatch(
         "k_vattn",
         [qkv, out],
-        args=vattn_args(T=T, nq=nq, s0=s0, hidden=hidden, dim=dim, scale=scale),
+        args=vattn_args(T=T, nq=nq, s0=s0, hidden=hidden, dim=dim, scale=scale,
+                        out_cols=out_cols or T,
+                        out_offset=s0 if out_offset is None else out_offset),
         grid=((nq + 63) // 64, hidden // dim, 1),
         tg=(256, 1, 1),
         lane=lane,

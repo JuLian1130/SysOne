@@ -42,12 +42,14 @@
 
 // 与 Python 侧 `kernels.vattn_args` 的 `_VATTN` 格式串逐字节对应（24 B）。
 struct VAttnArgs {
-    uint  T;       // 0  每通道列数（qkv / out 的 stride，也是键的总数）
+    uint  T;       // 0  qkv 每通道的列数（整图长度，也是键的总数）
     uint  nq;      // 1  这次产出的 query 列数
-    uint  s0;      // 2  第一列 query 的偏移
+    uint  s0;      // 2  第一列 query 在 qkv 里的偏移
     uint  hidden;  // 3  q、k、v 各自的通道数（= heads * dim）
     uint  dim;     // 4  head_dim（本核写死 64，见 `kernels.vattn` 的守卫）
     float scale;   // 5  dim ** -0.5
+    uint  oT;      // 6  out 每通道的列数（输出面自己的行跨距）
+    uint  os0;     // 7  这一片 query 在 out 里的首列
 };
 
 // 8×8 分片的元素归属（行主序读入 / 写出时 lane 与格的对应）。
@@ -121,7 +123,7 @@ static inline void va_stage(threadgroup half *buf, device const half *src, uint 
 // 出了这次调用的范围（`nq` 是 8 的倍数时没有，否则就有）—— 漏了这一判，`T` 是奇数时最后一列
 // 会写到 `T` 号列，也就是**下一个通道行的第 0 列**，把第 0 列 query 的输出踩掉（实测 T=25/33）。
 #define VA_STORE(EG, E) { \
-    device half *op = out + (ulong)(qbase + (E)) * T + a.s0 + jc; \
+    device half *op = out + (ulong)(qbase + (E)) * a.oT + a.os0 + jc; \
     op[0] = half(c_##EG.thread_elements()[0] * iv0); \
     if (jc + 1u < a.nq) op[1] = half(c_##EG.thread_elements()[1] * iv1); }
 

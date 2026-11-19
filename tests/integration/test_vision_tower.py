@@ -62,6 +62,14 @@ def test_tower_shape_repeat_and_reuse(tmp_path: Path) -> None:
         # 一次前向的 eval 次数是固定的：patch 1 + 24×2 + merger 2 = 51（分趟时按趟乘）。
         # 24 层每层两次，不是三次：`proj → 残差 → norm2 → FFN → 残差` 在同一段里（票据 07 §7.10）。
         assert tower.stats["evals"] == 102, tower.stats
+
+        # 跨瓦片：288² 是 324 个 token，在 s=256 下分成 256 + 68 两片，而**每个瓦片有自己的
+        # 面与槽位**（`attach_slot`，票据 07 §7.20）。片数一变，绑错面不会报错、只会让数值
+        # 安静地偏掉，所以这条钉的是"两片都走了自己那条路"：出口行数是 324/4 = 81。
+        wide = np.random.default_rng(12).uniform(-1.0, 1.0, (288, 288, 3)).astype(np.float32)
+        one = tower.encode(wide)
+        assert one.shape == (81, 2048), one.shape
+        assert np.array_equal(one, tower.encode(wide)), "跨瓦片的两次调用不是逐位相同"
     finally:
         tower.close()
 

@@ -146,11 +146,16 @@ def test_io_helpers_are_the_plans_own_numbers() -> None:
 
 
 def test_vattn_args_layout_is_the_msl_struct() -> None:
-    """`k_vattn` 的参数是 24 B：5 个 u32 + 1 个 f32，字段顺序见 `shaders/e8_vattn.metal`。
+    """`k_vattn` 的参数是 32 B：7 个 u32 + 1 个 f32，字段顺序见 `shaders/e8_vattn.metal`。
 
     dylib 把整块结构体写进 `E8_ARGS_INDEX`，所以格式串就是 ABI 本身：字段顺序错一位，核读到
-    的 `T` 会是 `nq`，形状合法而结果错。
+    的 `T` 会是 `nq`，形状合法而结果错。`oT`/`os0` 是**输出面自己的**行跨距与首列（塔按瓦片
+    写独立的面，qkv 仍是整图），所以两个布局要分开传。
     """
-    args = kernels.vattn_args(T=4096, nq=4096, s0=0, hidden=1024, dim=64, scale=0.125)
-    assert len(args) == 24
-    assert struct.unpack("<IIIIIf", args) == (4096, 4096, 0, 1024, 64, 0.125)
+    args = kernels.vattn_args(T=4096, nq=1024, s0=2048, hidden=1024, dim=64, scale=0.125,
+                              out_cols=1024, out_offset=0)
+    assert len(args) == 32
+    assert struct.unpack("<IIIIIfII", args) == (4096, 1024, 2048, 1024, 64, 0.125, 1024, 0)
+    # 不给 out_offset 时沿用它原来的意思：输出与 qkv 同一份整图布局
+    same = kernels.vattn_args(T=4096, nq=1024, s0=2048, hidden=1024, dim=64, scale=0.125)
+    assert struct.unpack("<IIIIIfII", same)[6:] == (4096, 2048)
