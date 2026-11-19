@@ -622,7 +622,15 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
             AT_SM1(7, s_7)
             mx    = max(mx, simd_shuffle_xor(mx, 1));
             mx    = max(mx, simd_shuffle_xor(mx, 8));
-            const float m_new = max(m_run, mx);
+            // A key block that is *entirely* masked leaves both `m_run` and `mx` at -INFINITY,
+            // and `-inf - -inf` is NaN, which then poisons the row.  Before this guard the only
+            // callers were batched tails, whose slot always starts after a non-empty shared
+            // prefix -- block 0 always held visible keys.  A block-diagonal layout (independent
+            // sequences side by side, empty prefix) hits it on every slot but the first.
+            // Substituting 0 keeps the algebra exact: `asc = exp2(-inf) = 0` and every
+            // `p = exp2(-inf - 0) = 0`, i.e. the block contributes nothing, which is the truth.
+            const float caught = max(m_run, mx);
+            const float m_new  = isinf(caught) ? 0.0f : caught;
             const float asc   = exp2(m_run - m_new);        // 0 on the first block
             m_run = m_new;
             float sum = 0.0f;
