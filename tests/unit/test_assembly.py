@@ -21,10 +21,12 @@ class FakeBuilder:
         self.label = label
         self.calls: list[dict] = []
 
-    def __call__(self, model_dir, *, bucket=None, width=None, resident=None, scratch_dir=None):
+    def __call__(self, model_dir, *, bucket=None, width=None, resident=None, scratch_dir=None,
+                 vision=None, vision_idle=None, vision_bucket=None):
         self.calls.append(
             {"dir": str(model_dir), "bucket": bucket, "width": width,
-             "resident": resident, "scratch_dir": scratch_dir}
+             "resident": resident, "scratch_dir": scratch_dir, "vision": vision,
+             "vision_idle": vision_idle, "vision_bucket": vision_bucket}
         )
         return f"runner:{self.label}"
 
@@ -56,7 +58,8 @@ def test_assemble_builds_the_runner_the_family_declares(tmp_path, builders):
     # 形状来自家族的 `parse_config`，不是从命令行拼的
     assert assembled.descriptor.model_id == root.name
     assert split.calls == [{"dir": str(root), "bucket": 1024, "width": 2048,
-                            "resident": 4, "scratch_dir": None}]
+                            "resident": 4, "scratch_dir": None, "vision": None,
+                            "vision_idle": None, "vision_bucket": None}]
     assert pooled.calls == []
 
 
@@ -124,3 +127,14 @@ def test_unknown_family_is_the_registry_error(tmp_path, builders):
 
     with pytest.raises(UnknownModelError):
         assembly.assemble(tmp_path, "nope", backend="split")
+
+
+def test_视觉的三个旋钮都到达执行器(tmp_path, builders):
+    """`vision` / `vision_idle` / `vision_bucket` 是三条独立的路：少传一个，部署时就会出现
+    "我设了它、它没生效"，而三条都不会报错。"""
+    split, _pooled = builders
+    root = make_mude_checkpoint(tmp_path)
+    assembly.assemble(root, "mude", backend="split", bucket=1024, vision=True,
+                      vision_idle=30.0, vision_bucket=512)
+    call = split.calls[-1]
+    assert (call["vision"], call["vision_idle"], call["vision_bucket"]) == (True, 30.0, 512)

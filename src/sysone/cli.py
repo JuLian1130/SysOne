@@ -88,6 +88,12 @@ def _model_flags() -> argparse.ArgumentParser:
         help=f"视觉塔空闲多少秒后真卸载（默认 {_VISION_IDLE:.0f}；0 = 每请求后立刻卸）。"
              "卸载是把 26 个 program 卸掉、面释放，不是挂起",
     )
+    common.add_argument(
+        "--vision-bucket", type=int, default=None, dest="vision_bucket", metavar="COLS",
+        help="视觉塔自己的列宽（默认跟随链的桶）。它决定每层切几个瓦片：越窄瓦片越多、"
+             "GPU 越藏得住，但 ANE 每 token 更贵、表面更小。1024² 上实测 256/512/1024/2048/4096 "
+             "= 959/902/781/794/849 ms，768² 上 512 最好（427 vs 1024 的 492）。必须是 4 的倍数",
+    )
     return common
 
 
@@ -368,7 +374,8 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
         }
         assembled = assemble(args.weights, name, backend=args.backend,
                              artifacts_dir=artifacts, vision=(args.vision != "off"),
-                             vision_idle=float(args.vision_idle), **options)
+                             vision_idle=float(args.vision_idle),
+                             vision_bucket=args.vision_bucket, **options)
         descriptor = assembled.descriptor
         config = EngineConfig(
             model=ModelSelection(name=args.weights.name, dir=args.weights),

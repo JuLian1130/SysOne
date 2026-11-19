@@ -216,6 +216,10 @@ class VisionTower:
             # `x.view(-1, 4·hidden)` 一致）：换一个 merge 值需要另一个 MIL 构造器，不是改个常数。
             raise NotReadyError("视觉塔只实现了 2×2 的空间合并", merge=self.merge)
         self.unit = self.merge ** 2          # 一个合并块吃掉几列
+        if self.s % self.unit:
+            # `self.q` 是整除，桶宽不整除 4 会让最后一趟少算几列 —— 静默丢列，所以在这里拦。
+            raise NotReadyError("视觉塔的桶宽必须能被 merger 的 2×2 合并整除",
+                                s=self.s, merge=self.merge)
         self.q = self.s // self.unit          # 合并后的列数
         self.hidden = int(spec.hidden)
         self.ffn = int(spec.intermediate_size)

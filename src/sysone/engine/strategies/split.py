@@ -339,6 +339,7 @@ def mude_runner(
     resident: int | None = None,
     vision: bool | None = None,
     vision_idle: float = 60.0,
+    vision_bucket: int | None = None,
 ) -> SplitRunner:
     """装一条 mude split 链：分词器 + 回答码 + ANE/Metal 链。
 
@@ -380,6 +381,13 @@ def mude_runner(
             resident=resident,
         )
 
+    # 塔自己的列宽（`None` = 跟随链的桶）。它决定"每层几个瓦片"：桶越窄瓦片越多、交错越好，
+    # 但 ANE 的每 token 成本上升。实测（1024²，票据 07 §7.17）：256/512/1024/2048/4096 =
+    # 959/902/**781**/794/849 ms —— 1024 是拐点，所以默认跟随链（`S_NATIVE` = 1024）。
+    tower_s = bucket_width if vision_bucket is None else int(vision_bucket)
+    if tower_s % 4:
+        raise ConfigError("视觉塔的桶宽必须是 4 的倍数（merger 的 2×2 合并）", vision_bucket=tower_s)
+
     def load_tower(chain: object) -> object:
         # 塔复用链已经打开的权重容器与两个运行时：`MetalRuntime` 是进程单例、按几何编译，
         # 塔再要一份的话，先建塔后建链（或反过来）会让第二次构造撞上"已经按另一套几何编译过"。
@@ -387,7 +395,7 @@ def mude_runner(
 
         slot = VisionSlot(
             lambda: VisionTower(store=chain.store, descriptor=weights.descriptor,  # type: ignore[attr-defined]
-                                s=bucket_width, runtime=chain.runtime,           # type: ignore[attr-defined]
+                                s=tower_s, runtime=chain.runtime,                # type: ignore[attr-defined]
                                 metal=chain.metal_runtime,                       # type: ignore[attr-defined]
                                 artifacts_dir=scratch_dir),
             spec=weights.descriptor.vision,

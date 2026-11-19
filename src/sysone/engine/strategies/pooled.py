@@ -233,6 +233,7 @@ def h2o_runner(
     resident: int | None = None,
     vision: bool | None = None,
     vision_idle: float = 60.0,
+    vision_bucket: int | None = None,
 ) -> PooledRunner:
     """装一条 h2o 的 pooled 链：厂商答面 + 词表行按需取 + ANE 链。
 
@@ -290,12 +291,17 @@ def h2o_runner(
     def rows(label_ids: Sequence[int]) -> np.ndarray:
         return np.asarray(store.read_rows(embed_name, list(label_ids)), np.float32)
 
+    # 塔自己的列宽（`None` = 跟随链的桶）；4 的倍数是 merger 的 2×2 合并要求的。
+    tower_s = bucket_width if vision_bucket is None else int(vision_bucket)
+    if tower_s % 4:
+        raise ConfigError("视觉塔的桶宽必须是 4 的倍数（merger 的 2×2 合并）", vision_bucket=tower_s)
+
     def load_tower(chain: object) -> object:
         from ...devices.apple.vision import VisionSlot, VisionTower
 
         return VisionSlot(
             lambda: VisionTower(store=chain.store, descriptor=weights.descriptor,  # type: ignore[attr-defined]
-                                s=bucket_width, runtime=chain.runtime,           # type: ignore[attr-defined]
+                                s=tower_s, runtime=chain.runtime,                # type: ignore[attr-defined]
                                 metal=chain.metal_runtime,                       # type: ignore[attr-defined]
                                 artifacts_dir=scratch_dir),
             spec=weights.descriptor.vision,
