@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from helpers import FIXTURES, make_request, make_tiny
-from sysone.cli import _artifacts_dir, _geometry_report, main
+from sysone.cli import _artifacts_dir, _geometry_report, _platform_report, _resolve_backend, main
 from sysone.devices.apple import platform as apple_platform
 from sysone.errors import ConfigError
 
@@ -41,6 +41,8 @@ def test_run_with_tiny_model(tmp_path: Path, capsys) -> None:
     code = main(
         [
             "run",
+            "--backend",
+            "reference",
             "--descriptor",
             str(descriptor_path),
             "--weights",
@@ -63,6 +65,8 @@ def test_run_rejects_unknown_mode(tmp_path: Path, capsys) -> None:
     code = main(
         [
             "run",
+            "--backend",
+            "reference",
             "--descriptor",
             str(descriptor_path),
             "--weights",
@@ -104,6 +108,12 @@ def test_doctor_needs_both_the_model_and_its_weights() -> None:
         _geometry_report(None, FIXTURES / "mude")
 
 
+def test_doctor_reports_the_artifact_format_even_when_apple_is_unavailable() -> None:
+    """产物格式版本是跨机器身份的一部分：苹果不可用时也要能查，别让用户卡在旧产物上。"""
+    report = _platform_report("apple")
+    assert report["artifact_version"] == 3
+
+
 # ---- 产物落点：命令行 > 环境变量 > 平台缓存目录 ----------------------------------------
 
 
@@ -124,12 +134,38 @@ def test_artifacts_dir_precedence(tmp_path: Path, monkeypatch) -> None:
 
 def test_compile_refuses_the_reference_backend(capsys) -> None:
     """参考后端没有产物可编：报错要说清给哪两个后端，而不是让它走到 `--descriptor` 缺失。"""
-    code = main(["compile", "--weights", str(FIXTURES / "mude")])
+    code = main(["compile", "--backend", "reference", "--weights", str(FIXTURES / "mude")])
     assert code == 2
     payload = json.loads(capsys.readouterr().err)
     assert payload["code"] == "config"
     assert payload["context"]["backend"] == "reference"
     assert payload["context"]["available"] == ["split", "pooled"]
+
+
+# ---- 后端默认值：不给 --backend 时按家族/包身份推断 ------------------------------------
+
+
+def test_backend_follows_the_model_family() -> None:
+    """`--model h2o` 不给 --backend 就是 pooled；reference 不会因为"没给"而被选中。"""
+    args = SimpleNamespace(backend=None, model="mude", weights=FIXTURES / "mude", descriptor=None)
+    assert _resolve_backend(args) == "split"
+    args = SimpleNamespace(backend=None, model="h2o", weights=FIXTURES / "h2o", descriptor=None)
+    assert _resolve_backend(args) == "pooled"
+
+
+def test_backend_is_inferred_from_the_weights_package(tmp_path: Path) -> None:
+    """没给 --model 时按必需件认家族：mude 带 decision_config.json，h2o 带 serve_config.json。"""
+    (tmp_path / "decision_config.json").write_text("{}", encoding="utf-8")
+    args = SimpleNamespace(backend=None, model=None, weights=tmp_path, descriptor=None)
+    assert _resolve_backend(args) == "split"
+    assert args.model == "mude"
+
+
+def test_backend_inference_asks_for_an_explicit_model_on_an_unknown_package(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        _resolve_backend(
+            SimpleNamespace(backend=None, model=None, weights=tmp_path, descriptor=None)
+        )
 
 
 def test_compile_reports_the_startup_split_and_shuts_down(monkeypatch, capsys) -> None:

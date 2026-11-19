@@ -1,0 +1,22 @@
+SysOne Native 运行时
+=====================
+
+`tools/native/` 下的三份源文件是 SysOne 的 Apple 后端构建输入：
+
+- `e8_ane.m` —— ANE（Apple Neural Engine）的私有 C ABI 封装；
+- `e8_mtl.m` —— Metal 运行时与 kernel 编译宿主；
+- `e8_image.m` —— 基于 ImageIO 的图片解码 shim。
+
+来源与性质
+----------
+
+三份 `.m` 从本项目的旧研究引擎迁移而来，其中 `e8_ane.m` 的私有 API 调用方言源自更早的
+`ane_mil_probe.m`。迁移后的源码是 SysOne 的一部分，随本仓库发布。本仓库根当前未附
+`LICENSE`；如需再分发，请先与维护者确认许可。
+
+`e8_ane.m` 通过 Objective-C 运行时动态查找 Apple 未公开的 `_ANE*` 类。这是非官方接口：
+Apple 不为其提供文档、兼容性承诺或支持，系统升级可能改变其行为。本项目与 Apple 不存在
+隶属或背书关系，"ANE"、"Apple"、"Metal" 等名称仅用于说明事实。
+
+这些源文件按现状提供，不附带任何明示或暗示的担保。使用前请确认符合你所在地的法律与
+Apple 的许可条款。

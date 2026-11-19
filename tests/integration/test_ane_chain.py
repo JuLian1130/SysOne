@@ -14,7 +14,7 @@ from sysone.errors import NotReadyError
 from sysone.models.families import mude
 from sysone.models.vision.merge import Placement
 
-MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
+MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", ""))
 WEIGHTS = MUDE_DIR / "model.safetensors"
 
 

@@ -32,7 +32,7 @@ from sysone.devices.apple.blobplan import ane_layer_segments
 from sysone.weights.packing import ane_blob
 from sysone.weights.store import SafeTensorFile
 
-MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
+MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", ""))
 WEIGHTS = MUDE_DIR / "model.safetensors"
 LAYER0 = "language_model.layers.0"
 PROJ = f"{LAYER0}.linear_attn.in_proj_qkv.weight"

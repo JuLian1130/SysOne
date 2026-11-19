@@ -32,8 +32,8 @@ MTL_DYLIB_NAME = "libe8mtl.dylib"
 # 编译顺序即拼接顺序：公共头必须在最前，后面的 .metal 里 `#include "e8_common.h"` 会被丢掉
 # （运行时编译没有 include 路径）。
 #
-# 这四份源码是 `docs/ANE/anebench` 的副本，vendored 到包内（`shaders/`）：kernel 需要跟着
-# 代码走，而 `docs/` 是独立的本地仓库、不进主仓库也不进安装包。唯一的功能改动写在
+# 这四份源码从旧引擎 vendored 到包内（`shaders/`）：kernel 需要跟着代码走，公开仓库与
+# 安装包都必须自包含。唯一的功能改动写在
 # `shaders/e8_attn.metal` 顶部：原实现的分片搬运用了 lambda，本机 MSL 编译器不支持，已展开成
 # `at_stage()`，循环体逐字保留。
 #
@@ -43,7 +43,7 @@ MTL_DYLIB_NAME = "libe8mtl.dylib"
 SOURCES = ("e8_common.h", "e8_kernels.metal", "e8_attn.metal", "e8_gdn.metal",
            "e8_vattn.metal")
 
-# 两条命令队列（`docs/ANE/anebench/e8_mtl.m:51-72` 的 `E8_NLANE`）：
+# 两条命令队列（`tools/native/e8_mtl.m:51-72` 的 `E8_NLANE`）：
 #   lane 0 —— 长任务：`k_attn` / `k_q_prep` / `k_kv_prep`，以及 ANE 藏在其后的那些 stage；
 #   lane 1 —— 1~3 ms 的小核：`k_norm_to` / `k_norm_resid` / `k_copy`（GDN 的 `core` 也在这里，
 #             因为 lane 0 上排着 ~140 ms 的 attention dispatch，把它排后面会让 ANE 停一整个
@@ -211,7 +211,7 @@ class MetalRuntime:
             raise NotReadyError(
                 "找不到 libe8mtl.dylib",
                 path=str(dylib),
-                hint="运行 tools/build_ane.sh 重建（产物在 .tmp/e8，被 .gitignore 忽略）",
+                hint="运行 tools/build_ane.sh 重建（源码在 tools/native/，产物在 .tmp/e8，被 .gitignore 忽略）",
             )
         self.path = dylib
         self._geometry = geometry

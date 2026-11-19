@@ -1,7 +1,7 @@
 """Apple 后端的本地产物位置。
 
-三份 dylib（`libe8ane` / `libe8mtl` / `libe8image`）由 `tools/build_ane.sh` 编译，落在
-`SYS1_E8_DIR`，默认 `<仓库>/.tmp/e8`。默认值从仓库内的 `.tmp` 取而不是 `/tmp`：本机开机
+三份 dylib（`libe8ane` / `libe8mtl` / `libe8image`）由 `tools/build_ane.sh` 从
+`tools/native/` 的三份 `.m` 编译，落在 `SYS1_E8_DIR`，默认 `<仓库>/.tmp/e8`。默认值从仓库内的 `.tmp` 取而不是 `/tmp`：本机开机
 会把 `/tmp` 整个清空（2026-11-19 实测：重启后 `/tmp` 里没有一项早于 boottime），而清空的
 表现是整条 ANE 路径都以"找不到 dylib"失败，代价却只是 2 s 重编。
 

@@ -30,7 +30,7 @@ from sysone.devices.apple.ops import (
 )
 from sysone.weights.store import SafeTensorFile
 
-MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
+MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", ""))
 _WEIGHTS = MUDE_DIR / "model.safetensors"
 LAYER = 0
 S = 96

@@ -19,7 +19,7 @@ from sysone.models.tokenizer import ChatTokenizer
 from sysone.models.vision import merge
 from sysone.domain.decision import Question
 
-MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
+MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", ""))
 STATE = "A small office with a desk and a lamp."
 QUESTION = Question(text="Is the light on?", options=("Yes, it is on.", "No, it is off."))
 

@@ -39,7 +39,7 @@ def test_surface_is_a_zero_copy_view():
 def test_missing_dylib_says_how_to_rebuild(tmp_path):
     with pytest.raises(NotReadyError) as excinfo:
         AneRuntime(tmp_path / "libe8ane.dylib")
-    assert excinfo.value.context["hint"] == "运行 tools/build_ane.sh 重建"
+    assert excinfo.value.context["hint"] == "运行 tools/build_ane.sh 重建（源码在 tools/native/）"
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="只在非 macOS 上有意义")

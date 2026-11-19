@@ -3,7 +3,7 @@
 这一层只管"加载 + 探测 + 最小调用面"。编译一个 program、拼 int8 blob、按 S 桶缓存，
 都在 M2.1 的 `compile.py`，不放这里。
 
-dylib 由 `tools/build_ane.sh` 从 `docs/ANE/anebench/e8_ane.m` 重建；产物在
+dylib 由 `tools/build_ane.sh` 从本仓库的 `tools/native/e8_ane.m` 重建；产物在
 `SYS1_E8_DIR`（默认 `<仓库>/.tmp/e8`），所以"找不到就报 NotReady"而不是静默降级。
 """
 
@@ -94,7 +94,7 @@ class AneRuntime:
             raise NotReadyError(
                 "找不到 ANE dylib",
                 path=str(dylib),
-                hint="运行 tools/build_ane.sh 重建",
+                hint="运行 tools/build_ane.sh 重建（源码在 tools/native/）",
             )
         try:
             self.lib = ctypes.CDLL(str(dylib))
@@ -110,7 +110,8 @@ class AneRuntime:
             raise NotReadyError("e8_init 失败", rc=int(rc), reason=self.error())
         # 异步 eval 的工作线程：`e8_eval` 是阻塞 ctypes 调用，但 ctypes 在调用期间释放 GIL，
         # 所以一个普通工作线程就够。**只有一个 eval 在飞**：两个并发发射者在这台机器上慢
-        # 1.68×（同一条固件队列），所以这里刻意用 `max_workers=1`（`docs/ANE/anebench/e8_a3.py:168-179`）。
+        # 1.68×（同一条固件队列），所以这里刻意用 `max_workers=1`（旧引擎的 e8_a3.py:168-179，
+        # 旧位置仅供追溯）。
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ane")
         self._pending: "Future | None" = None
 
@@ -335,7 +336,7 @@ class AneRuntime:
     def issue(self, name: str, procedure: int = 0, *, slot: int = 0) -> None:
         """异步发射一次 eval，立刻返回；用 `reap()` 回收。
 
-        这是旧引擎 `ISSUE_EVAL`（`docs/ANE/anebench/e8_a3.py:168-179`）的语义：
+        这是旧引擎 `ISSUE_EVAL`（旧引擎的 e8_a3.py:168-179，旧位置仅供追溯）的语义：
         **不是并发 eval**（两个并发发射者慢 1.68×，同一条固件队列），而是"eval 在飞时
         CPU 不阻塞"，于是这段时间里可以往 GPU 命令缓冲里继续编码互不依赖的 kernel。
         """

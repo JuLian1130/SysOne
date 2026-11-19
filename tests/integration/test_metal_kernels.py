@@ -1,7 +1,7 @@
 """Metal 核的对拍：q/k 的准备（归一化 + 半维 RoPE + gate 的 sigmoid）与注意力。
 
 两个用例都把参考路径与 GPU 路径的输入对齐到**同一份 fp16 取整后的数值**，所以量出来的差额
-就是核自己的算术，不含 ANE 的 fp16 地板（2.07e-2 量级，见 `docs/ANE/README.md` §10.22）。
+就是核自己的算术，不含 ANE 的 fp16 地板（2.07e-2 量级，见旧引擎的实测记录）。
 把 prep 与 attention 分成两段对拍，是为了失败时一眼看得出是哪一段错了。
 """
 
@@ -22,7 +22,7 @@ from sysone.devices.apple.ops import apply_rotary, attention, rms_norm, sigmoid
 from sysone.errors import NotReadyError
 from sysone.weights.store import SafeTensorFile
 
-MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
+MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", ""))
 _WEIGHTS = MUDE_DIR / "model.safetensors"
 LAYER = 3
 S = 96

@@ -43,6 +43,47 @@ _DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o"}
 # 视觉塔的空闲卸载窗口（票据 07 §6 未定项 2 的默认值）。60 s 是"连续几张图算同一批"的量级：
 # 装一次 0.6–2 s、卸一次同样，窗口短于这个数就等于每张图都付两遍。
 _VISION_IDLE = 60.0
+# run / serve 只列有 CLI 装配入口的家族：`torchcast` 只有 vendor 策略，`assemble` 会报
+# "装配不出来"，不能在公开选项里许诺它。`inspect` / `doctor` 仍列全部家族（它们只看配置）。
+_CLI_FAMILIES = tuple(name for name in families() if family(name).strategy in STRATEGY_BACKENDS)
+
+# 没有 --model 时按包身份认家族：mude 的读出依赖 `decision_config.json`，h2o 的 pooled 路径
+# 依赖厂商 `serve_config.json`。这不是按权重形状猜家族 —— 猜错不会崩，只会拿错模板算出
+# 看似正常的答案；两个标记文件是发布包的必需件，认它们比认形状或目录名可靠。
+_FAMILY_MARKERS = {"mude": "decision_config.json", "h2o": "serve_config.json"}
+
+
+def _infer_family(weights: Path) -> str:
+    """从模型目录的必需件推断家族；推断不出来就要求显式 `--model`。"""
+    if weights.is_dir():
+        found = [name for name, marker in _FAMILY_MARKERS.items() if (weights / marker).is_file()]
+        if len(found) == 1:
+            return found[0]
+    raise ConfigError(
+        "需要 --model 或 --backend",
+        weights=str(weights),
+        available=list(_CLI_FAMILIES),
+        hint="mude 加 --model mude，h2o 加 --model h2o；"
+             "reference 后端用 --backend reference --descriptor",
+    )
+
+
+def _resolve_backend(args: argparse.Namespace) -> str:
+    """`--backend` 未给时按 `--model`（或权重包身份）推断；reference 仍必须显式给。"""
+    if args.backend is not None:
+        return args.backend
+    if args.model is None:
+        args.model = _infer_family(args.weights)
+    strategy = family(args.model).strategy
+    if strategy not in STRATEGY_BACKENDS:
+        raise ConfigError(
+            "这个家族没有 CLI 装配入口",
+            family=args.model,
+            strategy=strategy,
+            available=list(_CLI_FAMILIES),
+            hint="给 --backend split（mude）或 pooled（h2o）",
+        )
+    return strategy
 
 
 def _model_flags() -> argparse.ArgumentParser:
@@ -50,14 +91,15 @@ def _model_flags() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--backend",
-        default="reference",
+        default=None,
         choices=("reference",) + STRATEGY_BACKENDS,
-        help="执行路径：reference（M0 语义裁判，只做全注意力层）/ split（码表读出，mude）"
-             "/ pooled（标签行读出，h2o）",
+        help="执行路径：不给时按 --model 的家族推断（mude → split、h2o → pooled，"
+             "没给 --model 时按权重包身份认）；reference（M0 语义裁判，只做全注意力层）"
+             "必须显式给，且只配合 --descriptor",
     )
     common.add_argument(
-        "--model", default=None, choices=families(),
-        help="家族（默认按后端取：split → mude、pooled → h2o）",
+        "--model", default=None, choices=_CLI_FAMILIES,
+        help="家族（默认按后端取：split → mude、pooled → h2o；也可由权重包身份推断）",
     )
     common.add_argument("--descriptor", type=Path, default=None, help="descriptor JSON；reference 路径必填")
     common.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
@@ -232,12 +274,19 @@ def _platform_report(target: str) -> dict[str, object]:
             "modes": sorted(mode.value for mode in caps.modes),
             "note": "M0 的语义裁判，只做全注意力层",
         }
+    from .devices.apple.compile import ARTIFACT_VERSION
+
     try:
-        report = {"available": True, **ApplePlatform().probe()}
+        report = {
+            "available": True,
+            "artifact_version": ARTIFACT_VERSION,
+            **ApplePlatform().probe(),
+        }
     except SysOneError as exc:
         return {
             "platform": "apple",
             "available": False,
+            "artifact_version": ARTIFACT_VERSION,
             "reason": exc.message,
             "context": exc.context,
         }
@@ -363,10 +412,11 @@ def _vision_report(
 
 
 def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
-    """按 `--backend` 装配引擎：参考后端（M0 语义裁判）或 mude 的 ANE+GPU 链。"""
+    """按后端装配引擎：参考后端（M0 语义裁判）或 mude/h2o 的 Apple 链。"""
+    backend = _resolve_backend(args)
     artifacts = _artifacts_dir(args.artifacts)
-    if args.backend in STRATEGY_BACKENDS:
-        name = args.model or _DEFAULT_FAMILY[args.backend]
+    if backend in STRATEGY_BACKENDS:
+        name = args.model or _DEFAULT_FAMILY[backend]
         width = int(args.width or _SPLIT_WIDTH)
         # 形状与执行器都由注册表装配（`engine.strategies.assembly`）：CLI 不认识任何家族名，
         # 也不认识哪条链该配哪套题面 —— 那是家族自己声明的策略。
@@ -374,7 +424,7 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
             "bucket": args.bucket or None, "width": width,
             "resident": args.resident or None,
         }
-        assembled = assemble(args.weights, name, backend=args.backend,
+        assembled = assemble(args.weights, name, backend=backend,
                              artifacts_dir=artifacts, vision=(args.vision != "off"),
                              vision_idle=float(args.vision_idle),
                              vision_bucket=args.vision_bucket, **options)
@@ -395,7 +445,8 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
             config=config,
         )
     if args.descriptor is None:
-        raise ConfigError("reference 后端需要 --descriptor")
+        raise ConfigError("reference 后端需要 --descriptor",
+                          hint="reference 只用于语义裁判：--backend reference --descriptor …")
     descriptor = ModelDescriptor.from_mapping(_load_json(args.descriptor))
     config = EngineConfig(
         model=ModelSelection(name=args.weights.name, dir=args.weights),
@@ -445,10 +496,11 @@ def _compile(args: argparse.Namespace) -> int:
     R6 里"首启编译慢"的缓解手段就是它：部署时先跑一次，起服务时编译那一段就是 0 秒。
     幂等由产物缓存本身保证 —— 全部命中时它只花装载与预热的时间。
     """
-    if args.backend not in STRATEGY_BACKENDS:
+    backend = _resolve_backend(args)
+    if backend not in STRATEGY_BACKENDS:
         raise ConfigError(
             "compile 只对按需编译的路径有意义",
-            backend=args.backend,
+            backend=backend,
             available=list(STRATEGY_BACKENDS),
             hint="给 --backend split（mude）或 pooled（h2o）；reference 后端不产生产物",
         )

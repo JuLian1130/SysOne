@@ -5,7 +5,7 @@
 接受的每一种格式，而且就是预览与访达用的那一个，所以"这张图在 Mac 上打得开"和"服务读得了"
 是同一个问题。
 
-两条与参照处理器一致、且**故意**如此的约定（源码 `docs/ANE/anebench/e8_image.m` 的头注释）：
+两条与参照处理器一致、且**故意**如此的约定（源码 `tools/native/e8_image.m` 的头注释）：
 
 1. **不应用 EXIF 方向**。`CGImageSourceCreateImageAtIndex` 忽略方向标签，Pillow 的
    `Image.open(...).convert("RGB")` 也一样，于是两边默认就对得上。在这里应用旋转，恰好会在
@@ -22,7 +22,7 @@ JPEG 4:4:4 只差反 DCT 的舍入（≤3 个 8 位步长、均值 0.21）；而
 CoreGraphics 另一套），只在色度有高频的地方显形。这一层的方差大于重采样，所以"视觉够不够准"
 的基线是 1e-2 而不是 1e-3（票据 07 §2.3 #3.2）。
 
-dylib 由 `tools/build_ane.sh` 从 `docs/ANE/anebench/e8_image.m` 编译到 `SYS1_E8_DIR`
+dylib 由 `tools/build_ane.sh` 从本仓库的 `tools/native/e8_image.m` 编译到 `SYS1_E8_DIR`
 （默认 `<仓库>/.tmp/e8`），所以"找不到就报 `NotReadyError`"而不是静默降级 ——
 与 `runtime.py` 同一个形态。**导入这个模块不需要编译**：库在第一次 `decode` 时才加载。
 
@@ -66,7 +66,7 @@ def _load(path: str | os.PathLike | None) -> ctypes.CDLL:
     dylib = _dylib_path(path)
     if not dylib.is_file():
         raise NotReadyError("找不到图片解码 dylib", path=str(dylib),
-                            hint="运行 tools/build_ane.sh 重建")
+                            hint="运行 tools/build_ane.sh 重建（源码在 tools/native/）")
     try:
         lib = ctypes.CDLL(str(dylib))
     except OSError as exc:

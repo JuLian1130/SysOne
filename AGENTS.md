@@ -6,18 +6,18 @@
 
 ### Issue tracker（问题追踪）
 
-issue 与 spec 以本地 markdown 形式存放于 `.scratch/`（不走 GitHub Issues；`.scratch/` 不被主仓库跟踪，由它自己的本地 git 仓库管理）。详见 `docs/agents/issue-tracker.md`。
+issue 与 spec 以本地 markdown 形式存放于 `.scratch/`（不走 GitHub Issues；`.scratch/` 不被主仓库跟踪，由它自己的本地 git 仓库管理）。主仓库的公开面不链接任何主仓库之外的私有文档。
 
-**提交信息**：主仓库是公开仓库，历史对读者可见，提交信息按 Conventional Commits 写，并且中英文对照、英文在前：标题行写英文；正文英文段在前、中文段在后，两段一一对应。`.scratch/`、`docs/` 仓库不受此约束。
+**提交信息**：主仓库是公开仓库，历史对读者可见，提交信息按 Conventional Commits 写，并且中英文对照、英文在前：标题行写英文；正文英文段在前、中文段在后，两段一一对应。`.scratch/` 仓库不受此约束。
 
-- 格式：`<type>(<scope>): <英文短句>`，句末不加句号；正文两段之间空一行。例：`feat(navigator): Count user messages toward the step budget`，正文先写 `User messages count toward the step budget.`，再写 `用户消息计入步数预算。`。type 取 `feat` / `fix` / `docs` / `test` / `refactor` / `chore`；scope 取包名短形：`navigator`、`reasoning-pruner`、`result-clipper`、`system-one`、`system-one-channel`。只动根级文件（`docs/`、`scripts/`、`.github/`、`AGENTS.md`）时用 `docs` / `chore`，不带 scope。
+- 格式：`<type>(<scope>): <英文短句>`，句末不加句号；正文两段之间空一行。例：`feat(system-one): Batch compatible requests into one ANE pass`，正文先写 `Compatible requests share one ANE pass...`，再写中文译文。type 取 `feat` / `fix` / `docs` / `test` / `refactor` / `chore`；scope 取模块短形：`system-one`、`apple`、`service`、`weights`、`cli`。只动根级文件（`README.md`、`AGENTS.md`、`.github/`、`tools/`）时用 `docs` / `chore`，不带 scope。
 - 英文标题写「实现了什么功能 / 修了什么问题」，不写票号、轮次、「复核落修」这类内部过程词。一轮复核的落修按改动性质归 `fix` / `test` / `refactor`。
 - 正文两段都说清为什么这么改；中文段是英文段的译文，不另加信息。
 - 票号与轮次写进正文：英文段写 `Ticket 04 round 2`，中文段写 `票据 04 第 2 轮：……`。标题是给读历史的人看的，票据日志留在 `.scratch/` 的提交里。
 
 ### Domain docs（领域文档）
 
-单上下文（single-context）：仓库根目录的 `GLOSSARY.md`，加上 `docs/adr/`。详见 `docs/agents/domain.md`。
+单上下文：领域词汇与设计决策写在模块 docstring 与根 `README.md`。公开仓库不依赖额外的 `GLOSSARY.md` 或 ADR 目录；需要追溯旧引擎时再看本地私有 `docs/`，它不参与构建或运行。
 
 ### Local scratch（本机临时产物）
 

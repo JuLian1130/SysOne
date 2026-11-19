@@ -23,14 +23,16 @@ from sysone.models.vendors.h2o_serve import Serve
 from sysone.service.protocol import describe
 
 H2O = os.environ.get("SYS1_H2O_WEIGHTS")
+TASKS = (
+    Path(os.environ["SYS1_H2O_TASKS"]) if os.environ.get("SYS1_H2O_TASKS") else None
+)
 pytestmark = pytest.mark.skipif(
-    not H2O or not Path(H2O).is_dir(),
-    reason="设 SYS1_H2O_WEIGHTS 指向 h2o4b-int8 权重目录才会跑",
+    not H2O or not Path(H2O).is_dir() or TASKS is None or not TASKS.is_file(),
+    reason="设 SYS1_H2O_WEIGHTS 指向 h2o 权重目录、SYS1_H2O_TASKS 指向题库 JSONL 才会跑",
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 GOLDEN = json.loads((FIXTURES / "h2o_tokens.json").read_text(encoding="utf-8"))
-TASKS = Path(__file__).resolve().parents[2] / "docs/collective-decision/tasks/hard.jsonl"
 
 
 def _states() -> dict[str, tuple[str, dict]]:

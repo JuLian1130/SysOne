@@ -2,6 +2,9 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# 只支持从源码树安装（README 的 `pip install -e ./src` / `PYTHONPATH=src`）：Metal 核源在
+# `sysone/devices/apple/shaders/`，`env.scratch_root` 也锚在源码树；非 editable 安装不在支持
+# 范围内，所以这里不声明 package-data，也不承诺 wheel 可移植。
 [project]
 name = "sysone"
 version = "0.1.0"

@@ -26,7 +26,7 @@ from sysone.devices.apple.vision import VisionTower
 from sysone.models.families import mude
 from sysone.weights.checkpoint import open_checkpoint
 
-MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", "/Users/nyonic/Documents/opensource/mude-bench"))
+MUDE_DIR = Path(os.environ.get("SYS1_MUDE_DIR", ""))
 WEIGHTS = MUDE_DIR / "model.safetensors"
 
 

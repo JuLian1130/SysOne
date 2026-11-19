@@ -1,0 +1,14 @@
+{
+  "state": "Vehicle battery is at 8%. The destination is 14 km away. The nearest compatible fast charger is 12 km back along the route. The next public charger ahead is 47 km away, beyond the estimated range. Weather is -2 C and the cabin heater is on.",
+  "questions": [
+    {
+      "text": "What should the vehicle do next?",
+      "options": [
+        "Continue to the destination and hope the remaining range is enough",
+        "Turn back to the nearest compatible fast charger",
+        "Stop at the next safe place and wait for a mobile charger",
+        "Reduce speed and turn off the cabin heater, then continue"
+      ]
+    }
+  ]
+}
