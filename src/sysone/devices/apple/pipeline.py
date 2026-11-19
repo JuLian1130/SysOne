@@ -23,6 +23,7 @@ from ...errors import ConfigError, NotReadyError
 from . import kernels
 from .compile import AneLayer, SurfaceSet
 from .geometry import Geometry, mude_geometry
+from .longpass import LongPass
 from .metal import LANE_LONG, LANE_SMALL, MetalBuffer, MetalRuntime
 from .residency import Residency
 from .schedule import (
@@ -121,6 +122,8 @@ class MudePipeline:
         residency: Residency | None = None,
     ) -> None:
         self._runtime = runtime
+        # 长 pass 的闸：跨进程、只对 `length > 4096` 生效（见 `longpass.py` 的推导）。
+        self._longpass = LongPass()
         self._geometry = mude_geometry() if geometry is None else geometry
         self._geometry.validate()
         self._hidden = self._geometry.hid
@@ -290,21 +293,24 @@ class MudePipeline:
             raise ConfigError("长度或 prefix 越界", length=length, prefix=prefix, width=self._width)
         if int(np.asarray(rows).shape[0]) != length:
             raise ConfigError("行数与长度不一致", rows=int(np.asarray(rows).shape[0]), length=length)
-        view = self.x.array(np.float16, (self._hidden, self._width))
-        self._write_rows(view, rows, 0)
-        self._chunks_list = list(self._chunks(length))
-        self._prepare(length, prefix, fresh=True, causal=causal)
-        for index, block_of_layers in enumerate(self._blocks()):
+        # 长 pass 串行化：画布与工作区按这一趟的长度分配，两个进程同时跑长的会把整机压垮
+        # （`longpass.py`）。短 pass 不过闸，所以常态请求不受影响。
+        with self._longpass.hold(length):
+            view = self.x.array(np.float16, (self._hidden, self._width))
+            self._write_rows(view, rows, 0)
+            self._chunks_list = list(self._chunks(length))
+            self._prepare(length, prefix, fresh=True, causal=causal)
+            for index, block_of_layers in enumerate(self._blocks()):
+                if self._residency is not None:
+                    self._residency.begin(index)
+                self._run_block(block_of_layers)
+                self._wait_all()    # 块之间排空：表面池与 qg/kv 画布是跨层复用的
+                if self._residency is not None:
+                    # 排空之后才卸：卸掉的层在这一块里刚刚用完，下一次需要它到下一轮的块
+                    # （`blocks()` 的块按层号单调，窗口只往后滚）。
+                    self._residency.end(index)
             if self._residency is not None:
-                self._residency.begin(index)
-            self._run_block(block_of_layers)
-            self._wait_all()        # 块之间排空：表面池与 qg/kv 画布是跨层复用的
-            if self._residency is not None:
-                # 排空之后才卸：卸掉的层在这一块里刚刚用完，下一次需要它到下一轮的块
-                # （`blocks()` 的块按层号单调，窗口只往后滚）。
-                self._residency.end(index)
-        if self._residency is not None:
-            self._residency.finish()   # 一轮结束落在待命窗口上（服务契约"回到前 W 层"）
+                self._residency.finish()   # 一轮结束落在待命窗口上（服务契约"回到前 W 层"）
 
     def run_shared(self, prefix_rows: np.ndarray, tails: Sequence[np.ndarray], *,
                    prefix: int, causal: bool = False) -> list[np.ndarray]:
@@ -336,14 +342,16 @@ class MudePipeline:
         lengths = [int(np.asarray(tail).shape[0]) for tail in tails]
         if min(lengths) <= 0:
             raise ConfigError("尾巴至少要有一个 token", lengths=lengths)
-        layout = self._slot_layout(prefix, lengths)
-        if layout is not None:
-            return self._run_shared_batched(prefix_rows, tails, prefix=prefix, layout=layout,
-                                            causal=causal)
-        if prefix + max(lengths) > self._width:
-            raise ConfigError("共享前缀 + 最长尾巴超出缓冲宽度",
-                              prefix=prefix, tail=max(lengths), width=self._width)
-        return self._run_shared_serial(prefix_rows, tails, prefix=prefix, causal=causal)
+        # 这个请求最长的那一趟是 `prefix + 最长尾巴`，闸按它算（批量路径同宽）。
+        with self._longpass.hold(prefix + max(lengths)):
+            layout = self._slot_layout(prefix, lengths)
+            if layout is not None:
+                return self._run_shared_batched(prefix_rows, tails, prefix=prefix, layout=layout,
+                                                causal=causal)
+            if prefix + max(lengths) > self._width:
+                raise ConfigError("共享前缀 + 最长尾巴超出缓冲宽度",
+                                  prefix=prefix, tail=max(lengths), width=self._width)
+            return self._run_shared_serial(prefix_rows, tails, prefix=prefix, causal=causal)
 
     def _run_shared_serial(self, prefix_rows: np.ndarray, tails: Sequence[np.ndarray], *,
                            prefix: int, causal: bool = False) -> list[np.ndarray]:
