@@ -473,44 +473,47 @@ class VisionTower:
                 self._hidden_views[0][index][:, :n] += pos_cm[:, lo:lo + n]
 
             # 2) 24 个 block：每层先把整图的 qkv 收齐，注意力按**整图**算，再分瓦片喂回去。
-            # q、k 的轴向 RoPE 在 GPU 上做（`k_vrope`）。每个瓦片的 ANE 输出直接写进 device
-            # buffer 的对应列 —— 这一步是唯一还经过主机的搬运，§7.19 之后的目标是把它也去掉
-            # （让注意力按瓦片选面），在那之前它按瓦片拷，不按整图原地换算。
-            qkv_dev = self.metal.alloc(3 * self.hidden * length * 2)
+            # q、k 的轴向 RoPE 在 GPU 上做（`k_vrope`）。qkv 的设备缓冲**双缓冲**（奇偶两层各
+            # 一份），于是第 L+1 层的 `main` 可以在第 L 层的 `p1` 之后立刻跑，不必等第 L 层四片
+            # 注意力全部结束 —— 它写的是另一份缓冲。这一步把每层"等 GPU"从 9.2 ms 压到 4.7 ms
+            # （1024² 墙钟 736 → 632，票据 07 §7.21）。
+            depth = self._depth
             half_dim = self.head_dim // 2
+            qkv_bufs = [self.metal.alloc(3 * self.hidden * length * 2) for _ in range(2)]
             cos_dev = self.metal.alloc(half_dim * length * 2)
             sin_dev = self.metal.alloc(half_dim * length * 2)
             try:
-                qkv_view = qkv_dev.array(np.float16, (3 * self.hidden, length))
+                qkv_views = [buf.array(np.float16, (3 * self.hidden, length))
+                             for buf in qkv_bufs]
                 # 转置成 `(½dim, L)`：核里一格的 32 个 lane 读同一行 `k` 的 32 个连续 token
                 cos_dev.array(np.float16, (half_dim, length))[...] = cos16[:, :half_dim].T
                 sin_dev.array(np.float16, (half_dim, length))[...] = sin16[:, :half_dim].T
-                for layer in range(self._depth):
+                # 第 0 层没有"上一层"可以配对，先整层做完
+                self._layer_main(0, tiles, qkv_views[0])
+                for layer in range(depth):
                     block = self._programs[f"block{layer:02d}"]
-                    for index, (lo, n) in enumerate(tiles):
-                        self._call(block, "main", slot=index)
-                        qkv_view[:, lo:lo + n] = self._tiles[index].qkv_view[:, :n]
-                    vrope(self.metal, qkv_dev, cos_dev, sin_dev, T=length,
+                    vrope(self.metal, qkv_bufs[layer % 2], cos_dev, sin_dev, T=length,
                           hidden=self.hidden, dim=self.head_dim)
                     # 注意力**整层一次发出去**（各瓦片之间没有依赖），再逐片等、逐片跑 p1。
-                    # 只留一段在飞（§7.12 的排布）时，每层开头有一段完全躲不掉、每片又有
-                    # 4.7 − 3.2 = 1.5 ms 露在外面（GPU 每片比 p1 长）；把四段都压进队里，露出的
-                    # 就只有"等第 j 片"那一截，队首永远有活干。`commit` 必须逐片做：一个命令
-                    # 缓冲里的几段只能一起结算，那就退化成串行了（票据 07 §7.20）。
+                    # `commit` 必须逐片做：一个命令缓冲里的几段只能一起结算，那就退化成串行了。
                     for j, (lo, n) in enumerate(tiles):
-                        self._attention(qkv_dev, j, n, lo, length)
+                        self._attention(qkv_bufs[layer % 2], j, n, lo, length)
                         self.metal.commit()
                     # p1 逐片跟在注意力后面。入口是一张 `[ctx | res]` 面：上半 GPU 刚写完，下半
-                    # 是这一层的残差（就是 `main` 读的那张面）。这次拷贝是唯一剩下的、每层每
-                    # 瓦片一次的搬运 —— 双输入面能删掉它，但一个 program 里各段的输入数必须
-                    # 一致（票据 07 §7.20）。
+                    # 是这一层的残差。这次拷贝是唯一剩下的、每层每瓦片一次的搬运 —— 双输入面能
+                    # 删掉它，但一个 program 里各段的输入数必须一致（票据 07 §7.20）。
+                    following = layer + 1
                     for j, (lo, n) in enumerate(tiles):
                         self._await_gpu()
                         np.copyto(self._tiles[j].ctx_view[self.hidden:, :n],
                                   self._hidden_views[layer % 2][j][:, :n])
                         self._call(block, "p1", slot=j)
+                        if following < depth:
+                            self._call(self._programs[f"block{following:02d}"], "main", slot=j)
+                            qkv_views[following % 2][:, lo:lo + n] = \
+                                self._tiles[j].qkv_view[:, :n]
             finally:
-                for dev in (qkv_dev, cos_dev, sin_dev):
+                for dev in (*qkv_bufs, cos_dev, sin_dev):
                     dev.free()
 
             # 3) merger：每趟把 2×2 合成 4·hidden，再 fc1 → gelu → fc2
@@ -526,6 +529,17 @@ class VisionTower:
             busy = (after[0] - before[0]) + (after[1] - before[1])
             self.stats["host_ms"] += (time.perf_counter() - started) * 1e3 - busy
         return merged
+
+    def _layer_main(self, layer: int, tiles: list, view: np.ndarray) -> None:
+        """一整层的 `main`，随后把每个瓦片的 qkv 面拷进这一层的设备缓冲。
+
+        那次拷贝是 §7.21 之后唯一还经过主机的 qkv 搬运；删掉它要求注意力直接按瓦片读面
+        （核里按 `t/S` 选面），那要动 `k_vattn` 的 staging 段，是下一步。
+        """
+        block = self._programs[f"block{layer:02d}"]
+        for index, (lo, n) in enumerate(tiles):
+            self._call(block, "main", slot=index)
+            view[:, lo:lo + n] = self._tiles[index].qkv_view[:, :n]
 
     def _attention(self, qkv_dev, tile: int, nq: int, s0: int, length: int) -> None:
         """发一个瓦片的注意力：读整图的 qkv，写这个瓦片的上下文面（GPU 直接写面）。"""
