@@ -223,6 +223,11 @@ class SplitChain:
         """ANE program 的列宽（塔的 26 个程序按同一条桶宽编译）。"""
         return self._s
 
+    @property
+    def width(self) -> int:
+        """GPU 缓冲的列数（一次前向最多能吃多少 token）。"""
+        return self._width
+
     # ------------------------------------------------------------------ 装载耗时
 
     @property
@@ -593,6 +598,35 @@ class SplitChain:
         return self._probabilities(
             self.logits(tokens, prefix=prefix, causal=causal, mm=mm), options
         )
+
+    def forward_batched(
+        self, sequences: Sequence[Sequence[int]], *, options: Sequence[int],
+        prefixes: Sequence[int] = (), causal: bool = False,
+    ) -> list[np.ndarray]:
+        """N 条**互不相干**的序列并排跑一个 pass，返回各自的 softmax 概率（按 `options` 截断）。
+
+        与 `forward_shared` 的区别是**没有共享前缀**：每条序列从第 0 列起、各自从零起算
+        （GDN 状态每段一份零值，注意力按块对角互不可见）。所以它能合的是"不同 state 的独立
+        请求"，而 `forward_shared` 合的是"同一个 state 的多个问题"。
+
+        `options[k]` 是第 k 条序列的候选码数；`mm` 不支持 —— 带图的序列要走塔与像素管线，
+        那是按请求的，不进这个批。
+        """
+        if len(options) != len(sequences):
+            raise ValueError(f"options 与序列条数不一致：{len(options)} vs {len(sequences)}")
+        if self._pipeline is None:
+            raise NotReadyError("numpy 链没有零拷贝流水线，合批只对 Metal 链开放")
+        lengths = [int(np.asarray(seq).size) for seq in sequences]
+        # RoPE 表按**最长**那条准备：`e8_fold` 之后每段各自从 0 起，所以前缀那段行数够用即可。
+        self._prepare_rope(None, max(lengths))
+        rows = [self._embeddings(self._ids_and_length(seq, 0)[0]) for seq in sequences]
+        hidden = self._pipeline.run_batched(rows, prefixes=prefixes, causal=causal)
+        readout = self._require_readout()
+        # 流水线给的是**最后一层的原始隐态**，`_final_norm` 还没做 —— 与 `last_hidden()`
+        # 那条路一样，读出之前必须先过最终 RMSNorm，否则整批答案会系统性偏移。
+        return [self._probabilities(readout @ rms_norm(row[None, :], self._final_norm)[0],
+                                    int(count))
+                for row, count in zip(hidden, options)]
 
     def forward_shared(
         self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, options: Sequence[int],

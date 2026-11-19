@@ -121,23 +121,27 @@ def test_argument_structs_match_the_c_header() -> None:
     """CPU-only：结构体字段顺序/宽度就是与 `e8_common.h` 的契约。"""
     assert kernels._NRM.size == 36          # A1（票据 06）在尾部加了 `pos0`
     assert kernels._COPY.size == 32
-    assert kernels._ATTN.size == 72         # M3 在尾部加了 `caus`（批尾巴是 qseq + 4 个 16-bit 表）
+    assert kernels._ATTN.size == 76         # 尾部依次加了 `caus` 与独立序列合批的 `pcap`
     assert kernels._GDN.size == 32          # 共享前缀在尾部加了 `cols`（真实列数）
     args = kernels.nrm_args(stile=8, s0=2, src_stride=64, eps=1e-6, pos0=96)
     assert kernels._NRM.unpack(args) == (8, 2, 64, pytest.approx(1e-6), 0, 0, 0, 0, 96)
     assert kernels._ATTN.unpack(kernels.attn_args(T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8,
                                                   qgT=16)) == (
-        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0,
+        10, 8, 0, 0.5, 8, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     )
     # M3：`caus` 在最后一位（索引 17）——插在中间会让 `qseq` 之后整段错位。
     assert kernels._ATTN.unpack(kernels.attn_args(
-        T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8, qseq=7, caus=1))[12:] == (7, 0, 0, 0, 0, 1)
+        T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8, qseq=7, caus=1))[12:] == (7, 0, 0, 0, 0, 1, 0)
     # 8 个槽位的表：低槽位在 `nkw0` 的低 16 位
     assert kernels._ATTN.unpack(kernels.attn_args(
         T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8, nka=1024, segw=128, qseq=1024,
         nkw_slots=[60, 63, 66, 69, 72, 75, 80, 90]))[12:] == (
-        1024, 60 | (63 << 16), 66 | (69 << 16), 72 | (75 << 16), 80 | (90 << 16), 0,
+        1024, 60 | (63 << 16), 66 | (69 << 16), 72 | (75 << 16), 80 | (90 << 16), 0, 0,
     )
+    # `pcap` 在最后一位（索引 18）：独立序列合批时每瓦片一条序列，前缀长度按瓦片给。
+    assert kernels._ATTN.unpack(kernels.attn_args(
+        T=10, stile=8, s0=0, scale=0.5, nk=8, nq=8, nka=0, segw=8, qseq=0,
+        nkw=8, pcap=3))[18] == 3
     # GDN 的 `s0` 是"源表面首列"（票据 10 的逐槽扫描），与 `AttnArgs.s0`（qg 环列）、
     # `CopyArgs.s0`（目标列偏移）同名不同义 —— 这里用非零值钉住它在索引 1。
     assert kernels._GDN.unpack(kernels.gdn_args(stile=4, src_s0=7, T=4, first=True,

@@ -244,6 +244,9 @@ class MudePipeline:
         self._tail_hidden: MetalBuffer | None = None
         self._tail_cols = 0
         self._fresh = True
+        # 独立序列合批（票据 07 §7.25n）：每个瓦片是**一条独立序列**，所以每槽的 GDN 状态
+        # 从零起、卷积尾巴也当开头（`first=True`）。与批尾巴只差这一点。
+        self._slot_fresh = False
         # 批尾巴（票据 10）的相位状态：`segw` = 槽宽（0 = 逐题），`_slot_counts` = 各槽位行数，
         # `_slot_per` = 一瓦片几格，`_slot_snapshot` = 本块前缀末状态（逐槽开跑前写回）。
         self._segw = 0
@@ -485,6 +488,65 @@ class MudePipeline:
             raise NotReadyError("共享前缀漏读了某题的读出", questions=len(tails))
         return [row for row in result if row is not None]
 
+    def run_batched(self, rows: Sequence[np.ndarray], *,
+                    prefixes: Sequence[int] = (),
+                    causal: bool = False) -> list[np.ndarray]:
+        """N 条**互不相干**的序列并排跑一个 pass，返回各自的末行 hidden（`[hidden]` fp32）。
+
+        **布局**：一条序列一个瓦片（瓦片 = `bucket` 列），序列 `i` 占列
+        `[i*bucket, i*bucket + len_i)`。因为槽宽 == 桶宽，`_slot_per` 恒为 1，所以
+
+        - `_slot_table(tile)` 给出"这个瓦片里那条序列有多长"，`nkw_slots` 直接就是它；
+        - 注意力用块对角（`nka = _prefix = 0` + `segw = bucket`）：每行只看见自己那一段。
+          §7.25m 已验：4 段 × 16k、因果与非因果都与单独跑**逐位相同**；
+        - RoPE 靠 `e8_fold(0, segw, col) = col % bucket` 自动按段重启（§7.25m）；
+        - GDN 每槽从零起（`_slot_fresh`）：**没有共享前缀可恢复**，每个瓦片是一条新序列。
+
+        **限制**：每条序列必须 ≤ `bucket`（否则一条序列会跨瓦片，而递归状态只有一份）；
+        总列数 `(N-1)*bucket + max(len)` 必须 ≤ `width`。不满足就抛 `ConfigError`，
+        由调用方退回逐条整趟 —— 静默降级会让"批没批上"变成一个查不出来的性能问题。
+        """
+        if not rows:
+            raise ConfigError("批里至少要有 一条序列")
+        lengths = [int(np.asarray(row).shape[0]) for row in rows]
+        if min(lengths) <= 0:
+            raise ConfigError("批里的序列长度必须为正", lengths=lengths)
+        if max(lengths) > self._bucket:
+            raise ConfigError("批里的序列超过桶宽：一条序列会跨瓦片，递归状态就无处安放",
+                              longest=max(lengths), bucket=self._bucket)
+        need = (len(rows) - 1) * self._bucket + max(lengths)
+        if need > self._width:
+            raise ConfigError("批的列数超过缓冲宽度", columns=need, width=self._width)
+        view = self.x.array(np.float16, (self._hidden, self._width))
+        # 先整段清零再写各序列：每个瓦片尾部那些填充列的 K/V 照样会被算（块对角掩码看不见
+        # 它们），留上一趟的残值只会让这一趟的中间量没有定义。
+        view[:, :need] = 0
+        for index, row in enumerate(rows):
+            self._write_rows(view, np.asarray(row), index * self._bucket)
+        self._chunks_list = [(index * self._bucket, lengths[index])
+                             for index in range(len(rows))]
+        if prefixes and (len(prefixes) != len(rows)
+                         or any(int(p) > int(n) for p, n in zip(prefixes, lengths))):
+            raise ConfigError("前缀长度与序列不匹配", prefixes=list(prefixes), lengths=lengths)
+        self._prepare(need, 0, fresh=True, segw=self._bucket, counts=lengths,
+                      causal=causal, fresh_slots=True,
+                      prefixes=tuple(int(p) for p in prefixes))
+        try:
+            for index, block_of_layers in enumerate(self._blocks()):
+                if self._residency is not None:
+                    self._residency.begin(index)
+                self._run_block(block_of_layers)
+                self._wait_all()
+                if self._residency is not None:
+                    self._residency.end(index)
+            if self._residency is not None:
+                self._residency.finish()
+        finally:
+            self._slot_fresh = False
+        # `last_hidden(n)` 取的是第 `n-1` 列，所以这里传"末列 + 1"。
+        return [self.last_hidden(index * self._bucket + lengths[index])
+                for index in range(len(rows))]
+
     def _slot_table(self, tile: int) -> tuple[int, ...]:
         """这一瓦片里各槽位的可行行数（按片内相对槽位排，表长 = `per`）。"""
         per = self._slot_per
@@ -523,7 +585,8 @@ class MudePipeline:
             position += size
 
     def _prepare(self, length: int, prefix: int, *, fresh: bool,
-                 segw: int = 0, counts: Sequence[int] = (), causal: bool = False) -> None:
+                 segw: int = 0, counts: Sequence[int] = (), causal: bool = False,
+                 fresh_slots: bool = False, prefixes: Sequence[int] = ()) -> None:
         """开一个执行相：掩码模型、S3 的死瓦片，以及各条链的游标账。
 
         `fresh=False` 表示这一相接着上一相的状态跑（共享前缀的尾巴相）：GDN 的递归状态与
@@ -538,7 +601,10 @@ class MudePipeline:
         # 批尾巴（票据 10）：这一相里每条尾巴占一个槽位，槽宽 `segw`、各槽位行数 `counts`。
         # `segw = 0` 是逐题整趟/前缀相，所有环节按老规则走。
         self._segw = int(segw)
+        self._slot_fresh = bool(fresh_slots)
         self._slot_counts = tuple(int(count) for count in counts)
+        # 独立序列合批：每瓦片一条序列，它自己的 `prefix_noncausal` 前缀长度（0 = 没有前缀项）。
+        self._slot_prefix = tuple(int(value) for value in prefixes)
         self._slot_per = (self._bucket // int(segw)) if segw else 0
         # S3（旧引擎的 `LASTDEAD`，`docs/ANE/anebench/e8_a3.py:291-302`）：模型最后一层里整段落在
         # 公共前缀中的瓦片只欠 K/V —— 前缀行的注意力输出与 MLP 输出都没有读者（读出在 query
@@ -872,12 +938,18 @@ class MudePipeline:
             # 扫自己那段。写状态前必须等上一槽的 gdn 结算（Metal 的编码序管不到主机写）。
             for lo, cnt in self._tile_slots(tile):
                 self._runtime.wait(LANE_SMALL)
-                self._restore_layer(chain.layer)
+                if self._slot_fresh:
+                    # 独立序列：这个瓦片就是一条完整序列（长度 ≤ 桶宽），状态与卷积尾巴
+                    # 都从零起 —— `first=True` 让核把前三列当"不存在"，主机再把两份缓冲清零。
+                    state.array(np.uint8)[:] = 0
+                    tail.array(np.uint8)[:] = 0
+                else:
+                    self._restore_layer(chain.layer)
                 kernels.gdn(
                     self._runtime, entry.surface("proj_out", chain.slot), state, tail,
                     entry.weights["conv"], entry.weights["a_log"], entry.weights["dt_bias"],
                     entry.weights["norm"], entry.surface("out_in", chain.slot), self.gscratch,
-                    stile=self._bucket, cols=cnt, eps=EPS, first=False,
+                    stile=self._bucket, cols=cnt, eps=EPS, first=self._slot_fresh,
                     T=self._bucket, out_stride=self._bucket, src_s0=lo, out_s0=lo,
                     fast=True, geometry=self._geometry,
                 )
@@ -983,6 +1055,9 @@ class MudePipeline:
         rule: dict = {}
         if self._segw:
             rule = dict(nka=self._prefix, segw=self._segw, nkw_slots=self._slot_table(tile))
+            if self._slot_prefix:
+                # 每瓦片一条独立序列时，前缀项按瓦片给（一格里只有一个槽，所以一个标量够）。
+                rule["pcap"] = self._slot_prefix[tile] if tile < len(self._slot_prefix) else 0
         # M3：causal 时这一段的可见上界就是它自己的末列（末行的位置 + 1）。双向时是全长。
         # `caus` 交给核里按行再收 —— 两件事分开：这个上界省掉整块看不见的 key 块，按行的项
         # 才给出三角。共享前缀的两刀同理：前一半的上界就是 `prefix`（= `boundary`）。

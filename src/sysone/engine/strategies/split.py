@@ -269,8 +269,12 @@ class SplitRunner(VisionRunner):
             spans.append((first, len(encoded)))
         shared = _shared_prefix(encoded) if use_prefix else None
         forward_shared = getattr(chain, "forward_shared", None)
+        forward_batched = getattr(chain, "forward_batched", None)
         if shared is not None and len(encoded) > 1 and callable(forward_shared):
             answers = _answer_shared(forward_shared, shared, encoded, kinds, causal)
+        elif len(encoded) > 1 and callable(forward_batched) and _batchable(encoded, chain):
+            # 没有共享前缀（不同 state 的独立请求）时走块对角：每条序列一个瓦片、互不可见。
+            answers = _answer_independent(forward_batched, encoded, kinds, causal)
         else:
             answers = _answer_serial(chain, encoded, use_prefix, kinds, causal)
         elapsed = time.perf_counter() - started
@@ -342,6 +346,56 @@ def _answer_shared(
     tails = [sequence[len(prefix):] for sequence, *_ in encoded]
     options = [len(labels) for _, _, labels, _ in encoded]
     raw = forward_shared(prefix, tails, options=options, causal=causal, mm=mm)
+    answers: list[Answer] = []
+    for index, (_, _, labels, indexes) in enumerate(encoded):
+        probs = SplitRunner._shares(raw[index])
+        values = tuple(probs[item] for item in indexes)
+        best = max(range(len(values)), key=values.__getitem__)
+        answers.append(
+            Answer(
+                question_index=index,
+                kind=kinds[index],
+                value=labels[best],
+                probs=values,
+                labels=labels,
+                confidence=values[best],
+            )
+        )
+    return answers
+
+
+def _batchable(
+    encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
+    chain: object,
+) -> bool:
+    """这批能不能走块对角合批：每条序列 ≤ 桶宽、总列数 ≤ 缓冲宽度。
+
+    判据与 `Pipeline.run_batched` 的入参约束一致；这里先判一次是为了**静默退回逐条**而不是
+    让一次超长的合批在流水线里抛异常 —— 但退回必须是可观测的（`_BATCH_FALLBACKS` 计数）。
+    """
+    bucket = int(getattr(chain, "bucket", 0) or 0)
+    width = int(getattr(chain, "width", 0) or 0)
+    if bucket <= 0 or width <= 0:
+        return False
+    lengths = [len(sequence) for sequence, *_ in encoded]
+    if max(lengths) > bucket:
+        return False
+    return (len(lengths) - 1) * bucket + max(lengths) <= width
+
+
+def _answer_independent(
+    forward_batched: Callable[..., Sequence[object]],
+    encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
+    kinds: Sequence[str],
+    causal: bool = False,
+) -> list[Answer]:
+    """块对角合批：N 条**独立**序列并排跑一个 pass（各段互不可见、各段状态从零起）。"""
+    sequences = [sequence for sequence, *_ in encoded]
+    options = [len(labels) for _, _, labels, _ in encoded]
+    # 每条序列自带它自己的 `prefix_noncausal` 前缀长度：块对角只隔离序列之间的可见性，
+    # **不改变一条序列内部**的前缀语义（前缀行只看前缀、尾部行看整段）。
+    prefixes = [prefix_len for _, prefix_len, _, _ in encoded]
+    raw = forward_batched(sequences, options=options, prefixes=prefixes, causal=causal)
     answers: list[Answer] = []
     for index, (_, _, labels, indexes) in enumerate(encoded):
         probs = SplitRunner._shares(raw[index])

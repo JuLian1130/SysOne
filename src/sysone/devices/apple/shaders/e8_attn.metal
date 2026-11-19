@@ -462,7 +462,14 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     // key).  Non-causal callers land on exactly the pre-M3 pair: `cap` = nkc and, since
     // nka <= nkc always holds, `nkap` = nka.
     const uint qrow = qpos + sg * 8u + row_l;
-    const uint cap  = a.caus ? min(nkc, qrow + 1u) : nkc;
+    uint cap = a.caus ? min(nkc, qrow + 1u) : nkc;
+    if (a.pcap) {
+        // `prefix_noncausal` per slot: a row inside the slot's prefix sees only the prefix,
+        // a row after it sees the whole slot.  `qrow` is the absolute column, `nkb` the slot's
+        // first column, so `qrow - nkb` is the row's position inside its own sequence.
+        const uint rel = qrow - nkb;
+        if (rel < a.pcap) cap = min(cap, nkb + a.pcap);
+    }
     const uint nkap = min(nka, cap);
 
     // ---- K and V staging: two AT_KC x 64 buffers, reused by both phases (they never overlap)

@@ -59,7 +59,7 @@ HEAD_SCALE = GEOMETRY.head_scale  # attention 的 1/sqrt(head_dim)
 # ---- 参数结构体（与 e8_common.h 一一对应，单位是字节数）-------------------------------
 _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
-_ATTN = struct.Struct("<IIIfIIIIIIIIIIIIII")  # struct AttnArgs，72 B
+_ATTN = struct.Struct("<IIIfIIIIIIIIIIIIIII")  # struct AttnArgs，76 B（+`pcap`）
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
 _VATTN = struct.Struct("<IIIIIfIIII")  # struct VAttnArgs，40 B
 _VROPE = struct.Struct("<III")  # struct VRopeArgs，12 B
@@ -116,6 +116,7 @@ def attn_args(
     out_stride: int = 0,
     out_s0: int = 0,
     caus: int = 0,
+    pcap: int = 0,
 ) -> bytes:
     """`k_attn` / `k_attn_ref`（`e8_common.h:108`）。
 
@@ -134,7 +135,7 @@ def attn_args(
         words[index >> 1] |= (min(int(count), 0xFFFF) & 0xFFFF) << ((index & 1) * 16)
     return _ATTN.pack(
         T, stile, s0, scale, nk, nq, nka, segw, nkw, qgT, out_stride, out_s0,
-        qseq, words[0], words[1], words[2], words[3], caus,
+        qseq, words[0], words[1], words[2], words[3], caus, pcap,
     )
 
 
@@ -435,6 +436,7 @@ def attention(
     out_stride: int = 0,
     out_s0: int = 0,
     caus: int = 0,
+    pcap: int = 0,
     fast: bool = True,
     geometry: Geometry | None = None,
     lane: int = LANE_LONG,
@@ -478,6 +480,7 @@ def attention(
             out_stride=out_stride,
             out_s0=out_s0,
             caus=caus,
+            pcap=pcap,
         ),
         grid=grid,
         tg=tg,

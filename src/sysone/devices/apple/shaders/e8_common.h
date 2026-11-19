@@ -159,6 +159,11 @@ struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIIIIIIIII" -> 72 bytes
     // the call's first query row, so `caus` = 1 makes it authoritative (0 included); with
     // `caus` = 0 nothing below index 17 is read and every pre-M3 caller is unchanged.
     uint  caus;            // 17 1 = cap each row at its own sequence column
+    // Independent-sequence batching (ticket 07 §7.25n): each slot may carry its own
+    // `prefix_noncausal` prefix -- rows inside it see only that prefix, rows after it see the
+    // whole slot.  One scalar is enough because such a pass puts exactly one sequence per tile
+    // (`segw` == the bucket), so a dispatch never spans two sequences.  0 = no prefix term.
+    uint  pcap;            // 18 prefix columns inside the slot; 0 = every row sees the slot
 };
 
 struct GdnArgs {           // e8_mtl.py: "<IIIIfIII" -> 32 bytes
