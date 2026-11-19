@@ -59,7 +59,7 @@ HEAD_SCALE = GEOMETRY.head_scale  # attention 的 1/sqrt(head_dim)
 # ---- 参数结构体（与 e8_common.h 一一对应，单位是字节数）-------------------------------
 _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
-_ATTN = struct.Struct("<IIIfIIIIIIIIIIIIIII")  # struct AttnArgs，76 B（+`pcap`）
+_ATTN = struct.Struct("<IIIfIIIIIIIIIIIIIIIIII")  # struct AttnArgs，88 B（+`pcw0..3`）
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
 _VATTN = struct.Struct("<IIIIIfIIII")  # struct VAttnArgs，40 B
 _VROPE = struct.Struct("<III")  # struct VRopeArgs，12 B
@@ -116,7 +116,7 @@ def attn_args(
     out_stride: int = 0,
     out_s0: int = 0,
     caus: int = 0,
-    pcap: int = 0,
+    pcap_slots: Sequence[int] | None = None,
 ) -> bytes:
     """`k_attn` / `k_attn_ref`（`e8_common.h:108`）。
 
@@ -133,9 +133,16 @@ def attn_args(
         if index >= 8:
             break
         words[index >> 1] |= (min(int(count), 0xFFFF) & 0xFFFF) << ((index & 1) * 16)
+    # 独立序列合批（§7.25n）：每槽自己的 `prefix_noncausal` 前缀长度，同一张 8×16 bit 表的形态。
+    pwords = [0, 0, 0, 0]
+    for index, count in enumerate(pcap_slots or ()):
+        if index >= 8:
+            break
+        pwords[index >> 1] |= (min(int(count), 0xFFFF) & 0xFFFF) << ((index & 1) * 16)
     return _ATTN.pack(
         T, stile, s0, scale, nk, nq, nka, segw, nkw, qgT, out_stride, out_s0,
-        qseq, words[0], words[1], words[2], words[3], caus, pcap,
+        qseq, words[0], words[1], words[2], words[3], caus,
+        pwords[0], pwords[1], pwords[2], pwords[3],
     )
 
 
@@ -436,7 +443,7 @@ def attention(
     out_stride: int = 0,
     out_s0: int = 0,
     caus: int = 0,
-    pcap: int = 0,
+    pcap_slots: Sequence[int] | None = None,
     fast: bool = True,
     geometry: Geometry | None = None,
     lane: int = LANE_LONG,
@@ -480,7 +487,7 @@ def attention(
             out_stride=out_stride,
             out_s0=out_s0,
             caus=caus,
-            pcap=pcap,
+            pcap_slots=pcap_slots,
         ),
         grid=grid,
         tg=tg,

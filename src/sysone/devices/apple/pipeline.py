@@ -493,18 +493,24 @@ class MudePipeline:
                     causal: bool = False) -> list[np.ndarray]:
         """N 条**互不相干**的序列并排跑一个 pass，返回各自的末行 hidden（`[hidden]` fp32）。
 
-        **布局**：一条序列一个瓦片（瓦片 = `bucket` 列），序列 `i` 占列
-        `[i*bucket, i*bucket + len_i)`。因为槽宽 == 桶宽，`_slot_per` 恒为 1，所以
+        **布局**：一条序列一个**槽**，槽宽 `slotw = 向上取整到 128 的最长序列`，一格（= 一个瓦片
+        = `bucket` 列）里塞 `bucket / slotw` 条。这一条是收益的全部来源：**ANE 的算力按瓦片计**
+        （program 的静态宽度就是桶宽），所以 4 条挤进 1 格只花 1 格的 ANE 时间，一条一格就和
+        逐条跑一样贵（实测 4 条打包 2 格：2.23× → 3.0× 量级）。
 
-        - `_slot_table(tile)` 给出"这个瓦片里那条序列有多长"，`nkw_slots` 直接就是它；
-        - 注意力用块对角（`nka = _prefix = 0` + `segw = bucket`）：每行只看见自己那一段。
-          §7.25m 已验：4 段 × 16k、因果与非因果都与单独跑**逐位相同**；
-        - RoPE 靠 `e8_fold(0, segw, col) = col % bucket` 自动按段重启（§7.25m）；
-        - GDN 每槽从零起（`_slot_fresh`）：**没有共享前缀可恢复**，每个瓦片是一条新序列。
+        因为槽宽 ≤ 桶宽且整除，`_slot_per = bucket / slotw`，于是：
+
+        - `_slot_table(tile)` 给出这一格里各槽的可见行数，直接当 `nkw_slots`；
+        - 注意力用块对角（`nka = _prefix = 0` + `segw = slotw`）：每行只看见自己那一槽；
+          因果与非因果都已验到 4 段 × 16k 逐位（§7.25m）；
+        - RoPE 靠 `e8_fold(0, segw, col) = col % slotw` 自动按槽重启（§7.25m）；
+        - 每槽自己的 `prefix_noncausal` 前缀长度走 `pcw0..3` 表（§7.25n）；
+        - GDN 每槽从零起（`_slot_fresh`）：**没有共享前缀可恢复**，每个槽是一条新序列。
 
         **限制**：每条序列必须 ≤ `bucket`（否则一条序列会跨瓦片，而递归状态只有一份）；
-        总列数 `(N-1)*bucket + max(len)` 必须 ≤ `width`。不满足就抛 `ConfigError`，
-        由调用方退回逐条整趟 —— 静默降级会让"批没批上"变成一个查不出来的性能问题。
+        打包区 `ntiles * bucket` 必须 ≤ `width`；每格最多 8 槽（`nkw`/`pcw` 表宽）。
+        不满足就抛 `ConfigError`，由调用方退回逐条整趟 —— 静默降级会让"批没批上"变成一个
+        查不出来的性能问题。
         """
         if not rows:
             raise ConfigError("批里至少要有 一条序列")
@@ -514,21 +520,29 @@ class MudePipeline:
         if max(lengths) > self._bucket:
             raise ConfigError("批里的序列超过桶宽：一条序列会跨瓦片，递归状态就无处安放",
                               longest=max(lengths), bucket=self._bucket)
-        need = (len(rows) - 1) * self._bucket + max(lengths)
-        if need > self._width:
-            raise ConfigError("批的列数超过缓冲宽度", columns=need, width=self._width)
+        if len(rows) == 1:
+            # 一条不成批：走普通那条路（与 `run` 逐位同一条代码），省得为 1 条造一个槽位布局。
+            self.run(np.asarray(rows[0]), length=lengths[0], causal=causal)
+            return [self.last_hidden(lengths[0])]
+        # 打包：一条序列一个**槽**，槽宽取"最长序列向上取到 AT_BM"，一格里能塞几条就塞几条。
+        # 这一步决定赚多少 —— ANE 的算力是按**瓦片**计的（program 的静态宽度就是桶宽），
+        # 所以 4 条塞进 1 格只花 1 格的 ANE 时间；一条一格就和逐条跑一样贵。
+        layout = self._slot_layout(0, lengths)
+        if layout is None:
+            raise ConfigError("这批排不进打包区", lengths=lengths, bucket=self._bucket,
+                              width=self._width)
         view = self.x.array(np.float16, (self._hidden, self._width))
-        # 先整段清零再写各序列：每个瓦片尾部那些填充列的 K/V 照样会被算（块对角掩码看不见
-        # 它们），留上一趟的残值只会让这一趟的中间量没有定义。
-        view[:, :need] = 0
+        # 打包区先整段清零：槽尾那些填充列的 K/V 照样会被算（槽位掩码看不见它们），
+        # 留上一趟的残值只会让这一趟的中间量没有定义。
+        view[:, :layout.nt] = 0
         for index, row in enumerate(rows):
-            self._write_rows(view, np.asarray(row), index * self._bucket)
-        self._chunks_list = [(index * self._bucket, lengths[index])
-                             for index in range(len(rows))]
+            self._write_rows(view, np.asarray(row), layout.starts[index])
+        self._chunks_list = [(tile * self._bucket, self._bucket)
+                             for tile in range(layout.ntiles)]
         if prefixes and (len(prefixes) != len(rows)
                          or any(int(p) > int(n) for p, n in zip(prefixes, lengths))):
             raise ConfigError("前缀长度与序列不匹配", prefixes=list(prefixes), lengths=lengths)
-        self._prepare(need, 0, fresh=True, segw=self._bucket, counts=lengths,
+        self._prepare(layout.nt, 0, fresh=True, segw=layout.slotw, counts=lengths,
                       causal=causal, fresh_slots=True,
                       prefixes=tuple(int(p) for p in prefixes))
         try:
@@ -544,7 +558,7 @@ class MudePipeline:
         finally:
             self._slot_fresh = False
         # `last_hidden(n)` 取的是第 `n-1` 列，所以这里传"末列 + 1"。
-        return [self.last_hidden(index * self._bucket + lengths[index])
+        return [self.last_hidden(layout.starts[index] + lengths[index])
                 for index in range(len(rows))]
 
     def _slot_table(self, tile: int) -> tuple[int, ...]:
@@ -560,6 +574,15 @@ class MudePipeline:
         """这一瓦片里真正有尾巴的 (片内列偏移, 行数)；空槽位没有尾巴，跳过。"""
         return [(index * self._segw, count)
                 for index, count in enumerate(self._slot_table(tile)) if count > 0]
+
+    def _slot_prefix_table(self, tile: int) -> tuple[int, ...]:
+        """这一瓦片里各槽位自己的 `prefix_noncausal` 前缀长度（打包时一格里不止一条序列）。"""
+        per = self._slot_per or 1
+        table = []
+        for index in range(per):
+            question = tile * per + index
+            table.append(self._slot_prefix[question] if question < len(self._slot_prefix) else 0)
+        return tuple(table)
 
     def _restore_layer(self, layer: int) -> None:
         """把本块前缀相留下的末状态写回这一层（批尾巴逐槽开跑前用）。"""
@@ -1056,8 +1079,8 @@ class MudePipeline:
         if self._segw:
             rule = dict(nka=self._prefix, segw=self._segw, nkw_slots=self._slot_table(tile))
             if self._slot_prefix:
-                # 每瓦片一条独立序列时，前缀项按瓦片给（一格里只有一个槽，所以一个标量够）。
-                rule["pcap"] = self._slot_prefix[tile] if tile < len(self._slot_prefix) else 0
+                # 独立序列合批：每槽自己的前缀长度（打包时一格里有好几条）。
+                rule["pcap_slots"] = self._slot_prefix_table(tile)
         # M3：causal 时这一段的可见上界就是它自己的末列（末行的位置 + 1）。双向时是全长。
         # `caus` 交给核里按行再收 —— 两件事分开：这个上界省掉整块看不见的 key 块，按行的项
         # 才给出三角。共享前缀的两刀同理：前一半的上界就是 `prefix`（= `boundary`）。

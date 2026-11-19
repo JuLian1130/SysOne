@@ -161,9 +161,13 @@ struct AttnArgs {          // e8_mtl.py: "<IIIfIIIIIIIIIIIIII" -> 72 bytes
     uint  caus;            // 17 1 = cap each row at its own sequence column
     // Independent-sequence batching (ticket 07 §7.25n): each slot may carry its own
     // `prefix_noncausal` prefix -- rows inside it see only that prefix, rows after it see the
-    // whole slot.  One scalar is enough because such a pass puts exactly one sequence per tile
-    // (`segw` == the bucket), so a dispatch never spans two sequences.  0 = no prefix term.
-    uint  pcap;            // 18 prefix columns inside the slot; 0 = every row sees the slot
+    // whole slot.  Packing several sequences into one tile means a dispatch *does* span several
+    // sequences, so the length arrives as a table like `nkw0..3`: 8 slots x 16 bit, low slot in
+    // the low half.  0 for a slot = no prefix term for it.
+    uint  pcw0;            // 18 slots 0,1
+    uint  pcw1;            // 19 slots 2,3
+    uint  pcw2;            // 20 slots 4,5
+    uint  pcw3;            // 21 slots 6,7
 };
 
 struct GdnArgs {           // e8_mtl.py: "<IIIIfIII" -> 32 bytes

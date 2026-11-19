@@ -463,12 +463,18 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     // nka <= nkc always holds, `nkap` = nka.
     const uint qrow = qpos + sg * 8u + row_l;
     uint cap = a.caus ? min(nkc, qrow + 1u) : nkc;
-    if (a.pcap) {
+    if (a.pcw0 | a.pcw1 | a.pcw2 | a.pcw3) {
         // `prefix_noncausal` per slot: a row inside the slot's prefix sees only the prefix,
         // a row after it sees the whole slot.  `qrow` is the absolute column, `nkb` the slot's
         // first column, so `qrow - nkb` is the row's position inside its own sequence.
-        const uint rel = qrow - nkb;
-        if (rel < a.pcap) cap = min(cap, nkb + a.pcap);
+        // The slot index comes from the threadgroup (slot width is a multiple of AT_BM), which
+        // is the same granularity the `nkw` table uses.
+        const uint pslot = min((qpos - a.qseq) / a.segw, 7u);
+        const uint pword = pslot < 2u ? a.pcw0 : pslot < 4u ? a.pcw1
+                         : pslot < 6u ? a.pcw2 : a.pcw3;
+        const uint pcap  = (pword >> ((pslot & 1u) * 16u)) & 0xFFFFu;
+        const uint rel   = qrow - nkb;
+        if (pcap && rel < pcap) cap = min(cap, nkb + pcap);
     }
     const uint nkap = min(nka, cap);
 
