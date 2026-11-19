@@ -572,13 +572,19 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
     // threadgroup is the one that reaches furthest, so the blocks above it hold nothing but
     // masked keys -- skipping them is the triangular saving (2.68e8 -> ~1.35e8 half-scores at
     // 16k) and, because it only drops blocks whose scores are all -inf, it cannot move a value.
+    // Blocks that lie entirely between the prefix and this slot's first key hold no visible key,
+    // so their QK/softmax/PV work would be computed only to be masked away -- with an empty
+    // prefix (block-diagonal layout) that is the whole left half of the grid.  Skipping them is
+    // exact, not approximate: every one of their scores is -inf either way.  `nkb` is a multiple
+    // of `AT_BM`, hence of `AT_BN`, so the skip lands on a block boundary.
+    const uint bstart = (nkap == 0u && nkb > 0u) ? (nkb / AT_BN) : 0u;
     const uint nchi = a.caus ? min(nkc, qpos + AT_BM) : nkc;
     const uint nb = (nchi + AT_BN - 1u) / AT_BN;
 
-    AT_STAGE(kb0, kbase, 0u);                   // prologue: first K chunk
+    AT_STAGE(kb0, kbase, bstart * AT_BN);       // prologue: first K chunk of the first live block
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint blk = 0; blk < nb; blk++) {
+    for (uint blk = bstart; blk < nb; blk++) {
         const uint t0 = blk * AT_BN;
         AT_ZEROC(s_0)
         AT_ZEROC(s_1)
