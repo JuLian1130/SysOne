@@ -61,7 +61,7 @@ _NRM = struct.Struct("<IIIfIIIII")  # struct NormArgs，36 B
 _COPY = struct.Struct("<IIIIIIII")  # struct CopyArgs，32 B
 _ATTN = struct.Struct("<IIIfIIIIIIIIIIIIII")  # struct AttnArgs，72 B
 _GDN = struct.Struct("<IIIIfIII")  # struct GdnArgs，32 B
-_VATTN = struct.Struct("<IIIIIfII")  # struct VAttnArgs，32 B
+_VATTN = struct.Struct("<IIIIIfIIII")  # struct VAttnArgs，40 B
 _VROPE = struct.Struct("<III")  # struct VRopeArgs，12 B
 
 
@@ -141,6 +141,7 @@ def attn_args(
 def vattn_args(
     *, T: int, nq: int, s0: int, hidden: int, dim: int, scale: float,
     out_cols: int = 0, out_offset: int | None = None,
+    k0: int = 0, k1: int | None = None,
 ) -> bytes:
     """`k_vattn`（`shaders/e8_vattn.metal`）。
 
@@ -150,7 +151,8 @@ def vattn_args(
     长度），而 qkv 与键总数仍是整图的。`hidden`/`dim` 是通道布局，`scale` 是 1/√d。
     """
     return _VATTN.pack(T, nq, s0, hidden, dim, scale, out_cols or T,
-                       s0 if out_offset is None else out_offset)
+                       s0 if out_offset is None else out_offset,
+                       k0, T if k1 is None else k1)
 
 
 def vrope_args(*, T: int, hidden: int, dim: int) -> bytes:
@@ -534,6 +536,8 @@ def vattn(
     s0: int = 0,
     out_cols: int = 0,
     out_offset: int | None = None,
+    k0: int = 0,
+    k1: int | None = None,
     lane: int = LANE_LONG,
 ) -> None:
     """视觉塔的非因果注意力：`qkv` 依次是 `[q | k | v]` 各 `hidden` 行，结果写 `out` 的前 `hidden` 行。
@@ -547,6 +551,9 @@ def vattn(
     `out_cols` 是**输出缓冲**的行跨距（0 = 与 `T` 相同），`out_offset` 是这一片在 out 里的首列
     （`None` = 与 `s0` 相同，也就是"qkv 与 out 是同一份整图布局"的老行为）。塔把每个瓦片写成
     独立的一张面时，出参是 `(out_cols = 桶宽, out_offset = 0)`。
+
+    `k0`/`k1` 是这一片 query 能看的**键区间**（默认 `[0, T)`）。多图打包时 qkv 缓冲里并排放着
+    几张图，一片 query 只能看自己那张图的键，所以区间按图给。
     """
     if dim != 64:
         # 核里"8 档通道 × 8 个分片"是按 head_dim == 64 写死的。`k_attn` 对 `E8_HEAD_DIM` 用
@@ -557,7 +564,8 @@ def vattn(
         [qkv, out],
         args=vattn_args(T=T, nq=nq, s0=s0, hidden=hidden, dim=dim, scale=scale,
                         out_cols=out_cols or T,
-                        out_offset=s0 if out_offset is None else out_offset),
+                        out_offset=s0 if out_offset is None else out_offset,
+                        k0=k0, k1=k1),
         grid=((nq + 63) // 64, hidden // dim, 1),
         tg=(256, 1, 1),
         lane=lane,

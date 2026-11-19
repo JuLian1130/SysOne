@@ -18,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 
+from collections.abc import Sequence
+
 import numpy as np
 import pytest
 
@@ -49,13 +51,21 @@ class _FakeTower:
         self.reuse = (26, 26)
 
     def encode(self, img: np.ndarray) -> np.ndarray:
-        assert img.ndim == 3 and img.shape[2] == 3
-        self.images += 1
+        return self.encode_many([img])[0]
+
+    def encode_many(self, images: Sequence[np.ndarray]) -> list[np.ndarray]:
+        # 打包之后一批图是**一次**调用：eval 数按批算，但每张图的行数各按自己的网格。
+        assert images
+        out = []
+        for img in images:
+            assert img.ndim == 3 and img.shape[2] == 3
+            self.images += 1
+            rows = (img.shape[0] // PATCH) * (img.shape[1] // PATCH) // (MERGE * MERGE)
+            out.append(np.full((rows, 64), self.images, np.float16))
         self.stats["evals"] += 3
         self.stats["ane_ms"] += 0.5
         self.stats["gpu_ms"] += 0.25
-        rows = (img.shape[0] // PATCH) * (img.shape[1] // PATCH) // (MERGE * MERGE)
-        return np.full((rows, 64), self.images, np.float16)
+        return out
 
     def close(self) -> None:
         self.closed += 1

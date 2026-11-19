@@ -517,6 +517,45 @@ def test_vision_attention_matches_numpy(runtime: MetalRuntime, T: int, nq: int,
     assert (got[outside] == sentinel).all(), "写到了本次调用范围之外的列"
 
 
+@pytest.mark.parametrize(("T", "nq", "s0", "k0", "k1"), [
+    (300, 64, 0, 0, 150),        # 前半段当键：尾部与"只看一部分键"的遮罩
+    (300, 64, 128, 100, 233),    # 键区间既不在 0 也不在尾部，且不与 query 对齐
+    (128, 128, 0, 40, 41),       # 只看一个键：softmax 退化成恒等
+])
+def test_vision_attention_honours_the_key_range(runtime: MetalRuntime, T: int, nq: int,
+                                                s0: int, k0: int, k1: int) -> None:
+    """`k0`/`k1` 是这一片 query 能看的键区间 —— 多图打包靠它把一张图的注意力关在自己那张图里。
+
+    判据不是"差不多"，是逐位等于"把键先切出来单独算一遍"：越界的键必须真的被排除（漏掉就
+    会像正常结果一样安静地错），而区间里的键必须一个不少。
+    """
+    heads, dim = 16, 64
+    hidden = heads * dim
+    rng = np.random.default_rng(6)
+    qkv = (rng.standard_normal((3 * hidden, T)) * 0.6).astype(np.float16)
+    out = np.full((hidden, T), np.float16(-777.0), dtype=np.float16)
+    qbuf = runtime.alloc(qkv.nbytes)
+    obuf = runtime.alloc(out.nbytes)
+    try:
+        qbuf.array(np.float16, qkv.shape)[:] = qkv
+        obuf.array(np.float16, out.shape)[:] = out
+        kernels.vattn(runtime, qbuf, obuf, T=T, nq=nq, hidden=hidden, dim=dim,
+                      scale=dim ** -0.5, s0=s0, k0=k0, k1=k1)
+        runtime.commit()
+        runtime.wait()
+        got = obuf.array(np.float16, (hidden, T)).copy()
+    finally:
+        qbuf.free()
+        obuf.free()
+    col = slice(s0, s0 + nq)
+    keys = slice(k0, k1)
+    want = _vattn_reference(qkv[:hidden, col], qkv[hidden:2 * hidden, keys],
+                            qkv[2 * hidden:, keys], heads, dim)
+    diff = np.abs(got[:, col].astype(np.float32) - want.astype(np.float32))
+    peak = float(np.abs(want.astype(np.float32)).max())
+    assert diff.max() / peak < TOL, f"键区间没被遵守：rel={diff.max() / peak:.3e}"
+
+
 def test_vision_attention_rejects_other_head_dims(runtime: MetalRuntime) -> None:
     """核里 8 档通道是按 head_dim == 64 写死的：别的值要当场拒绝，不能算出垃圾。"""
     qbuf = runtime.alloc(3 * 256 * 4 * 2)

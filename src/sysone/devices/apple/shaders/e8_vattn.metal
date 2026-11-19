@@ -40,7 +40,7 @@
 #define VA_LDP    8u                        // P^T 的行跨距（8 列 query = 一个 16 字节组）
 #define VA_LOG2E 1.4426950408889634f
 
-// 与 Python 侧 `kernels.vattn_args` 的 `_VATTN` 格式串逐字节对应（24 B）。
+// 与 Python 侧 `kernels.vattn_args` 的 `_VATTN` 格式串逐字节对应（40 B）。
 struct VAttnArgs {
     uint  T;       // 0  qkv 每通道的列数（整图长度，也是键的总数）
     uint  nq;      // 1  这次产出的 query 列数
@@ -50,6 +50,8 @@ struct VAttnArgs {
     float scale;   // 5  dim ** -0.5
     uint  oT;      // 6  out 每通道的列数（输出面自己的行跨距）
     uint  os0;     // 7  这一片 query 在 out 里的首列
+    uint  k0;      // 8  本片 query 能看的**第一**个键（多图打包时是这张图自己的起点）
+    uint  k1;      // 9  键的结束（不含）
 };
 
 // 8×8 分片的元素归属（行主序读入 / 写出时 lane 与格的对应）。
@@ -59,18 +61,20 @@ static inline uint va_col_of(uint l)   { return ((l & 1u) << 1) | (((l >> 3) & 1
 static inline uint va_owner_of(uint m) { return ((m & 3u) << 1) | ((m >> 2) << 4); }
 
 // 键（或值）的一档搬进线程组内存：每线程一个 `[1 通道][8 键]` 的单位，VA_TG 个线程恰好
-// 铺满 64 通道 × 4 组。块尾不足 8 个键的那组要逐半字补零 —— `T` 不保证是 8 的倍数
-// （640×480 的图有 300 个 token），而 16 字节的向量搬运还额外要求行首对齐，也就是 `T % 8 == 0`。
+// 铺满 64 通道 × 4 组。块尾不足 8 个键的那组要逐半字补零 —— 一张图不保证有 8 的倍数个 token
+// （640×480 的图有 300 个），而 16 字节的向量搬运还额外要求行首对齐。
+// `kend` 是**这一片 query 能看的**键的上界（单图时就是 `T`，多图打包时是这张图的结束列），
+// `stride` 是 qkv 缓冲的行跨距（打包之后比单图的 T 宽）。
 static inline void va_stage(threadgroup half *buf, device const half *src, uint tid,
-                            uint chan0, uint T, uint t0, uint vec) {
+                            uint chan0, uint stride, uint kend, uint t0, uint vec) {
     const uint c = tid >> 2, j = tid & 3u;
     const uint col = t0 + j * 8u;
     threadgroup half *dst = buf + c * VA_LDK + j * 8u;
-    const device half *p = src + (ulong)(chan0 + c) * T + col;
-    if (vec && col + 8u <= T) {
+    const device half *p = src + (ulong)(chan0 + c) * stride + col;
+    if (vec && col + 8u <= kend) {
         *(threadgroup uint4 *)dst = *(device const uint4 *)p;
     } else {
-        for (uint i = 0u; i < 8u; i++) dst[i] = (col + i < T) ? p[i] : half(0);
+        for (uint i = 0u; i < 8u; i++) dst[i] = (col + i < kend) ? p[i] : half(0);
     }
 }
 
@@ -107,8 +111,8 @@ static inline void va_stage(threadgroup half *buf, device const half *src, uint 
 // 本档的分数：乘上 scale·log2e，键越界的置 -inf（尾档才有，`T % 32 != 0` 时）
 #define VA_SM1(K, S) { const uint tA = t0 + (K) * 8u + col_l; \
     float v0 = (S).thread_elements()[0] * K1, v1 = (S).thread_elements()[1] * K1; \
-    if (tA >= T)      v0 = -INFINITY; \
-    if (tA + 1u >= T) v1 = -INFINITY; \
+    if (tA >= a.k1)      v0 = -INFINITY; \
+    if (tA + 1u >= a.k1) v1 = -INFINITY; \
     sv0[K] = v0; sv1[K] = v1; mx = max(mx, max(v0, v1)); }
 
 // 指数与 P^T 落一半字：P^T 是每 warp 私有的 `[键][query]`，只有本 warp 写、本 warp 读
@@ -180,18 +184,20 @@ kernel void k_vattn(device const half  *qkv    [[buffer(0)]],
     VA_ZEROC(c_6)
     VA_ZEROC(c_7)
 
-    const uint blocks = (T + VA_BK - 1u) / VA_BK;
-    const uint vec = ((T & 7u) == 0u) ? 1u : 0u;     // 16 字节搬运要求的对齐
+    // 键的范围是 `[a.k0, a.k1)`，不是 `[0, T)`：多图打包时 qkv 缓冲里并排放着几张图，一片
+    // query 只能看**自己那张图**的键。单图的调用方给 (0, T)，行为与以前一字不差。
+    const uint blocks = (a.k1 - a.k0 + VA_BK - 1u) / VA_BK;
+    const uint vec = ((a.k1 & 7u) == 0u) ? 1u : 0u;  // 16 字节搬运要求的对齐
     const uint kchan = HID + qbase;                 // k 段里本头的首通道
     const uint vchan = 2u * HID + qbase;            // v 段
     threadgroup half *const ktg0 = ktg;
     threadgroup half *const vtg0 = vtg;
 
-    va_stage(ktg0, qkv, tid, kchan, T, 0u, vec);
+    va_stage(ktg0, qkv, tid, kchan, T, a.k1, a.k0, vec);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint blk = 0u; blk < blocks; blk++) {
-        const uint t0 = blk * VA_BK;
+        const uint t0 = a.k0 + blk * VA_BK;
         VA_ZEROC(s_0)
         VA_ZEROC(s_1)
         VA_ZEROC(s_2)
@@ -206,7 +212,7 @@ kernel void k_vattn(device const half  *qkv    [[buffer(0)]],
         VA_QK(48u, q_6)
         VA_QK(56u, q_7)
         // 值的暂存紧跟在 QK 后面：全局加载的延迟被下面的 softmax 盖掉，且写的是另一块缓冲
-        va_stage(vtg0, qkv, tid, vchan, T, t0, vec);
+        va_stage(vtg0, qkv, tid, vchan, T, a.k1, t0, vec);
 
         // ---- 在线 softmax（fp32，按 lane 的行）：max → 重标定 → exp → 行和 → 落 P^T
         {
@@ -244,7 +250,7 @@ kernel void k_vattn(device const half  *qkv    [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // K 已无人再读（上面的屏障排在所有 warp 的 QK 之后），下一档的 K 可以开始搬；
         // 它的加载延迟由下面的 PV 盖住。最后一档搬的是全零（块数保证没人读它）。
-        va_stage(ktg0, qkv, tid, kchan, T, t0 + VA_BK, vec);
+        va_stage(ktg0, qkv, tid, kchan, T, a.k1, t0 + VA_BK, vec);
 
         simdgroup_load(pbs_0, &ptg[sg][0][0], VA_LDP);
         simdgroup_load(pbs_1, &ptg[sg][8][0], VA_LDP);

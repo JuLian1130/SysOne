@@ -70,6 +70,17 @@ def test_tower_shape_repeat_and_reuse(tmp_path: Path) -> None:
         one = tower.encode(wide)
         assert one.shape == (81, 2048), one.shape
         assert np.array_equal(one, tower.encode(wide)), "跨瓦片的两次调用不是逐位相同"
+
+        # 打包：两张图拼成一条列空间，比逐张少几趟 ANE。判据是**逐位相同** —— 列与列之间本来
+        # 没有耦合，注意力只看自己那张图的键（`k_vattn` 的 k0/k1），所以拼与不拼必须一模一样。
+        # 这两张大小不同，拼起来一条图的边界不在桶边界上，正是最容易出错的那种形状。
+        pair = [np.random.default_rng(21).uniform(-1.0, 1.0, (128, 128, 3)).astype(np.float32),
+                np.random.default_rng(22).uniform(-1.0, 1.0, (160, 96, 3)).astype(np.float32)]
+        packed = tower.encode_many(pair)
+        alone = [tower.encode(img) for img in pair]
+        assert all(np.array_equal(a, b) for a, b in zip(alone, packed)), \
+            "打包之后的结果与逐张不同"
+        assert [tuple(item.shape) for item in packed] == [(16, 2048), (15, 2048)]
     finally:
         tower.close()
 

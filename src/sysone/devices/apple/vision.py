@@ -187,6 +187,24 @@ class _Program:
 
 
 @dataclass(frozen=True)
+class _Placed:
+    """一张图在打包列空间里的位置，以及它自己的三张表。
+
+    `padded` 是它占的列数（今天等于 `length`：各图之间不补空，注意力按 (瓦片, 图) 逐段发，
+    不要求段的长度是 64 的倍数）。留着这个字段是因为 merger 的 4 列一组要求图边界落在组边界上，
+    而"是否需要补"由那一处的守卫决定，不由打包层猜。
+    """
+
+    lo: int
+    length: int
+    padded: int
+    tokens: np.ndarray
+    pos: np.ndarray
+    cos: np.ndarray
+    sin: np.ndarray
+
+
+@dataclass(frozen=True)
 class _Tile:
     """一个 token 瓦片独占的两张面，以及它们在 GPU 侧的零拷贝包装。
 
@@ -442,9 +460,103 @@ class VisionTower:
     # -- 跑 ------------------------------------------------------------------
     def encode(self, img: np.ndarray) -> np.ndarray:
         """`(H, W, 3)` fp32 归一图 → `(L/spatial_merge², out_hidden)` fp16。"""
+        return self.encode_many([img])[0]
+
+    def encode_many(self, images: Sequence[np.ndarray]) -> list[np.ndarray]:
+        """一次请求的几张图**拼在一条列空间里**过塔：返回每张图各自的 `(L/4, out_hidden)`。
+
+        为什么要拼：ANE 一次只算一个桶宽的列，一图 2304 个 token 要 3 趟，三张图就是 9 趟；拼成
+        一条 6912 列的空间只要 7 趟（1024² 这种已经对齐的形状则一点不省）。拼的前提是**注意力
+        只能看自己那张图的键** —— `k_vattn` 的 `k0`/`k1` 就是为此加的（票据 07 §7.24）。
+
+        各图之间**不需要**按桶补空：注意力是按 (瓦片, 图) 逐段发的，一段的 query 数不必是 64 的
+        倍数；只有 merger 的 2×2 合并要求每张图的长度是 4 的倍数（smart_resize 保证，这里补
+        一个守卫）。逐位与"一张一张过"相同 —— 列与列之间本来就没有耦合。
+        """
         spec = self.spec
         started = time.perf_counter()
         before = (self.stats["ane_ms"], self.stats["gpu_ms"])
+        placed = []
+        lo = 0
+        for img in images:
+            item = self._place(img)
+            placed.append(_Placed(lo=lo, length=item.length, padded=item.padded,
+                                  tokens=item.tokens, pos=item.pos, cos=item.cos, sin=item.sin))
+            lo += item.padded
+        width = lo
+        if width == 0:
+            raise NotReadyError("没有可编码的图像", images=len(images))
+        tiles = list(self._tiles_of(width))
+        self._ensure_tiles(len(tiles))
+        half_dim = self.head_dim // 2
+
+        # 打包后的输入与表：每张图写进自己的列区间，补齐的那几列留零。
+        tokens = np.zeros((self.cin, width), np.float16)
+        pos_cm = np.zeros((self.hidden, width), np.float16)
+        cos_p = np.zeros((half_dim, width), np.float16)
+        sin_p = np.zeros((half_dim, width), np.float16)
+        for item in placed:
+            tokens[:, item.lo:item.lo + item.length] = item.tokens
+            pos_cm[:, item.lo:item.lo + item.length] = item.pos
+            cos_p[:, item.lo:item.lo + item.length] = item.cos[:, :half_dim].T
+            sin_p[:, item.lo:item.lo + item.length] = item.sin[:, :half_dim].T
+        try:
+            # 1) patch 投影 + pos_embed：出口直接落在这个瓦片的残差面上，位置编码就地加上。
+            for index, (lo, n) in enumerate(tiles):
+                self._put("patch_in", self.cin, tokens[:, lo:lo + n])
+                self._call(self._programs["patch"], "main", slot=index)
+                self._hidden_views[0][index][:, :n] += pos_cm[:, lo:lo + n]
+
+            # 2) 24 个 block（见 §7.21 的跨层调度）
+            qkv_bufs = [self.metal.alloc(3 * self.hidden * width * 2) for _ in range(2)]
+            cos_dev = self.metal.alloc(half_dim * width * 2)
+            sin_dev = self.metal.alloc(half_dim * width * 2)
+            try:
+                cos_dev.array(np.float16, (half_dim, width))[...] = cos_p
+                sin_dev.array(np.float16, (half_dim, width))[...] = sin_p
+                self._layer_main(0, tiles, qkv_bufs[0], width)
+                for layer in range(self._depth):
+                    block = self._programs[f"block{layer:02d}"]
+                    # 上一层抄进 lane 1 的 qkv 必须在这一趟 vrope 之前落地。
+                    self.stats["gpu_ms"] += self.metal.wait(LANE_SMALL)
+                    vrope(self.metal, qkv_bufs[layer % 2], cos_dev, sin_dev, T=width,
+                          hidden=self.hidden, dim=self.head_dim)
+                    for j, (lo, n) in enumerate(tiles):
+                        self._attention(qkv_bufs[layer % 2], j, lo, n, width, placed)
+                        self.metal.commit()
+                    following = layer + 1
+                    for j, (lo, n) in enumerate(tiles):
+                        self._await_gpu()
+                        self._call(block, vp.P1, slot=j)
+                        if following < self._depth:
+                            self._call(self._programs[f"block{following:02d}"], vp.MAIN, slot=j)
+                            copy_columns(
+                                self.metal, self._tiles[j].qkv_dev, qkv_bufs[following % 2],
+                                nchan=3 * self.hidden, src_c0=0, dst_c0=0, stile=n, s0=lo,
+                                src_stride=self.s, dst_stride=width)
+                            self.metal.commit(LANE_SMALL)
+            finally:
+                for dev in (*qkv_bufs, cos_dev, sin_dev):
+                    dev.free()
+
+            # 3) merger：每趟把 2×2 合成 4·hidden，再 fc1 → gelu → fc2
+            merger = self._programs["merger"]
+            merged = np.empty((width // self.unit, self.out_hidden), np.float16)
+            for index, (lo, n) in enumerate(tiles):
+                self._call(merger, "main", slot=index)
+                self._call(merger, "p1")
+                merged[lo // self.unit:(lo + n) // self.unit] = \
+                    self._take(merger, "p1", n // self.unit).T
+        finally:
+            after = (self.stats["ane_ms"], self.stats["gpu_ms"])
+            busy = (after[0] - before[0]) + (after[1] - before[1])
+            self.stats["host_ms"] += (time.perf_counter() - started) * 1e3 - busy
+        return [merged[item.lo // self.unit:(item.lo + item.length) // self.unit]
+                for item in placed]
+
+    def _place(self, img: np.ndarray) -> "_Placed":
+        """一张图 → 打包布局里的位置与它自己的三张表（位置编码、cos、sin）。"""
+        spec = self.spec
         img = np.asarray(img, np.float32)
         if img.ndim != 3 or img.shape[2] != 3:
             raise NotReadyError("视觉塔的输入必须是 (H, W, 3)", shape=list(img.shape))
@@ -458,81 +570,18 @@ class VisionTower:
             raise NotReadyError("patch 网格必须是空间合并的整数倍", grid=[grid_h, grid_w],
                                 merge=merge)
         length = grid_h * grid_w
-        # patch 的出口按**通道主序**摊一次（一次 12 MB 的连续转置），而不是每个瓦片各转一次
-        # （每次 3 MB、目标跨步，实测 3.3 GB/s）。
+        if length % self.unit:
+            # merger 的 2×2 合并是按列 4 个一组切的，图与图的边界要落在组边界上 —— 否则一张图
+            # 的最后几列会跟下一张图的前几列合成一个块。补到 4 的倍数最省（不补到 64：那会把
+            # 打包省下来的趟数又还回去）。
+            raise NotReadyError("一张图的 token 数必须是空间合并的整数倍",
+                                length=length, unit=self.unit, grid=[grid_h, grid_w])
+        pos_cm, cos16, sin16 = self._grid_tables(grid_h, grid_w)
         tokens = np.ascontiguousarray(
             patchify(img, patch=patch, merge=merge,
                      temporal=int(spec.temporal_patch_size)).T).astype(np.float16)
-        # 位置表、cos、sin 只取决于网格尺寸，与像素无关：按 (gh, gw) 缓存。
-        pos_cm, cos16, sin16 = self._grid_tables(grid_h, grid_w)
-
-        tiles = list(self._tiles_of(length))
-        self._ensure_tiles(len(tiles))
-        try:
-            # 1) patch 投影 + pos_embed：出口直接落在这个瓦片的残差面上，位置编码就地加上。
-            for index, (lo, n) in enumerate(tiles):
-                self._put("patch_in", self.cin, tokens[:, lo:lo + n])
-                self._call(self._programs["patch"], "main", slot=index)
-                self._hidden_views[0][index][:, :n] += pos_cm[:, lo:lo + n]
-
-            # 2) 24 个 block：每层先把整图的 qkv 收齐，注意力按**整图**算，再分瓦片喂回去。
-            # q、k 的轴向 RoPE 在 GPU 上做（`k_vrope`）。qkv 的设备缓冲**双缓冲**（奇偶两层各
-            # 一份），于是第 L+1 层的 `main` 可以在第 L 层的 `p1` 之后立刻跑，不必等第 L 层四片
-            # 注意力全部结束 —— 它写的是另一份缓冲。这一步把每层"等 GPU"从 9.2 ms 压到 4.7 ms
-            # （1024² 墙钟 736 → 632，票据 07 §7.21）。
-            depth = self._depth
-            half_dim = self.head_dim // 2
-            qkv_bufs = [self.metal.alloc(3 * self.hidden * length * 2) for _ in range(2)]
-            cos_dev = self.metal.alloc(half_dim * length * 2)
-            sin_dev = self.metal.alloc(half_dim * length * 2)
-            try:
-                # 转置成 `(½dim, L)`：核里一格的 32 个 lane 读同一行 `k` 的 32 个连续 token
-                cos_dev.array(np.float16, (half_dim, length))[...] = cos16[:, :half_dim].T
-                sin_dev.array(np.float16, (half_dim, length))[...] = sin16[:, :half_dim].T
-                # 第 0 层没有"上一层"可以配对，先整层做完
-                self._layer_main(0, tiles, qkv_bufs[0], length)
-                for layer in range(depth):
-                    block = self._programs[f"block{layer:02d}"]
-                    # 上一层的 qkv 是 GPU 抄进这条缓冲的（lane 1），vrope 之前必须抄完。
-                    # 它在上一层的整整一个注意力窗口里跑，所以这一步通常已经完成。
-                    self.stats["gpu_ms"] += self.metal.wait(LANE_SMALL)
-                    vrope(self.metal, qkv_bufs[layer % 2], cos_dev, sin_dev, T=length,
-                          hidden=self.hidden, dim=self.head_dim)
-                    # 注意力**整层一次发出去**（各瓦片之间没有依赖），再逐片等、逐片跑 p1。
-                    # `commit` 必须逐片做：一个命令缓冲里的几段只能一起结算，那就退化成串行了。
-                    for j, (lo, n) in enumerate(tiles):
-                        self._attention(qkv_bufs[layer % 2], j, n, lo, length)
-                        self.metal.commit()
-                    # p1 逐片跟在注意力后面。它有两张输入面：GPU 刚写完的上下文，与上一层写好的
-                    # 残差 —— 两张都不经过主机（§7.23 的双输入）。
-                    following = layer + 1
-                    for j, (lo, n) in enumerate(tiles):
-                        self._await_gpu()
-                        self._call(block, vp.P1, slot=j)
-                        if following < depth:
-                            self._call(self._programs[f"block{following:02d}"], vp.MAIN, slot=j)
-                            copy_columns(
-                                self.metal, self._tiles[j].qkv_dev, qkv_bufs[following % 2],
-                                nchan=3 * self.hidden, src_c0=0, dst_c0=0, stile=n, s0=lo,
-                                src_stride=self.s, dst_stride=length)
-                            self.metal.commit(LANE_SMALL)
-            finally:
-                for dev in (*qkv_bufs, cos_dev, sin_dev):
-                    dev.free()
-
-            # 3) merger：每趟把 2×2 合成 4·hidden，再 fc1 → gelu → fc2
-            merger = self._programs["merger"]
-            merged = np.empty((length // self.unit, self.out_hidden), np.float16)
-            for index, (lo, n) in enumerate(tiles):
-                self._call(merger, "main", slot=index)
-                self._call(merger, "p1")
-                merged[lo // self.unit:(lo + n) // self.unit] = \
-                    self._take(merger, "p1", n // self.unit).T
-        finally:
-            after = (self.stats["ane_ms"], self.stats["gpu_ms"])
-            busy = (after[0] - before[0]) + (after[1] - before[1])
-            self.stats["host_ms"] += (time.perf_counter() - started) * 1e3 - busy
-        return merged
+        return _Placed(lo=0, length=length, padded=length, tokens=tokens,
+                       pos=pos_cm, cos=cos16, sin=sin16)
 
     def _layer_main(self, layer: int, tiles: list, buffer: MetalBuffer,
                     length: int) -> None:
@@ -551,11 +600,23 @@ class VisionTower:
                 src_stride=self.s, dst_stride=length)
             self.metal.commit(LANE_SMALL)
 
-    def _attention(self, qkv_dev, tile: int, nq: int, s0: int, length: int) -> None:
-        """发一个瓦片的注意力：读整图的 qkv，写这个瓦片的上下文面（GPU 直接写面）。"""
-        vattn(self.metal, qkv_dev, self._tiles[tile].ctx_dev, T=length, nq=nq, s0=s0,
-              hidden=self.hidden, dim=self.head_dim, scale=self.scale,
-              out_cols=self.s, out_offset=0)
+    def _attention(self, qkv_dev, tile: int, lo: int, nq: int, width: int,
+                   placed: Sequence["_Placed"]) -> None:
+        """发一个瓦片的注意力：读整条的 qkv，写这个瓦片的上下文面（GPU 直接写面）。
+
+        一个瓦片可能横跨两张图，所以按**图**逐段发：每段的 query 数只取这张图在这一瓦片里的
+        那部分，键区间也只取这张图（`k0`/`k1`）。段与段之间没有依赖，同一个命令缓冲一次提交。
+        """
+        end = lo + nq
+        for item in placed:
+            start = max(lo, item.lo)
+            stop = min(end, item.lo + item.length)
+            if stop <= start:
+                continue
+            vattn(self.metal, qkv_dev, self._tiles[tile].ctx_dev, T=width, nq=stop - start,
+                  s0=start, hidden=self.hidden, dim=self.head_dim, scale=self.scale,
+                  out_cols=self.s, out_offset=start - lo,
+                  k0=item.lo, k1=item.lo + item.length)
 
     def _grid_tables(self, grid_h: int, grid_w: int) -> tuple[np.ndarray, ...]:
         """`(gh, gw)` 决定的三张表：pos_embed（通道主序 fp16）、cos、sin（各 `(L, ½dim)` fp16）。
@@ -830,11 +891,15 @@ class VisionSlot:
 
     # -- 跑 ------------------------------------------------------------------
     def encode(self, img: np.ndarray) -> np.ndarray:
+        return self.encode_many([img])[0]
+
+    def encode_many(self, images: Sequence[np.ndarray]) -> list[np.ndarray]:
+        """一次请求的几张图一起过塔（拼成一条列空间，见 `VisionTower.encode_many`）。"""
         with self._lock:
             tower = self._ensure()
             keys = ("evals", "ane_ms", "gpu_ms", "gpu_busy_ms")
             before = [tower.stats.get(k, 0.0) for k in keys]
-            rows = tower.encode(img)
+            rows = tower.encode_many(images)
             after = [tower.stats.get(k, 0.0) for k in keys]
             self._evals += after[0] - before[0]
             self._ane_ms += after[1] - before[1]
@@ -853,7 +918,8 @@ class VisionSlot:
         spec = self._spec
         counts: list[int] = []
         grids: list[tuple[int, int]] = []
-        blocks: list[np.ndarray] = []
+        pixels: list[np.ndarray] = []
+        prepared: list[np.ndarray] = []
         unit = int(spec.spatial_merge)
         for index, ref in enumerate(refs):
             data = getattr(ref, "data", b"")
@@ -884,7 +950,9 @@ class VisionSlot:
                     shape=list(pixels.shape), merge=unit)
             counts.append(gh * gw)
             grids.append((gh, gw))
-            blocks.append(np.asarray(self.encode(pixels)))
+            prepared.append(pixels)
+        # 整批一起过塔：拼成一条列空间，比逐张少几个 ANE 趟（票据 07 §7.24）。
+        blocks = [np.asarray(rows) for rows in self.encode_many(prepared)]
         return merge.Media(counts=tuple(counts), grids=tuple(grids),
                            rows=np.concatenate(blocks).astype(np.float16))
 
