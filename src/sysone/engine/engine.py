@@ -92,10 +92,14 @@ class Engine:
 
     @property
     def batch_limit(self) -> int:
-        """一个 pass 最多装几条请求：执行器支持 `answers_batch` 才有得装，否则 1。"""
-        if not callable(getattr(self._runner, "answers_batch", None)):
-            return 1
-        return max(1, int(self._config.scheduler.batch))
+        """一个 pass 最多装几条请求：执行器报的**形状**上限，再被 `--batch` 压一次。
+
+        读执行器的属性而不是 `getattr("answers_batch")`：那条路现在在 `DecisionRunner` 基类里
+        人人都有，鸭子类型不再说明任何事。执行器报 1（pooled / vendor）就不攒批。
+        """
+        limit = min(int(getattr(self._runner, "batch_limit", 1)),
+                    int(self._config.scheduler.batch))
+        return max(1, limit)
 
     def _mode_of(self, request: DecisionRequest) -> MaskMode:
         """校验请求能不能跑，并定下这次用哪个掩码。"""

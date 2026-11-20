@@ -498,3 +498,34 @@ def test_causal_batched_tails_keep_the_slot_contract(packed) -> None:
         drift = float(np.abs(row - ref).max())
         assert drift <= SHARED_TOL, f"causal 批尾巴第 {index} 题差 {drift:.3e}，超过 {SHARED_TOL}"
         assert int(np.argmax(row)) == int(np.argmax(ref)), f"causal 批尾巴第 {index} 题的答案变了"
+
+
+def test_forward_batched_matches_per_sequence_passes(chains) -> None:
+    """几条互不相干的序列并排：每条序列的读数与它单独整趟相同。
+
+    块对角只隔离**序列之间**的可见性：每段从第 0 列起、GDN 状态各自从零起，所以这是同一条
+    算术换了排布 —— 槽 0 与逐条整趟逐位相同，其余槽按票据 10 的数值契约差 ≤ `SHARED_TOL`
+    logits，答案必须相同。
+    """
+    _, gpu = chains
+    sequences = [_ids(120, seed=7), _ids(96, seed=11)]
+    batched = gpu.forward_batched(sequences, options=[4, 4])
+    assert batched is not None, "两条短序列该能排进一个桶"
+    alone = [gpu.forward(sequence, options=4) for sequence in sequences]
+    assert np.array_equal(batched[0], alone[0]), "槽 0 不再逐位"
+    for index, (got, want) in enumerate(zip(batched, alone)):
+        drift = float(np.abs(got - want).max())
+        assert drift <= SHARED_TOL, f"第 {index} 条序列差 {drift:.3e}，超过 {SHARED_TOL}"
+        assert int(np.argmax(got)) == int(np.argmax(want)), f"第 {index} 条序列的答案变了"
+
+
+def test_forward_batched_returns_none_when_the_batch_does_not_pack(chains) -> None:
+    """三条 100 token 的序列要两格（2 × 256 > 缓冲 256）：这批没有一次前向的解法。
+
+    以前这条拒绝是 `ConfigError`，而策略层的预判（按 `(n-1) × 桶宽 + 最长` 估）认为能批 ——
+    一次本该静默回退的请求因此变成 500。现在判据只有 `_slot_layout` 一处，装不下就是 `None`，
+    由策略层退回逐条整趟。
+    """
+    _, gpu = chains
+    sequences = [_ids(100, seed=index) for index in range(3)]
+    assert gpu.forward_batched(sequences, options=[4, 4, 4]) is None

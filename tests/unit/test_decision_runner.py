@@ -1,8 +1,10 @@
-"""决策 runner 的共性契约：共享前缀判据、`answers_for` 的编排、能力声明与回退计数。
+"""决策 runner 的共性契约：共享前缀判据、两层编排（`answers_for` / `answers_batch`）、能力声明
+与回退计数。
 
-三件事分开钉：`shared_prefix` 在什么条件下才算"同一条前缀"、基类拿到四个原语之后怎么分派
-（共享 / 逐题 / 拒绝）、以及计数器的形状与归属。三条策略自己的接线在 `test_split_runner.py` /
-`test_pooled_runner.py` / `test_vendor_runner.py`，服务层那一栏在 `test_service_app.py`。
+三件事分开钉：`shared_prefix` 在什么条件下才算"同一条前缀"、基类拿到五个原语之后怎么分派
+（请求内共享 / 跨请求合批 / 逐题回退 / 拒绝）、以及计数器的形状与归属。三条策略自己的接线在
+`test_split_runner.py` / `test_pooled_runner.py` / `test_vendor_runner.py`，服务层那一栏在
+`test_service_app.py`。
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from sysone.engine.strategies.decision import (
     Encoded,
     shared_prefix,
 )
-from sysone.errors import RequestTooLongError
+from sysone.errors import ConfigError, RequestTooLongError
 
 
 def _encoded(ids, *, prefix_len=None, labels=("A", "B"), indexes=(0, 1)) -> Encoded:
@@ -115,22 +117,28 @@ def _request(questions: int) -> DecisionRequest:
 
 
 class FakeRunner(DecisionRunner):
-    """四个原语齐全的替身：两条前向各自记账，按选项数给等概率。
+    """五个原语齐全的替身：每条前向各自记账，按选项数给等概率。
 
     `prefixes` 逐题给前缀（默认 `(7, 8)`），`boundary` 是它声明给 `Encoded` 的边界 —— 两者
     分开是为了能造"声明长度相同、词元不同"这种真会发生的错配。
+
+    `tiled` 表示它还有块对角原语；`fits` 是那条原语对"这一批装不装得下"的回答（装不下时它
+    返回 `None`，编排退回逐题）。
     """
 
     def __init__(self, *, prefixes=None, boundary: int = 2, max_len: int = 64,
-                 shared: bool = True) -> None:
+                 shared: bool = True, tiled: bool = False, fits: bool = True) -> None:
         self.supports_shared = shared
+        self.supports_batch = tiled
         self._max_len = max_len
         self._image_token = None
         self._prefixes = list(prefixes or [])
         self._boundary = boundary
         self._call = 0
+        self._fits = fits
         self.serial: list[tuple[tuple[int, ...], int, bool]] = []
         self.shared: list[tuple[tuple[int, ...], list[tuple[int, ...]], tuple[int, ...], bool]] = []
+        self.tiled: list[tuple[tuple[tuple[int, ...], ...], bool]] = []
 
     def encode(self, state, question, *, images=0):
         index = self._call
@@ -152,6 +160,17 @@ class FakeRunner(DecisionRunner):
         self.shared.append((tuple(prefix), [tuple(tail) for tail in tails], tuple(options),
                             bool(causal)))
         return [[1.0 / int(count)] * int(count) for count in options]
+
+    def forward_batched(self, encoded, *, causal=False, use_prefix=True):
+        self.tiled.append((
+            tuple(item.ids for item in encoded),
+            bool(causal),
+            tuple(0 if not use_prefix or item.prefix_len is None else item.prefix_len
+                  for item in encoded),
+        ))
+        if not self._fits:
+            return None
+        return [[1.0 / len(item.labels)] * len(item.labels) for item in encoded]
 
     def answer(self, encoded, raw, *, index, kind):
         values = tuple(float(value) for value in raw)
@@ -221,3 +240,107 @@ def test_an_over_long_prompt_is_refused_before_anything_runs() -> None:
         runner.answers_for(_request(2), MaskMode.PREFIX_NONCAUSAL)
     assert runner.serial == [] and runner.shared == []
     assert runner.decisions.snapshot() == DecisionMetrics().snapshot()
+
+
+# ---------------------------------------------------------------- 跨请求合批
+
+
+def test_a_batch_with_one_prefix_shares_it_across_requests() -> None:
+    """决策负载的主形态：几条请求同一个 state，前缀只跑一遍、所有题一次尾巴相。"""
+    runner = FakeRunner()
+    out = runner.answers_batch([_request(1), _request(2)], MaskMode.PREFIX_NONCAUSAL)
+    assert len(runner.shared) == 1 and len(runner.shared[0][1]) == 3
+    assert runner.shared[0][0] == (7, 8)
+    assert runner.tiled == [] and runner.serial == [], "共享命中之后不该再有别的前向"
+    assert runner.decisions.batch_hit == 1
+    assert [len(answers) for answers, _, _ in out] == [1, 2], "答案按请求切回去"
+    assert [tokens for _, tokens, _ in out] == [4, 8], "token 也按请求切"
+
+
+def test_independent_requests_tile_into_one_pass_when_the_shapes_fit() -> None:
+    """前缀不同、形状装得下：块对角一条序列一个槽。"""
+    runner = FakeRunner(prefixes=[(7, 8), (9, 8)], tiled=True)
+    out = runner.answers_batch([_request(1), _request(1)], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.shared == [] and len(runner.tiled) == 1
+    assert [sequence[0] for sequence in runner.tiled[0][0]] == [7, 9], "两条序列原样并排"
+    assert runner.decisions.batch_hit == 1 and runner.decisions.batch_fallback == 0
+    assert [answer.value for answers, _, _ in out for answer in answers] == ["甲", "甲"]
+
+
+def test_a_batch_whose_shapes_do_not_fit_falls_back_to_serial() -> None:
+    """装不进一趟：退回逐题，答案与逐条调用**逐位相同**，只记一笔 fallback。"""
+    tiled = FakeRunner(prefixes=[(7, 8), (9, 8)], tiled=True, fits=False)
+    serial = FakeRunner(prefixes=[(7, 8), (9, 8)])
+    requests = [_request(1), _request(1)]
+    batched = tiled.answers_batch(requests, MaskMode.PREFIX_NONCAUSAL)
+    alone = [serial.answers_for(request, MaskMode.PREFIX_NONCAUSAL)[0] for request in requests]
+    assert len(tiled.serial) == 2 and tiled.shared == []
+    assert [answers for answers, _, _ in batched] == alone
+    assert tiled.decisions.batch_fallback == 1 and tiled.decisions.batch_hit == 0
+
+
+def test_a_single_sequence_through_the_batch_route_is_a_miss() -> None:
+    """引擎把单条也送进这条路：一条题没有可合的东西，但那不叫"有机会没合上"。"""
+    runner = FakeRunner()
+    runner.answers_batch([_request(1)], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.batch_miss == 1
+    assert runner.decisions.batch_hit == 0 and runner.decisions.batch_fallback == 0
+    assert len(runner.serial) == 1
+
+
+def test_one_request_with_many_questions_is_a_batch_hit() -> None:
+    """单条请求多题：引擎仍走批这条路，共用前缀就是真的合批。"""
+    runner = FakeRunner()
+    runner.answers_batch([_request(3)], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.batch_hit == 1 and runner.decisions.batch_miss == 0
+    assert len(runner.shared) == 1
+
+
+def test_noncausal_full_does_not_share_across_requests() -> None:
+    """双向掩码下前缀行与题面耦合：不共享（也不记 miss），但形状合适仍可块对角。"""
+    runner = FakeRunner(tiled=True)
+    runner.answers_batch([_request(1), _request(1)], MaskMode.NONCAUSAL_FULL)
+    assert runner.shared == [] and len(runner.tiled) == 1
+    assert runner.decisions.batch_hit == 1 and runner.decisions.shared_miss == 0
+
+
+def test_noncausal_full_sends_zero_prefixes_into_the_tiled_batch() -> None:
+    """`noncausal_full` 没有前缀语义：批里每条序列的前缀长度必须传 0。
+
+    带着 `prefix_len` 进去，流水线会按 `prefix_noncausal` 收行 —— 同一个 mode 的批与逐条就
+    用上了两种掩码（真 mude 上这批的概率差了 8.2e-2，判词恰好没翻）。
+    """
+    runner = FakeRunner(prefixes=[(7, 8), (9, 8)], tiled=True)
+    runner.answers_batch([_request(1), _request(1)], MaskMode.NONCAUSAL_FULL)
+    assert runner.tiled[0][2] == (0, 0), "全双向的批不该带前缀长度"
+
+
+def test_a_prefix_mode_keeps_each_sequence_own_prefix() -> None:
+    """有前缀语义的模式相反：批里每条序列仍按自己的前缀长度收行。"""
+    runner = FakeRunner(prefixes=[(7, 8), (9, 8)], tiled=True)
+    runner.answers_batch([_request(1), _request(1)], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.tiled[0][2] == (2, 2), "prefix_noncausal 的批要按每条自己的边界"
+
+
+def test_a_batch_with_images_is_refused_before_encoding() -> None:
+    """图按请求走塔与像素管线：批里不许有图，而且是编码之前就拒。"""
+    runner = FakeRunner()
+    requests = [
+        _request(1),
+        DecisionRequest(state="s",
+                       questions=(Question(text="q0", options=("甲", "乙")),),
+                       media=(object(),)),
+    ]
+    with pytest.raises(ConfigError):
+        runner.answers_batch(requests, MaskMode.PREFIX_NONCAUSAL)
+    assert runner.shared == [] and runner.serial == [] and runner.tiled == []
+    assert runner.decisions.snapshot() == DecisionMetrics().snapshot(), "拒收之前不该记任何账"
+
+
+def test_the_base_runner_reports_a_batch_limit_of_one() -> None:
+    """没有合批原语就没有这条路：引擎不攒批、也不把单条送进 `answers_batch`。"""
+
+    class Runner(DecisionRunner):
+        supports_shared = True
+
+    assert Runner().batch_limit == 1

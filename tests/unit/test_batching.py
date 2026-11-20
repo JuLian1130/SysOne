@@ -24,7 +24,12 @@ from sysone.service.batching import Batcher
 
 
 class _FakeRunner:
-    """最小执行器：`answers_batch` 记住批的形状，答案按请求内容算（可复现）。"""
+    """最小执行器：`answers_batch` 记住批的形状，答案按请求内容算（可复现）。
+
+    `batch_limit` 是它报给引擎的合批上限，与默认的 `--batch` 同值。
+    """
+
+    batch_limit = 4
 
     def __init__(self) -> None:
         self.calls: list[list[DecisionRequest]] = []
@@ -120,9 +125,17 @@ def test_batch_limit_is_one_without_a_batch_capable_runner() -> None:
     from sysone.config import EngineConfig, ModelSelection
 
     engine = Engine.__new__(Engine)
-    engine._runner = object()                      # noqa: SLF001 - 没有 answers_batch
+    engine._runner = object()                      # noqa: SLF001 - 没有 batch_limit 属性
     engine._config = EngineConfig(model=ModelSelection(name="m", dir="."))  # noqa: SLF001
     assert engine.batch_limit == 1
+
+
+def test_the_runner_ceiling_caps_the_configured_batch() -> None:
+    """执行器报的形状上限与 `--batch` 取小：两边都能收紧，谁都不能放大另一边。"""
+    engine, runner = _engine()
+    assert engine.batch_limit == 4, "默认 --batch 与执行器的上限都是 4"
+    runner.batch_limit = 2
+    assert engine.batch_limit == 2
 
 
 # ---------------------------------------------------------------- 攒批器

@@ -495,7 +495,7 @@ class MudePipeline:
 
     def run_batched(self, rows: Sequence[np.ndarray], *,
                     prefixes: Sequence[int] = (),
-                    causal: bool = False) -> list[np.ndarray]:
+                    causal: bool = False) -> list[np.ndarray] | None:
         """N 条**互不相干**的序列并排跑一个 pass，返回各自的末行 hidden（`[hidden]` fp32）。
 
         **布局**：一条序列一个**槽**，槽宽 `slotw = 向上取整到 128 的最长序列`，一格（= 一个瓦片
@@ -513,18 +513,18 @@ class MudePipeline:
         - GDN 每槽从零起（`_slot_fresh`）：**没有共享前缀可恢复**，每个槽是一条新序列。
 
         **限制**：每条序列必须 ≤ `bucket`（否则一条序列会跨瓦片，而递归状态只有一份）；
-        打包区 `ntiles * bucket` 必须 ≤ `width`；每格最多 8 槽（`nkw`/`pcw` 表宽）。
-        不满足就抛 `ConfigError`，由调用方退回逐条整趟 —— 静默降级会让"批没批上"变成一个
-        查不出来的性能问题。
+        打包区 `ntiles * bucket` 必须 ≤ `width`；每格最多 8 槽（`nkw`/`pcw` 表宽）；槽宽
+        `slotw` 必须**整除** `bucket`（槽边界要落在瓦片边界上，一个槽不能跨瓦片）。任一不满足
+        就返回 `None`：这批没有"一次前向"的解法，调用方退回逐条整趟即可 —— 这不是错误。
+
+        形状判据只在 `_slot_layout` 里有一份，调用方**不要**再抄一份预判：抄出来的那份曾经漏过
+        "槽宽整除桶宽"，于是它判"能批"、这里拒，一次本该静默回退的请求变成了 500。
         """
         if not rows:
             raise ConfigError("批里至少要有 一条序列")
         lengths = [int(np.asarray(row).shape[0]) for row in rows]
         if min(lengths) <= 0:
             raise ConfigError("批里的序列长度必须为正", lengths=lengths)
-        if max(lengths) > self._bucket:
-            raise ConfigError("批里的序列超过桶宽：一条序列会跨瓦片，递归状态就无处安放",
-                              longest=max(lengths), bucket=self._bucket)
         if len(rows) == 1:
             # 一条不成批：走普通那条路（与 `run` 逐位同一条代码），省得为 1 条造一个槽位布局。
             # 这条出口只读末行，所以末层可以走 S3 的末行规则。
@@ -536,8 +536,7 @@ class MudePipeline:
         # 所以 4 条塞进 1 格只花 1 格的 ANE 时间；一条一格就和逐条跑一样贵。
         layout = self._slot_layout(0, lengths)
         if layout is None:
-            raise ConfigError("这批排不进打包区", lengths=lengths, bucket=self._bucket,
-                              width=self._width)
+            return None
         view = self.x.array(np.float16, (self._hidden, self._width))
         # 打包区先整段清零：槽尾那些填充列的 K/V 照样会被算（槽位掩码看不见它们），
         # 留上一趟的残值只会让这一趟的中间量没有定义。

@@ -168,6 +168,7 @@ def test_a_causal_request_with_two_questions_is_counted_as_a_shared_miss():
     stats = subject.decision_stats()
     assert stats["shared_miss"] == 1 and stats["shared_hit"] == 0
     assert stats["supports_shared"] is False and stats["supports_batch"] is False
+    assert subject.batch_limit == 1, "引擎据此不攒批、也不把单条送进批路"
 
 
 def test_noncausal_full_has_no_prefix_to_share_so_no_miss():

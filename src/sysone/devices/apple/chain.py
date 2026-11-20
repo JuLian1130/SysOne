@@ -612,7 +612,7 @@ class SplitChain:
     def forward_batched(
         self, sequences: Sequence[Sequence[int]], *, options: Sequence[int],
         prefixes: Sequence[int] = (), causal: bool = False,
-    ) -> list[np.ndarray]:
+    ) -> list[np.ndarray] | None:
         """N 条**互不相干**的序列并排跑一个 pass，返回各自的 softmax 概率（按 `options` 截断）。
 
         与 `forward_shared` 的区别是**没有共享前缀**：每条序列从第 0 列起、各自从零起算
@@ -621,6 +621,9 @@ class SplitChain:
 
         `options[k]` 是第 k 条序列的候选码数；`mm` 不支持 —— 带图的序列要走塔与像素管线，
         那是按请求的，不进这个批。
+
+        这批排不进一趟打包区（每条 ≤ 桶宽、槽宽整除桶宽、打包区 ≤ 缓冲宽度）时返回 `None`：
+        调用方（策略层）退回逐条整趟。形状判据只有流水线那一份，这里不预判。
         """
         if len(options) != len(sequences):
             raise ValueError(f"options 与序列条数不一致：{len(options)} vs {len(sequences)}")
@@ -631,6 +634,8 @@ class SplitChain:
         self._prepare_rope(None, max(lengths))
         rows = [self._embeddings(self._ids_and_length(seq, 0)[0]) for seq in sequences]
         hidden = self._pipeline.run_batched(rows, prefixes=prefixes, causal=causal)
+        if hidden is None:
+            return None
         readout = self._require_readout()
         # 流水线给的是**最后一层的原始隐态**，`_final_norm` 还没做 —— 与 `last_hidden()`
         # 那条路一样，读出之前必须先过最终 RMSNorm，否则整批答案会系统性偏移。

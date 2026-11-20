@@ -610,6 +610,27 @@ def test_the_shared_path_is_counted_as_a_hit() -> None:
     assert stats["supports_shared"] is True and stats["supports_batch"] is False
 
 
+def test_the_batch_limit_comes_from_the_buffer_width() -> None:
+    """块对角一趟最多并排 `width // 128` 条：一条序列至少占一槽（槽宽是 128 的整数倍）。
+
+    引擎取"执行器的形状上限"与 `--batch`（默认 4）的小值：默认负载下 `batch_limit` 仍是 4，
+    与 Stage 1 之前一致。
+    """
+    runner = _runner(TiledChain(), max_len=2048)
+    runner.load_weights()                         # 能力位问的是**装载后**那条链
+    assert runner.batch_limit == 16
+    engine = _engine(TiledChain(), max_len=2048)
+    engine.start()
+    assert engine.batch_limit == 4
+
+
+def test_a_chain_without_any_batch_primitive_reports_a_limit_of_one() -> None:
+    """两条原语都没有：引擎不攒批，单条也不绕进 `answers_batch`。"""
+    runner = _runner(FakeChain())
+    runner.load_weights()
+    assert runner.batch_limit == 1
+
+
 def test_a_lone_question_is_neither_a_hit_nor_a_miss() -> None:
     """单题没有"与谁共享"这件事：记成 miss 会把最常见的负载涂成失败。"""
     chain = SharedChain()
@@ -650,7 +671,7 @@ def test_an_over_long_prompt_is_refused_before_the_counters_move() -> None:
 
 
 class TiledChain(SharedChain):
-    """再补一条块对角原语与桶宽：`_batchable` 认的就是 `bucket` / `width` 两个属性。"""
+    """再补一条块对角原语：它的形状判定归链自己，这里只记账、按选项数给等概率。"""
 
     bucket = 512
     width = 2048

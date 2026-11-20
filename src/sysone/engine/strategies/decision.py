@@ -1,15 +1,17 @@
-"""决策 runner 的共性编排：编码循环、共享前缀判定、串行回退与能力声明。
+"""决策 runner 的共性编排：编码循环、共享前缀、跨请求合批与串行回退。
 
-这是 `docs/sysone/decision-runner.md` 的 Stage 1：**一个请求内 1 个 state + N 个题**到底走
-共享前缀还是逐题整趟，由这里决定，模型只提供四个薄原语（`encode` / `forward` /
-`forward_shared` / `answer`）。
+这是 `docs/sysone/decision-runner.md` 的 Stage 1 与 Stage 2：两层调度都由这里决定 ——
+**一个请求内** 1 个 state + N 个题走共享前缀还是逐题整趟（`answers_for`），**多个请求之间**
+能不能挤进一个 pass（`answers_batch`）。模型只提供五个薄原语（`encode` / `forward` /
+`forward_shared` / `forward_batched` / `answer`），外加自己的几何与能力位。
 
-为什么这层不属于任何一条模型：协议天然是 1 state + N questions，"那一段能不能复用"只取决于
-每题的前缀 tokens 是否相同，与模型结构无关。它写在 `SplitRunner` 里的那些天，h2o 与 vendor
-就各写了一遍串行，谁都没共享 —— 真实评测流量 34 条请求全是 4–5 题、理想共享比 3.8–3.9×，
-而 `/metrics` 里 `shared_miss` 那一格才把这件事量出来。
+为什么这两层都不属于任何一条模型：协议天然是 1 state + N questions，合批的前提是"同一个
+掩码、都没有图、槽位装得下"。"那一段能不能复用"只取决于每题的前缀 tokens 是否相同，
+"几条请求能不能并排"只取决于形状与掩码 —— 都与模型结构无关。它们写在 `SplitRunner` 里的
+那些天，h2o 与 vendor 就各写了一遍串行，谁都没共享 —— 真实评测流量 34 条请求全是 4–5 题、
+理想共享比 3.8–3.9×，而 `/metrics` 里 `shared_miss` 那一格才把这件事量出来。
 
-四个计数的语义（互不重叠，一个机会只记一次）：
+六个计数的语义（互不重叠，一个机会只记一次）：
 
 | 计数 | 记什么 |
 |---|---|
@@ -25,8 +27,10 @@
 耦合，本来就不能复用）。vendor 桥不透明、永远串行，也不记 —— 那些数字会永远不动，读的人
 会以为有机会没做。
 
-`answers_batch`（多请求合批）仍写在 `SplitRunner` 里，Stage 2 才搬；它今天已经借这里的
-`encode_request` / `shared_answers` / `serial_answers`，所以迁移时只剩"怎么拼一个 pass"。
+`batch_limit` 是"这条执行路径一个 pass 最多装几条请求"，基类给 1。它是**形状**上限，不是
+策略上限：策略上限是服务层的 `--batch`，两边由 `Engine.batch_limit` 取小。合批的收益按瓦片
+数算（见 `answers_batch` 的 docstring）；"这一批装不装得下"的判断留在 `forward_batched` 里
+—— 只有执行器知道那条链的桶宽与缓冲宽度。
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from typing import Sequence
 
 from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest, Question
-from ...errors import RequestTooLongError, UnsupportedMediaError
+from ...errors import ConfigError, RequestTooLongError, UnsupportedMediaError
 from ...models.vision import merge
 
 
@@ -74,7 +78,7 @@ def shared_prefix(encoded: Sequence[Encoded]) -> tuple[int, ...] | None:
     - **混着给**：没有可证的公共边界，返回 `None`。
 
     **单题与空序列不算共享**：这个函数只回答"是不是同一条前缀"，调用方要自己要求
-    `len(encoded) > 1`（编排在 `DecisionRunner._answers` 里）。
+    `len(encoded) > 1`（编排在 `DecisionRunner._answers` 与 `answers_batch` 里）。
     """
     if not encoded:
         return None
@@ -122,14 +126,16 @@ class DecisionMetrics:
 class DecisionRunner:
     """决策 runner 的共性骨架：编排 + 能力声明 + 计数。
 
-    `answers_for` 是一次请求的全部编排：编码 → 判前缀 → 共享或逐题 → 读出。子类只需实现
-    四个原语，并让 `_max_len` / `_image_token` 就位（后者与 `VisionRunner` 是同一个字段：
+    `answers_for` 是一次请求的全部编排：编码 → 判前缀 → 共享或逐题 → 读出；`answers_batch`
+    是多个请求的全部编排：编码 → 判前缀 → 同前缀共享 / 块对角合批 / 逐题回退 → 读出。子类只需
+    实现五个原语，并让 `_max_len` / `_image_token` 就位（后者与 `VisionRunner` 是同一个字段：
     两条装配共用"一张图一个占位符"这个语义）。
 
-    `supports_shared` **不是"想不想共享"，而是"这条链现在有没有那条原语"**：`ModelChain`
-    的协议只要求 `forward` / `close`，不强制 `forward_shared`。所以 `SplitRunner` 把它实现成
-    按链问的属性 —— 一条没有 `forward_shared` 的链在这里就退回串行，而不是等 `AttributeError`
-    把它变成一次 500。声明能力也不等于每次都用：前缀不同、单题、`noncausal_full` 都走串行。
+    `supports_shared` / `supports_batch` **不是"想不想共享"，而是"这条链现在有没有那条原语"**：
+    `ModelChain` 的协议只要求 `forward` / `close`，不强制 `forward_shared` / `forward_batched`。
+    所以 `SplitRunner` 把它们实现成按链问的属性 —— 一条没有 `forward_shared` 的链在这里就退回
+    串行，而不是等 `AttributeError` 把它变成一次 500。声明能力也不等于每次都用：前缀不同、
+    单题、`noncausal_full` 都走串行。
     """
 
     # 有没有"多题共用一段前缀"与"多请求挤进一个 pass"的原语。默认没有：一个没声明的模型
@@ -144,6 +150,15 @@ class DecisionRunner:
     _decisions: DecisionMetrics | None = None
 
     # ------------------------------------------------------------------ 编排
+
+    @property
+    def batch_limit(self) -> int:
+        """一个 pass 最多装几条请求；1 = 这条执行路径不进合批。
+
+        基类没有合批原语，所以是 1。子类按自己的**形状**给上限（`SplitRunner` 用缓冲宽度与
+        最短槽宽推），服务层的 `--batch` 是**策略**上限，两边由 `Engine.batch_limit` 取小。
+        """
+        return 1
 
     def answers_for(
         self, request: DecisionRequest, mode: MaskMode, *, media: object | None = None
@@ -162,7 +177,7 @@ class DecisionRunner:
     def _answers(
         self, request: DecisionRequest, mode: MaskMode, media: object | None
     ) -> tuple[tuple[Answer, ...], int, float]:
-        """编码 + 分派 + 读出。`answers_batch` 也借 `encode_request` 与两条 `*_answers`。"""
+        """编码 + 分派 + 读出。`encode_request` 与两条 `*_answers` 也是 `answers_batch` 用的。"""
         self._require_ready()
         # `noncausal_full` 就是把前缀当 0：掩码 `(q >= 0) | (k < 0)` 恒真，前缀行与题面耦合，
         # 复用那一段会改答案 —— 所以它不是"漏了共享"，是没这个语义。
@@ -189,6 +204,79 @@ class DecisionRunner:
                 encoded, kinds, use_prefix=use_prefix, causal=causal, mm=mm)
         tokens = sum(len(item.ids) for item in encoded)
         return tuple(answers), tokens, time.perf_counter() - started
+
+    def answers_batch(
+        self, requests: Sequence[DecisionRequest], mode: MaskMode
+    ) -> list[tuple[tuple[Answer, ...], int, float]]:
+        """多条**互不相干**的请求走一个 pass，返回每条各自的 `(答案, token 数, 前向秒)`。
+
+        合成一个 pass 有两条路：**前缀相同**（决策负载里就是"同一个 state、不同的问题"）走
+        `forward_shared` 批尾巴；**前缀不同**走块对角（一条序列一个槽，每行只看自己那一槽）。
+        两条都拿不到才退回逐题整趟（`serial_answers`），结果与逐条调用**逐位相同** ——
+        这只是没有收益，不是另一种答案。
+
+        收益按**瓦片数**算，不按列：program 的静态宽度就是桶宽，一格（一片瓦片）里放 118 列
+        还是 512 列，这一趟的成本几乎一样。所以 N 条短序列全挤进**一格**时倍率 ≈ N（票据 07
+        §7.25o，`bucket=512`：4 × 120 token 2.23× → **3.94×**、2 条 1.79×、3 条 2.52×）；
+        溢出到第二格就掉下来（4 × 100–130 token 的槽宽是 256 ⇒ 2 格 ⇒ 2.64×）；瓦片数完全
+        不降时只剩每趟固定项可省（§7.25j 的宽度标定臂：2 条 1.53×、4 条 2.01×）。上限还受
+        两张表约束：`nkw` / `pcw` 只有 8 槽，槽宽按 128 向上取整、由**最长**那条决定。
+
+        三条约束，调用方（`Engine.batch`）负责满足：**都没有图**（图的塔与像素管线按请求走，
+        塞进批里会把调度搅乱）、**同一个 mode**（掩码不同就打不到一起）、**非空**。
+        """
+        if not requests:
+            return []
+        self._require_ready()
+        if any(request.media for request in requests):
+            raise ConfigError("批里不能有带图的请求（图片按请求走塔）",
+                              images=sum(1 for r in requests if r.media))
+        causal = mode is MaskMode.CAUSAL
+        use_prefix = mode is not MaskMode.NONCAUSAL_FULL
+        started = time.perf_counter()
+        # 编码、长度检查与"一图多占位"的展开都在 `encode_request`（批里没有图，落点一定是空的）。
+        # 多条请求的题摊平成一张表，所以每条记一个区间，答案最后按区间切回去。
+        encoded: list[Encoded] = []
+        kinds: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for request in requests:
+            first = len(encoded)
+            own, _ = self.encode_request(request, None)
+            encoded.extend(own)
+            kinds.extend(question.kind for question in request.questions)
+            spans.append((first, len(encoded)))
+        shared = shared_prefix(encoded) if use_prefix else None
+        answers: list[Answer] | None = None
+        if shared is not None and len(encoded) > 1 and self.supports_shared:
+            self.decisions.batch_hit += 1
+            answers = self.shared_answers(shared, encoded, kinds, causal=causal)
+        elif len(encoded) > 1 and self.supports_batch:
+            # 没有共享前缀（不同 state 的独立请求）时走块对角：一条序列一个槽、互不可见。
+            # `None` = 这一批的形状挤不进一趟（判据在 `forward_batched` 里，只有它知道几何）。
+            answers = self.batched_answers(
+                encoded, kinds, causal=causal, use_prefix=use_prefix)
+            if answers is not None:
+                self.decisions.batch_hit += 1
+        if answers is None:
+            # 一条序列（引擎把单条也送进这条路）没有可合的东西；≥2 条才是有机会却没合上。
+            if len(encoded) > 1:
+                self.decisions.batch_fallback += 1
+            else:
+                self.decisions.batch_miss += 1
+            answers = self.serial_answers(encoded, kinds, use_prefix=use_prefix, causal=causal)
+        elapsed = time.perf_counter() - started
+        out: list[tuple[tuple[Answer, ...], int, float]] = []
+        for first, last in spans:
+            # 摊平编码之后，答案的 `question_index` 是**全批**的序号；每条请求的结果要报"这条
+            # 请求里的第几题"（逐条调用时就是这个数），所以切片时按请求内序号重编 —— 只是这
+            # 份数据对齐，没有另一种答案。
+            own = tuple(
+                replace(answer, question_index=index)
+                for index, answer in enumerate(answers[first:last])
+            )
+            tokens = sum(len(encoded[index].ids) for index in range(first, last))
+            out.append((own, tokens, elapsed))
+        return out
 
     def encode_request(
         self, request: DecisionRequest, media: object | None
@@ -260,6 +348,27 @@ class DecisionRunner:
             for index, item in enumerate(encoded)
         ]
 
+    def batched_answers(
+        self, encoded: Sequence[Encoded], kinds: Sequence[str], *, causal: bool = False,
+        use_prefix: bool = True,
+    ) -> list[Answer] | None:
+        """块对角的一条路：N 条互不相干的序列并排跑一个 pass；装不下就是 `None`。
+
+        `None` 不是错误，是"这一批的形状挤不进一趟"（每条 ≤ 桶宽、总列数 ≤ 缓冲宽度）。
+        判断留在 `forward_batched` 里，因为只有它知道那条链的几何；编排拿到 `None` 就退回逐题，
+        结果与逐条调用逐位相同 —— 这只是没有收益，不是另一种答案。
+
+        `use_prefix` 与 `_answers` 同一个口径：`noncausal_full` 没有前缀语义，前缀长度一律传 0
+        （见 `forward_batched`）。
+        """
+        raw = self.forward_batched(encoded, causal=causal, use_prefix=use_prefix)
+        if raw is None:
+            return None
+        return [
+            self.answer(item, raw[index], index=index, kind=kinds[index])
+            for index, item in enumerate(encoded)
+        ]
+
     def serial_answers(
         self, encoded: Sequence[Encoded], kinds: Sequence[str],
         *, use_prefix: bool, causal: bool = False, mm: object | None = None,
@@ -297,6 +406,18 @@ class DecisionRunner:
                        mm: object | None = None) -> Sequence[object]:
         """前缀 + 每条尾巴一次前向；每题一份读数，顺序与 `tails` 一致。"""
         raise NotImplementedError("这条执行路径没有声明共享前缀前向")
+
+    def forward_batched(self, encoded: Sequence[Encoded], *, causal: bool = False,
+                        use_prefix: bool = True) -> Sequence[object] | None:
+        """N 条独立序列一次前向；每题一份读数，顺序与 `encoded` 一致。
+
+        装不进一趟返回 `None`（编排退回逐题）：形状判据是几何的一部分，只有执行器知道。
+
+        `use_prefix=False`（`noncausal_full`）时每条序列的前缀长度传 0：那条掩码里没有"前缀
+        行"，把 `prefix_len` 带进批会让流水线按 `prefix_noncausal` 收行 —— 同一个 mode 的批与
+        逐条就会得到不同的掩码（曾经如此，见 Stage 2 的对拍）。
+        """
+        raise NotImplementedError("这条执行路径没有声明块对角前向")
 
     def answer(self, encoded: Encoded, raw: object, *, index: int, kind: str) -> Answer:
         """读数 → `Answer`（标签映射、温度、归一化、合法性检查都在这里）。"""

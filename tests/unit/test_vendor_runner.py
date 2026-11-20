@@ -324,3 +324,4 @@ def test_the_bridge_declares_no_shared_or_batch_capability() -> None:
     assert stats["supports_shared"] is False and stats["supports_batch"] is False
     assert stats["shared_hit"] == stats["shared_miss"] == 0
     assert stats["batch_hit"] == stats["batch_miss"] == stats["batch_fallback"] == 0
+    assert runner.batch_limit == 1, "厂商桥串行：引擎据此不建攒批器"
