@@ -372,6 +372,40 @@ def test_forward_shared_on_a_chunked_chain(chunked) -> None:
     _shared_vs_single(chunked, 70, (3, 9, 5))
 
 
+def test_last_hidden_shared_matches_per_question_passes(chains) -> None:
+    """共享前缀的末行 hidden 与"每题各自整趟"的末行一致 —— pooled 的读出就靠这一行。
+
+    `logits_shared` 是从它点出 logits 的，所以这条与上面几条不重复：这里钉的是"没有码表
+    读出的模型（h2o 的 pooled）也能走上共享路径"，读出那一步在策略层做。
+    """
+    _, gpu = chains
+    prefix, tails = 70, (5, 3, 9)
+    tokens = _ids(prefix + sum(tails))
+    head = tokens[:prefix]
+    bounds = np.cumsum((0, *tails))
+    tail_ids = [tokens[prefix + int(start):prefix + int(end)]
+                for start, end in zip(bounds[:-1], bounds[1:])]
+    per_question = [gpu.last_hidden(head + tail, causal=True) for tail in tail_ids]
+    shared = gpu.last_hidden_shared(head, tail_ids, causal=True)
+    assert len(shared) == len(per_question)
+    for index, (row, want) in enumerate(zip(shared, per_question)):
+        assert row.shape == want.shape
+        # 实测（`.tmp/measure_hidden_shared.py`，同一份代码两跑逐位相同）：前缀落在桶边界
+        # （192/256）时末行**逐位相同**；只有前缀停在瓦片中间（70）时差 1.65e-3（相对最大）。
+        # 这里按 5e-3 守，形状不是"随便取一个宽界限"：它比实测值大 3 倍，比 fp16 一个 ulp 大。
+        drift = float(np.abs(row - want).max() / np.abs(want).max())
+        assert drift <= 5e-3, f"共享前缀第 {index} 题的末行 hidden 相对差 {drift:.3e}"
+
+
+def test_a_numpy_chain_declares_no_prefix_buffer(chains) -> None:
+    """共享前缀要有零拷贝流水线：numpy 形态没有那段存贮，能力位与调用都得这么说。"""
+    cpu, gpu = chains
+    assert cpu.can_share_prefix is False
+    assert gpu.can_share_prefix is True
+    with pytest.raises(ValueError):
+        cpu.last_hidden_shared(TOKENS[:4], (TOKENS[4:],))
+
+
 def test_batched_tails_match_per_question_passes(packed) -> None:
     """四条等长尾巴塞进一个桶：每格一份状态与前缀末状态，答案与逐题整趟相同。
 

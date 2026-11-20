@@ -10,6 +10,11 @@
 所以这条路的边界是：我们算 `hidden`，**再算"哪些词表行 × hidden"**（这一步是设备层的
 真相），把 logits 原样交给 `Serve.answer`，由厂商代码判答案。概率不会在中间被我们自己
 归一化一次再交给它 —— 那会变成"我们的温度 + 厂商的温度"。
+
+编排（单题整趟 / 一次请求内的共享前缀 / 跨请求合批）**不在这个模块里**：那是
+`DecisionRunner` 的事（`docs/sysone/decision-runner.md`），这里只给原语。其中"前缀一遍、
+每题一条尾巴"是这条策略唯一的真实收益 —— 真实评测流量 34 条请求全是 4–5 题共享同一个
+state，理想共享比 3.8–3.9×。
 """
 
 from __future__ import annotations
@@ -24,17 +29,10 @@ import numpy as np
 from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest, Question
 from ...domain.work import CompilationTimes
-from ...errors import (
-    ConfigError,
-    NotReadyError,
-    RequestTooLongError,
-    UnsupportedMediaError,
-    UnsupportedModeError,
-)
-from ...models.vision import merge
+from ...errors import ConfigError, NotReadyError, UnsupportedModeError
 from ...models.vendors.base import question_spec
 from ...models.vendors.h2o_serve import Prepared, Serve
-from .decision import DecisionRunner
+from .decision import DecisionRunner, Encoded
 from .vision import VisionRunner
 
 # h2o 训练过两种读法、也只声明了两种：整段因果，或整段双向（没有 prefix 语义）。
@@ -45,9 +43,13 @@ _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one"
 
 
 class PooledChain(Protocol):
-    """这条策略只需要链的两件事：末位 token 的最终 hidden 与卸载。"""
+    """这条策略只需要链的两件事：末位 token 的最终 hidden 与卸载。
 
-    def last_hidden(self, tokens: Sequence[int], *, causal: bool = False,
+    "前缀一遍、每题一条尾巴"是可选的第四条：有 `last_hidden_shared` 才共享（`supports_shared`
+    按链问）。`ModelChain` 的协议不强制它，替身链与 numpy 形态的链都可能没有。
+    """
+
+    def last_hidden(self, tokens: Sequence[int], *, prefix: int = 0, causal: bool = False,
                     mm: object | None = None) -> np.ndarray: ...
 
     def close(self) -> None: ...
@@ -58,12 +60,15 @@ class PooledRunner(VisionRunner, DecisionRunner):
 
     `rows` 把"标签 token id"换成"词表里的那几行"（tied 模型上就是 `embed_tokens`），由调用
     方注入：设备层不加一个只为这份 checkpoint 存在的读出方式，链也不需要认识 tokenizer。
+
+    **它不自己编排**：一题整趟还是"state 前缀只算一遍"，由基类（`DecisionRunner`）按前缀、
+    题数与能力位决定，这里只提供原语 —— `encode`（厂商答面渲染）、`forward`（末行 hidden）、
+    `forward_shared`（前缀一遍 + 每条尾巴的末行）、`answer`（标签行 × hidden 交回厂商）。
+
+    跨请求合批不声明（`supports_batch = False`，`batch_limit` 因此是基类的 1）：h2o 的真实
+    prompt p90 是 2644 token、桶宽 1024，块对角基本排不进一趟（Stage 4 才有结论）。
     """
 
-    # 只有逐题的 `last_hidden`：没有共享前缀原语（Stage 3 才接 `forward_shared` 与
-    # `last_hidden_shared`），也没有跨请求合批（Stage 4 才评估）。能力位显式写出来，
-    # 免得读的人以为"没声明"和"想过了、不做"是一回事。
-    supports_shared = False
     supports_batch = False
 
     def __init__(
@@ -90,6 +95,19 @@ class PooledRunner(VisionRunner, DecisionRunner):
         self._chain: PooledChain | None = None
         self._load_s = 0.0
         self._warm_ok = False
+
+    # ------------------------------------------------------------------ 能力
+    @property
+    def supports_shared(self) -> bool:
+        """这条链能不能"前缀一遍"：`last_hidden_shared` 与零拷贝流水线两样都要。
+
+        `last_hidden_shared` 在 `SplitChain` 上总有这个名字，但 numpy 形态没有前缀 K/V 的
+        落脚点（`can_share_prefix` 为假）。声明了却调不到是一条 500；退回串行只是一次没有
+        收益的前向。声明也不等于每次都走：单题、前缀不同、`noncausal_full` 都走逐题。
+        """
+        chain = self._chain
+        return (callable(getattr(chain, "last_hidden_shared", None))
+                and bool(getattr(chain, "can_share_prefix", False)))
 
     # ------------------------------------------------------------------ 生命周期
     def init_device(self) -> None:
@@ -142,23 +160,20 @@ class PooledRunner(VisionRunner, DecisionRunner):
             self._chain = None
         self._warm_ok = False
 
-    # ------------------------------------------------------------------ 前向
+    # ------------------------------------------------------------------ 请求入口
     def answers_for(
         self, request: DecisionRequest, mode: MaskMode, *, media: object | None = None
     ) -> tuple[tuple[Answer, ...], int, float]:
-        """一次请求内的所有题：返回 (答案元组, 输入 token 数, 读出耗时)。
+        """一次请求的所有题：先过 h2o 的读法门，再交给基类的编排。
 
-        `media` 是给门与替身用的旁路；**请求自带的图**（`request.media`）走真路径（解码 →
-        像素管线 → 塔 → `Media`），两条路在 `_answers` 汇合。
+        读法的门留在这里而不是基类：`causal` / `noncausal_full` 是**这个 checkpoint** 训练过
+        的两种读法，不是所有决策模型的共性。一个没验证过的读法（比如 `prefix_noncausal`）
+        在 h2o 上会算出一个"看起来正常"的答案，所以它必须当场拒绝，而不是等数值对不上才发现。
+
+        `media` 是给门与替身用的旁路（塔已经算完的图像侧）；请求自带的图仍走真路径，两条路
+        在基类汇合。跨请求合批那条入口不需要这道门：这条 runner 的 `supports_batch` 是 False、
+        `batch_limit` 是 1，引擎据此既不攒批、也不把单条送进批路。
         """
-        if media is None and request.media:
-            return self._answers_with_images(request, mode)
-        return self._answers(request, mode, media)
-
-    def _answers(
-        self, request: DecisionRequest, mode: MaskMode, media: object | None
-    ) -> tuple[tuple[Answer, ...], int, float]:
-        chain = self._require_chain()
         if mode not in _SUPPORTED_MODES:
             raise UnsupportedModeError(
                 "h2o 只有 causal / noncausal_full 两种读法",
@@ -166,65 +181,74 @@ class PooledRunner(VisionRunner, DecisionRunner):
                 strategy="pooled",
                 supported=sorted(item.value for item in _SUPPORTED_MODES),
             )
-        causal = mode is MaskMode.CAUSAL
-        started = time.perf_counter()
-        answers: list[Answer] = []
-        tokens = 0
-        images = 0 if media is None else int(media.images)
-        if images and self._image_token is None:
-            raise UnsupportedMediaError("这个模型没有视觉塔，收不了图", images=images)
-        if media is not None:
-            # 带图请求不共享也不合批；记一笔，否则"图一多，优化就静默失效"看不出来。
-            self.decisions.media_skip += 1
-        if causal and len(request.questions) > 1:
-            # 因果读法下 state 前缀只算一遍是成立的，但这条 runner 还没接共享前缀（Stage 3）：
-            # 记 miss，否则"h2o 的 4–5 题请求全在重算同一个 state"在 /metrics 里看不见。
-            self.decisions.shared_miss += 1
-        for index, question in enumerate(request.questions):
-            prepared = self._serve.prepare(request.state, question_spec(question),
-                                           images=images)
-            ids, placement = prepared.ids, None
-            if media is not None:
-                # 与 mude 同一条路：厂商给的 prompt 里一张图一个占位符，展开与定位都在合流里。
-                ids, placement = merge.attach(prepared.ids, media,
-                                              image_token_id=self._image_token)
-            if len(ids) > self._max_len:
-                raise RequestTooLongError(
-                    "prompt 超过链的缓冲宽度",
-                    length=len(ids),
-                    max_len=self._max_len,
-                    question=index,
-                )
-            answers.append(self._answer(chain, prepared, question, causal, index,
-                                        ids=ids, mm=placement))
-            tokens += len(ids)
-        return tuple(answers), tokens, time.perf_counter() - started
+        return super().answers_for(request, mode, media=media)
 
-    def _answer(
-        self,
-        chain: PooledChain,
-        prepared: Prepared,
-        question: Question,
-        causal: bool,
-        index: int,
-        *,
-        ids: Sequence[int] | None = None,
-        mm: object | None = None,
-    ) -> Answer:
-        # 读出只取最后一行的**最终归一化** hidden（厂商 `last_hidden_state` 就是它，见
-        # `Qwen3_5TextModel.forward` 末尾的 `self.norm`），再点积标签那几行词表权重。
-        # 链只读回这一行：整段读回 + 归一在 16k 上是 87 ms，末行 0.02 ms，而这里只需要末行。
-        logits = self._rows(prepared.label_ids) @ chain.last_hidden(
-            prepared.ids if ids is None else ids, causal=causal, mm=mm)
+    # ------------------------------------------------------------------ 原语
+    def encode(self, state: str, question: Question, *, images: int = 0) -> Encoded:
+        """题面 → 整条 prompt 与读出要的全部东西（厂商答面渲染的那一半）。
+
+        `prefix_len=None`：厂商答面给不出"state 在哪结束"的词元边界，所以共享前缀由基类用
+        公共前缀（LCP）判。那只对因果共享成立，而这条装配只有 causal / 全双向两种读法
+        （全双向不共享），所以这里没有第二种切法要担心。
+
+        `payload` 带厂商的 `Prepared`：答案不是"取最大概率的那个码"，而是厂商按题型判的
+        （温度、noul 的地板与阈值、score 的期望值），这些量只有 `Prepared` 里有。
+        """
+        prepared = self._serve.prepare(state, question_spec(question), images=images)
+        return Encoded(
+            ids=prepared.ids,
+            prefix_len=None,
+            labels=prepared.labels,
+            indexes=prepared.label_ids,
+            payload=prepared,
+        )
+
+    def forward(self, encoded: Encoded, *, prefix: int, causal: bool = False,
+                mm: object | None = None) -> np.ndarray:
+        """单题一整趟：链只交最后一条 token 的最终归一化 hidden（不整段读回）。
+
+        `prefix` 是 `prefix_noncausal` 的公共前缀长度；这条装配没有那个读法，基类按 0 传。
+        """
+        return self._require_chain().last_hidden(
+            encoded.ids, prefix=prefix, causal=causal, mm=mm)
+
+    def forward_shared(self, prefix: Sequence[int], tails: Sequence[Sequence[int]],
+                       *, options: Sequence[int], causal: bool = False,
+                       mm: object | None = None) -> Sequence[np.ndarray]:
+        """前缀 + 每条尾巴一次前向：链给每题一份末行 hidden。
+
+        `options` 只服务码表类的读出（"读前 n 个码"）；这里的候选集是标签行，由 `answer`
+        按 `encoded.indexes` 取，所以不用它 —— 但它是基类的原语契约，得收下。
+        """
+        chain = self._require_chain()
+        return chain.last_hidden_shared(  # type: ignore[attr-defined]
+            prefix, tails, causal=causal, mm=mm)
+
+    def answer(self, encoded: Encoded, raw: object, *, index: int, kind: str) -> Answer:
+        """末行 hidden × 标签行 → logits → 厂商判答案。
+
+        点积只算标签那几行（不是整张码表）：整段读回 + 归一在 16k 上是 87 ms，末行 0.02 ms，
+        而这里只需要这一行。概率**不在这里归一化**：厂商按题型换温度、noul 有地板与阈值，
+        我们归一化一次再交过去就成了两套温度。
+        """
+        prepared = encoded.payload
+        if not isinstance(prepared, Prepared):
+            raise ConfigError(
+                "pooled 的读出载体不是厂商答面（编码与读出不是同一条路）", kind=kind)
+        logits = self._rows(encoded.indexes) @ np.asarray(raw, dtype=np.float32)
         value, labels, probs = self._serve.answer(prepared, logits)
         return Answer(
             question_index=index,
-            kind=question.kind,
+            kind=kind,
             value=value,
             probs=tuple(probs),
             labels=tuple(labels),
             confidence=max(probs) if probs else 0.0,
         )
+
+    def _require_ready(self) -> None:
+        """基类在编码之前调它：没装权重就当场 `ConfigError`，别先记一笔不会发生的 miss。"""
+        self._require_chain()
 
     def _require_chain(self) -> PooledChain:
         if self._chain is None:

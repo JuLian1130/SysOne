@@ -228,6 +228,16 @@ class SplitChain:
         """GPU 缓冲的列数（一次前向最多能吃多少 token）。"""
         return self._width
 
+    @property
+    def can_share_prefix(self) -> bool:
+        """这条链有没有"前缀只算一遍"的落脚点：要零拷贝流水线（numpy 链没有）。
+
+        `forward_shared` / `last_hidden_shared` 在任何 `SplitChain` 实例上都有这个名字，但
+        numpy 形态没有前缀 K/V 的存贮，调用会抛 `ValueError`。策略层按这条问能力，而不是按
+        "有没有这个方法"问：声明了却调不到是一条 500，退回串行只是一次没有收益的前向。
+        """
+        return self._pipeline is not None
+
     # ------------------------------------------------------------------ 装载耗时
 
     @property
@@ -661,11 +671,19 @@ class SplitChain:
         logits = self.logits_shared(prefix, tails, causal=causal, mm=mm)
         return [self._probabilities(row, int(count)) for row, count in zip(logits, options)]
 
-    def logits_shared(
+    def last_hidden_shared(
         self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, causal: bool = False,
         mm: object | None = None,
     ) -> list[np.ndarray]:
-        """共享前缀的整条前向：返回每题的 `[rows]` 原始 logits（未除温度）。"""
+        """共享前缀的末行 hidden：前缀一遍，每题只跑自己那条尾巴。
+
+        `last_hidden()` 的"一请求多题"版本：返回每题最后一条 token 的**最终归一化** hidden
+        （`[hidden]` fp32）。数学上与"每题各自整趟"的 `last_hidden()` 等价，数值差落在共享
+        槽的 ulp 量级（见 `Pipeline.run_shared`）。
+
+        没有码表读出的模型（h2o 的 pooled）走这条出口：它的读出是"标签行 × hidden"，那一步
+        在策略层（它才拿得到厂商的读出形态），链只该交 hidden。
+        """
         if self._pipeline is None:
             raise ValueError("共享前缀只有 Metal 链提供（load 时用 metal=True）")
         ids = np.asarray(prefix, dtype=np.int64).reshape(-1)
@@ -696,11 +714,16 @@ class SplitChain:
             [self._embeddings(tail, rest) for tail in rows],
             prefix=length, causal=causal,
         )
-        out: list[np.ndarray] = []
-        for row in hidden:
-            final = rms_norm(row[None, :], self._final_norm)[0]
-            out.append(self._require_readout() @ final)
-        return out
+        return [rms_norm(row[None, :], self._final_norm)[0] for row in hidden]
+
+    def logits_shared(
+        self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, causal: bool = False,
+        mm: object | None = None,
+    ) -> list[np.ndarray]:
+        """共享前缀的整条前向：返回每题的 `[rows]` 原始 logits（未除温度）。"""
+        readout = self._require_readout()
+        return [readout @ row
+                for row in self.last_hidden_shared(prefix, tails, causal=causal, mm=mm)]
 
     def _require_readout(self) -> np.ndarray:
         """码表读出；没有就明确报错（`pooled` 读出还没接，见 `_readout`）。"""

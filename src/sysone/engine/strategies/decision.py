@@ -56,12 +56,18 @@ class Encoded:
     `labels` / `indexes` 是读出要用的两样东西（mude 是码表里的码与选项序号，h2o 是答面标签
     与它们在 logits 里的位置）。词表行之类的 runner 私有事实不进这里：它们是读出形态的一部分，
     由各 runner 自己带着。
+
+    `payload` 是**执行器私有的读出载体**。有码表的链（mude）用不上：`labels` / `indexes`
+    就够读出。没有码表的链（h2o 的 pooled）要把厂商答面给出的 `Prepared` 带到 `answer` ——
+    温度、noul 的地板与阈值、score 的期望值都在那里，`indexes` 只装得下标签 id。基类不碰
+    它、也不认识它的类型：这里只是"编码"到"读出"之间搭的一趟便车。
     """
 
     ids: tuple[int, ...]
     prefix_len: int | None
     labels: tuple[str, ...]
     indexes: tuple[int, ...]
+    payload: object | None = None
 
 
 def shared_prefix(encoded: Sequence[Encoded]) -> tuple[int, ...] | None:
