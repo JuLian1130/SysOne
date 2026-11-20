@@ -34,6 +34,7 @@ from ...errors import (
 from ...models.vision import merge
 from ...models.vendors.base import question_spec
 from ...models.vendors.h2o_serve import Prepared, Serve
+from .decision import DecisionRunner
 from .vision import VisionRunner
 
 # h2o 训练过两种读法、也只声明了两种：整段因果，或整段双向（没有 prefix 语义）。
@@ -52,12 +53,18 @@ class PooledChain(Protocol):
     def close(self) -> None: ...
 
 
-class PooledRunner(VisionRunner):
+class PooledRunner(VisionRunner, DecisionRunner):
     """实现 `ModelRunner` 的 pooled 路径：一题一次整链前向 + 一次标签行读出。
 
     `rows` 把"标签 token id"换成"词表里的那几行"（tied 模型上就是 `embed_tokens`），由调用
     方注入：设备层不加一个只为这份 checkpoint 存在的读出方式，链也不需要认识 tokenizer。
     """
+
+    # 只有逐题的 `last_hidden`：没有共享前缀原语（Stage 3 才接 `forward_shared` 与
+    # `last_hidden_shared`），也没有跨请求合批（Stage 4 才评估）。能力位显式写出来，
+    # 免得读的人以为"没声明"和"想过了、不做"是一回事。
+    supports_shared = False
+    supports_batch = False
 
     def __init__(
         self,
@@ -166,6 +173,13 @@ class PooledRunner(VisionRunner):
         images = 0 if media is None else int(media.images)
         if images and self._image_token is None:
             raise UnsupportedMediaError("这个模型没有视觉塔，收不了图", images=images)
+        if media is not None:
+            # 带图请求不共享也不合批；记一笔，否则"图一多，优化就静默失效"看不出来。
+            self.decisions.media_skip += 1
+        if causal and len(request.questions) > 1:
+            # 因果读法下 state 前缀只算一遍是成立的，但这条 runner 还没接共享前缀（Stage 3）：
+            # 记 miss，否则"h2o 的 4–5 题请求全在重算同一个 state"在 /metrics 里看不见。
+            self.decisions.shared_miss += 1
         for index, question in enumerate(request.questions):
             prepared = self._serve.prepare(request.state, question_spec(question),
                                            images=images)

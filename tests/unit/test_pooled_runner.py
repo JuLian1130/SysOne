@@ -152,3 +152,32 @@ def test_answers_are_per_question_with_the_vendor_ordering():
     assert [answer.question_index for answer in answers] == [0, 1]
     assert all(answer.kind == "choice" for answer in answers)
     assert len(subject._chain.calls) == 2
+
+
+# ----------------------------------------------------------------- 共享的账
+
+
+def test_a_causal_request_with_two_questions_is_counted_as_a_shared_miss():
+    """h2o 今天逐题整趟：因果下"一次 state + 多题"本可以共享，但这条 runner 还没接（Stage 3）。
+
+    这个 miss 是 Stage 3 的立项依据 —— 真实评测流量 34 条请求全是 4–5 题，理想共享比是
+    3.8–3.9×；不记的话 `/metrics` 里只看到"跑得慢"，看不到"本来能快"。
+    """
+    subject = runner()
+    subject.answers_for(make_request(questions=2), MaskMode.CAUSAL)
+    stats = subject.decision_stats()
+    assert stats["shared_miss"] == 1 and stats["shared_hit"] == 0
+    assert stats["supports_shared"] is False and stats["supports_batch"] is False
+
+
+def test_noncausal_full_has_no_prefix_to_share_so_no_miss():
+    """双向前向里前缀行与题面耦合：那不是"漏做共享"，是没这个语义。"""
+    subject = runner()
+    subject.answers_for(make_request(questions=2), MaskMode.NONCAUSAL_FULL)
+    assert subject.decisions.shared_miss == 0
+
+
+def test_a_lone_question_is_not_a_miss():
+    subject = runner()
+    subject.answers_for(make_request(questions=1), MaskMode.CAUSAL)
+    assert subject.decisions.shared_miss == 0

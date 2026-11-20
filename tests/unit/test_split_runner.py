@@ -19,6 +19,7 @@ from sysone.domain.attention import MaskMode
 from sysone.domain.decision import Question
 from sysone.domain.work import CompilationTimes
 from sysone.engine.engine import Engine
+from sysone.engine.strategies.decision import DecisionMetrics
 from sysone.engine.strategies.split import SplitRunner
 from sysone.errors import (
     ConfigError,
@@ -583,6 +584,127 @@ def test_the_shared_path_gives_the_same_answers_and_usage() -> None:
     assert shared[1] == serial[1]
 
 
+def test_the_engine_hands_the_runner_decision_stats_to_metrics() -> None:
+    """`/metrics` 的 `decision` 一栏由执行器给：Engine 只转交，不改数字。"""
+    chain = SharedChain()
+    engine = _engine(chain)
+    engine.start()
+    engine.run(make_request(questions=2))
+    stats = engine.decision_stats()
+    assert stats is not None and stats["supports_shared"] is True
+    # 两题一起走批那条路（`Engine.run` 对 `batch_limit > 1` 的单条也走批），共用前缀。
+    assert stats["batch_hit"] == 1
+
+
+# ---------------------------------------------------------------------- 计数
+
+
+def test_the_shared_path_is_counted_as_a_hit() -> None:
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2), MaskMode.PREFIX_NONCAUSAL)
+    stats = runner.decision_stats()
+    assert stats["shared_hit"] == 1 and stats["shared_miss"] == 0
+    # 能力位问的是"这条链上有没有那条原语"：这条替身只有 `forward_shared`，没有块对角那条。
+    assert stats["supports_shared"] is True and stats["supports_batch"] is False
+
+
+def test_a_lone_question_is_neither_a_hit_nor_a_miss() -> None:
+    """单题没有"与谁共享"这件事：记成 miss 会把最常见的负载涂成失败。"""
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=1), MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.shared_hit == 0 and runner.decisions.shared_miss == 0
+
+
+def test_a_different_prefix_per_question_is_counted_as_a_miss() -> None:
+    chain = SharedChain()
+    labels = ("甲", "乙")
+    plans = [((10, 11, 12, 13), 2, labels, (0, 1)), ((10, 99, 12, 13), 2, labels, (0, 1))]
+    runner = _forced_runner(plans, chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2), MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.shared_miss == 1 and runner.decisions.shared_hit == 0
+
+
+def test_noncausal_full_has_no_shared_opportunity_to_miss() -> None:
+    """双向前向里前缀行与题面耦合，本来就不能复用：那是"没这个语义"，不是"漏做了"。"""
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2, mode=MaskMode.NONCAUSAL_FULL),
+                       MaskMode.NONCAUSAL_FULL)
+    assert runner.decisions.shared_miss == 0
+
+
+def test_an_over_long_prompt_is_refused_before_the_counters_move() -> None:
+    """超长是 422：编码那一关没过，共享的账就不该动。"""
+    chain = SharedChain()
+    runner = _runner(chain, max_len=8)
+    runner.load_weights()
+    with pytest.raises(RequestTooLongError):
+        runner.answers_for(make_request(questions=2), MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.snapshot() == DecisionMetrics().snapshot()
+
+
+class TiledChain(SharedChain):
+    """再补一条块对角原语与桶宽：`_batchable` 认的就是 `bucket` / `width` 两个属性。"""
+
+    bucket = 512
+    width = 2048
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[tuple[tuple[int, ...], ...]] = []
+        self.prefixes: tuple[int, ...] | None = None
+
+    def forward_batched(self, sequences, *, options, prefixes, causal=False):
+        self.rows.append(tuple(tuple(sequence) for sequence in sequences))
+        self.prefixes = tuple(int(value) for value in prefixes)
+        return [[1.0 / int(count)] * int(count) for count in options]
+
+
+def test_two_requests_that_share_a_prefix_count_as_a_batch_hit() -> None:
+    chain = TiledChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    request = make_request(questions=1)
+    runner.answers_batch([request, request], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.batch_hit == 1
+    assert chain.rows == [], "同前缀该走共享，不该走块对角"
+    assert runner.supports_shared and runner.supports_batch, "这条链两条原语都有"
+
+
+def test_two_independent_requests_tile_into_one_pass_and_count_as_a_hit() -> None:
+    chain = TiledChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_batch([make_request(questions=1, state="甲"),
+                          make_request(questions=1, state="乙")], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.batch_hit == 1 and len(chain.rows) == 1
+
+
+def test_a_batch_that_cannot_share_nor_tile_counts_as_a_fallback() -> None:
+    """两条不同 state 的请求，链却没有块对角原语：退回逐题 —— 以前这件事没有计数。"""
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_batch([make_request(questions=1, state="甲"),
+                          make_request(questions=1, state="乙")], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.batch_fallback == 1 and runner.decisions.batch_hit == 0
+
+
+def test_a_single_sequence_through_the_batch_route_counts_as_a_miss() -> None:
+    """引擎把单条也送进这条路（`Engine.run` 的"免得两条代码路"），它没有可合的东西。"""
+    chain = SharedChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_batch([make_request(questions=1)], MaskMode.PREFIX_NONCAUSAL)
+    assert runner.decisions.batch_miss == 1 and runner.decisions.batch_hit == 0
+
+
 def test_images_are_refused_by_a_model_without_a_tower() -> None:
     """没有视觉塔的装配收到图：当场拒（422 那一类），不能变成"占位符数不对"的裸 ValueError。"""
     chain = FakeChain()
@@ -660,6 +782,7 @@ def test_request_images_go_through_the_slot_and_are_released_afterwards() -> Non
     assert slot.calls == [(request.media[0],)], "slot 拿到的应当就是请求里那些图"
     assert slot.finished == 1, "一次请求结束要调 finish（idle = 0 时那就是卸载点）"
     assert chain.calls, "带图的请求照样要前向"
+    assert runner.decisions.media_skip == 1, "带图请求不进共享/合批，要记这一笔"
 
 
 def test_shutdown_closes_the_tower_before_the_chain() -> None:
@@ -717,3 +840,14 @@ def _with_media(request, *, data: bytes = b"\x89PNG\r\n\x1a\n"):
     from sysone.domain.decision import MediaRef
 
     return dataclasses.replace(request, media=(MediaRef(kind="image", data=data),))
+
+
+def test_a_chain_without_the_primitive_is_declared_incapable_and_runs_serially() -> None:
+    """能力位说真话：链上没有 `forward_shared` 就报 False，多题退回逐题而不是报错。"""
+    chain = FakeChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2), MaskMode.PREFIX_NONCAUSAL)
+    assert len(chain.calls) == 2, "没有共享原语就逐题整趟"
+    assert runner.decisions.shared_miss == 1, "机会在、能力不在：这一笔是 Stage 3 的立项依据"
+    assert runner.decision_stats()["supports_shared"] is False

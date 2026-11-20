@@ -272,6 +272,17 @@ class Engine:
             return {"available": False}
         return dict(stats())
 
+    def decision_stats(self) -> dict[str, object] | None:
+        """`/metrics` 的 `decision` 一栏：执行器认不认识共享/合批，以及今天各命中多少。
+
+        不认这条契约的执行器（reference / 替身）回 `None`：`/metrics` 里就是空，而不是替它
+        伪造一排 0 —— 那些 0 读起来像"测过了，没有机会"。
+        """
+        stats = getattr(self._runner, "decision_stats", None)
+        if not callable(stats):
+            return None
+        return dict(stats())
+
     def stats(self) -> RunStats:
         return RunStats(
             request=RequestStats(

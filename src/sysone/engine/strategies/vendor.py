@@ -13,10 +13,16 @@ from ...domain.decision import Answer, DecisionRequest
 from ...domain.work import CompilationTimes
 from ...errors import ConfigError, UnsupportedModeError
 from ...models.vendors.base import VendorBridge, question_spec
+from .decision import DecisionRunner
 
 
-class VendorRunner:
-    """实现 ModelRunner 的厂商路径：不排 MaskPlan，一题一次厂商前向。"""
+class VendorRunner(DecisionRunner):
+    """实现 ModelRunner 的厂商路径：不排 MaskPlan，一题一次厂商前向。
+
+    厂商桥不透明：模板、前向、读出都在厂商代码里，我们连"多题是不是同一个 state 前缀"都
+    看不见。所以两条能力位保持 False、永远串行，也**不记**共享/合批的 miss —— 那些数字会
+    永远不动，读的人会以为有机会没做。
+    """
 
     def __init__(self, bridge: VendorBridge) -> None:
         self._bridge = bridge

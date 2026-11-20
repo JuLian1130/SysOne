@@ -15,16 +15,14 @@ from typing import Callable, Protocol, Sequence
 from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest, Question
 from ...domain.work import CompilationTimes
+from .decision import DecisionRunner, Encoded, shared_prefix
 from .vision import VisionRunner
 from ...errors import (
     ConfigError,
     NotReadyError,
     ReadoutError,
-    RequestTooLongError,
-    UnsupportedMediaError,
     UnsupportedModeError,
 )
-from ...models.vision import merge
 
 # 三种模式这条链都能表达：双向（`prefix_noncausal` 的前缀窗 + `noncausal_full` 的全可见）
 # 与三角（`causal`，M3 的核改动）。声明在这里而不在 descriptor 里：descriptor 说模型能跑
@@ -65,8 +63,12 @@ class Prompter(Protocol):
     ) -> tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]: ...
 
 
-class SplitRunner(VisionRunner):
-    """实现 `ModelRunner` 的 split 路径：一题一次整链前向。
+class SplitRunner(VisionRunner, DecisionRunner):
+    """实现 `ModelRunner` 的 split 路径：投影/FFN 走 ANE program、注意力/GDN 走 Metal。
+
+    **它不再自己编排**：一题一次整链前向还是"前缀一次 + 每条尾巴一次"由基类
+    （`DecisionRunner._answers`）按前缀与能力位决定，这里只提供四个原语 —— `encode`
+    （复用 `MudePrompter`）、`forward`、`forward_shared`、`answer`（码表读出）。
 
     `load_chain` 延迟到 `load_weights()` 才调用，所以构造它不碰 ANE；`max_len` 是链的
     缓冲宽度（prompt 超过它就是 422，而不是让链里抛裸 `ValueError`）。
@@ -76,6 +78,19 @@ class SplitRunner(VisionRunner):
     所以它必须等到 `load_weights()` 之后才能调。`None` 表示这条装配不做图（`--vision off`，
     或者模型本身没有塔）。
     """
+
+    # 能力按**这条链上有没有那条原语**问，而不是无条件声明：`ModelChain` 的协议只要求
+    # `forward` / `close`，替身链与将来的 numpy 路径都可能没有 `forward_shared`。声明了却调不到
+    # 是一条 500，退回串行只是一次没有收益的前向。
+    # 声明也不等于每次都走：前缀不同、单题、`noncausal_full` 都走逐题（见基类的 `_answers`）。
+
+    @property
+    def supports_shared(self) -> bool:
+        return callable(getattr(self._chain, "forward_shared", None))
+
+    @property
+    def supports_batch(self) -> bool:
+        return callable(getattr(self._chain, "forward_batched", None))
 
     def __init__(
         self,
@@ -139,85 +154,45 @@ class SplitRunner(VisionRunner):
             self._chain = None
         self._warm_ok = False
 
-    # ------------------------------------------------------------------ 前向
+    # ------------------------------------------------------------------ 原语
 
-    def answers_for(
-        self, request: DecisionRequest, mode: MaskMode, *, media: object | None = None
-    ) -> tuple[tuple[Answer, ...], int, float]:
-        """一次请求内的所有题：返回 (答案元组, 输入 token 数, 前向耗时)。
+    def encode(self, state: str, question: Question, *, images: int = 0) -> Encoded:
+        """题面 → 整条 prompt / 前缀边界 / 读出标签与位置（复用家族的 `MudePrompter`）。
 
-        `media` 是给门与替身用的旁路：给了就原样用。**请求自带的图**（`request.media`）在这里
-        走真路径 —— 解码、像素管线、塔、`Media` —— 然后与 `media=` 那条路汇合。两条都在
-        同一个 `finally` 里释放塔（`idle = 0` 时"每请求后即卸"就是靠它）。
+        `images` 是这道题里的图数：一张图在题面里仍只占一个占位符，展开在基类
+        （`DecisionRunner.encode_request`）里做，因为"一图多占位"是协议层的事实，不是模型特征。
         """
-        if media is None and request.media:
-            return self._answers_with_images(request, mode)
-        return self._answers(request, mode, media)
+        sequence, prefix_len, labels, indexes = self._prompter.encode(
+            state, question, images=images)
+        return Encoded(ids=sequence, prefix_len=prefix_len, labels=labels, indexes=indexes)
 
-    def _answers(
-        self, request: DecisionRequest, mode: MaskMode, media: object | None
-    ) -> tuple[tuple[Answer, ...], int, float]:
+    def forward(self, encoded: Encoded, *, prefix: int, causal: bool = False,
+                mm: object | None = None) -> Sequence[float]:
+        """单题一整趟：链给出该题的候选概率。"""
+        return self._require_chain().forward(
+            encoded.ids, options=len(encoded.labels), prefix=prefix, causal=causal, mm=mm)
+
+    def forward_shared(self, prefix: Sequence[int], tails: Sequence[Sequence[int]],
+                       *, options: Sequence[int], causal: bool = False,
+                       mm: object | None = None) -> Sequence[Sequence[float]]:
+        """前缀 + 每条尾巴一次前向：链给出每题一份候选概率。"""
         chain = self._require_chain()
-        if mode not in _SUPPORTED_MODES:
-            raise UnsupportedModeError(
-                "mude 链没有这个掩码",
-                mode=mode.value,
-                strategy="split",
-                supported=sorted(item.value for item in _SUPPORTED_MODES),
-            )
-        # `noncausal_full` 就是把前缀当 0：掩码 `(q >= 0) | (k < 0)` 恒真。
-        # `causal` 的共享前缀照样成立：前缀行的掩码在相内自己成三角，尾巴行看 `[0, q]` 包含
-        # 整个前缀 —— 两条路（共享 / 逐题）的可见集合一样，所以批尾巴的槽位规则也不用改。
-        causal = mode is MaskMode.CAUSAL
-        use_prefix = mode is not MaskMode.NONCAUSAL_FULL
-        started = time.perf_counter()
-        images = 0 if media is None else int(media.images)
-        if images and self._image_token is None:
-            # 图块没有 token id 的模型（纯文本装配）收到图：这是**请求**的问题，不是我们的配置
-            # 坏了 —— 客户端据此知道不要重试。前门会先用 `image_contract()` 拒一次，这里是最后
-            # 一道，不能让 `image_token_id=None` 变成一个诡异的"占位符数不对"。
-            raise UnsupportedMediaError("这个模型没有视觉塔，收不了图", images=images)
-        # 先把所有题编码完：共享前缀要先知道每题的尾巴，长度检查也按整条 prompt 做。
-        encoded: list[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]] = []
-        for index, question in enumerate(request.questions):
-            encoded.append(self._prompter.encode(request.state, question, images=images))
-            if len(encoded[-1][0]) > self._max_len:
-                raise RequestTooLongError(
-                    "prompt 超过链的缓冲宽度",
-                    length=len(encoded[-1][0]),
-                    max_len=self._max_len,
-                    question=index,
-                )
-        # 展开在**编码之后**：一张图一个占位符 → `counts[i]` 个，图块的起点要等前面那些图
-        # 各自展开了多少才知道（所以是 span，不是一个偏移）。展开之后长度才是真的，所以
-        # 越界检查放在展开之后。
-        placements: list[object] = []
-        if media is not None:
-            placed: list[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]] = []
-            for index, (sequence, prefix_len, labels, indexes) in enumerate(encoded):
-                expanded, placement = merge.attach(sequence, media,
-                                                   image_token_id=self._image_token)
-                if len(expanded) > self._max_len:
-                    raise RequestTooLongError(
-                        "展开图像占位符之后超过链的缓冲宽度",
-                        length=len(expanded), max_len=self._max_len, question=index)
-                # 前缀里也有图块，所以前缀长度要跟着展开（`_prefix_ids` 量的是未展开的那串）。
-                prefix_ids, _ = merge.expand_image_tokens(
-                    sequence[:prefix_len], media.counts, image_token_id=self._image_token)
-                placed.append((tuple(expanded), len(prefix_ids), labels, indexes))
-                placements.append(placement)
-            encoded = placed
-        shared = _shared_prefix(encoded) if use_prefix else None
-        forward_shared = getattr(chain, "forward_shared", None)
-        mm = placements[0] if placements else None
-        if shared is not None and len(encoded) > 1 and callable(forward_shared):
-            answers = _answer_shared(forward_shared, shared, encoded,
-                                     [item.kind for item in request.questions], causal, mm=mm)
-        else:
-            answers = _answer_serial(chain, encoded, use_prefix,
-                                     [item.kind for item in request.questions], causal, mm=mm)
-        tokens = sum(len(sequence) for sequence, *_ in encoded)
-        return tuple(answers), tokens, time.perf_counter() - started
+        return chain.forward_shared(  # type: ignore[attr-defined]
+            prefix, tails, options=options, causal=causal, mm=mm)
+
+    def answer(self, encoded: Encoded, raw: object, *, index: int, kind: str) -> Answer:
+        """概率 → `Answer`：按标签序号取候选，最大的那一项胜出（码表读出的形状）。"""
+        shares = self._shares(raw)
+        values = tuple(shares[position] for position in encoded.indexes)
+        best = max(range(len(values)), key=values.__getitem__)
+        return Answer(
+            question_index=index,
+            kind=kind,
+            value=encoded.labels[best],
+            probs=values,
+            labels=encoded.labels,
+            confidence=values[best],
+        )
 
     def answers_batch(
         self, requests: Sequence[DecisionRequest], mode: MaskMode
@@ -226,7 +201,7 @@ class SplitRunner(VisionRunner):
 
         合成一个 pass 有两条路：**前缀相同**（决策负载里就是"同一个 state、不同的问题"）走
         `forward_shared` 批尾巴；**前缀不同**走块对角（一条序列一个槽，每行只看自己那一槽）。
-        两条都拿不到才退回逐题整趟（`_answer_serial`），结果与逐条调用**逐位相同** ——
+        两条都拿不到才退回逐题整趟（基类的 `serial_answers`），结果与逐条调用**逐位相同** ——
         这只是没有收益，不是另一种答案。
 
         收益按**瓦片数**算，不按列：program 的静态宽度就是桶宽，一格（一片瓦片）里放 118 列
@@ -255,38 +230,38 @@ class SplitRunner(VisionRunner):
         causal = mode is MaskMode.CAUSAL
         use_prefix = mode is not MaskMode.NONCAUSAL_FULL
         started = time.perf_counter()
-        encoded: list[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]] = []
+        # 编码、长度检查与"一图多占位"的展开都在基类（批里没有图，所以落点一定是空的）。
+        encoded: list[Encoded] = []
         kinds: list[str] = []
         # 每条请求的题在扁平列表里的区间，用来把答案切回去。
         spans: list[tuple[int, int]] = []
         for request in requests:
             first = len(encoded)
-            for index, question in enumerate(request.questions):
-                encoded.append(self._prompter.encode(request.state, question, images=0))
-                if len(encoded[-1][0]) > self._max_len:
-                    raise RequestTooLongError(
-                        "prompt 超过链的缓冲宽度",
-                        length=len(encoded[-1][0]),
-                        max_len=self._max_len,
-                        question=index,
-                    )
-                kinds.append(question.kind)
+            own, _ = self.encode_request(request, None)
+            encoded.extend(own)
+            kinds.extend(question.kind for question in request.questions)
             spans.append((first, len(encoded)))
-        shared = _shared_prefix(encoded) if use_prefix else None
-        forward_shared = getattr(chain, "forward_shared", None)
+        shared = shared_prefix(encoded) if use_prefix else None
         forward_batched = getattr(chain, "forward_batched", None)
-        if shared is not None and len(encoded) > 1 and callable(forward_shared):
-            answers = _answer_shared(forward_shared, shared, encoded, kinds, causal)
+        if shared is not None and len(encoded) > 1 and self.supports_shared:
+            self.decisions.batch_hit += 1
+            answers = self.shared_answers(shared, encoded, kinds, causal=causal)
         elif len(encoded) > 1 and callable(forward_batched) and _batchable(encoded, chain):
             # 没有共享前缀（不同 state 的独立请求）时走块对角：每条序列一个瓦片、互不可见。
+            self.decisions.batch_hit += 1
             answers = _answer_independent(forward_batched, encoded, kinds, causal)
         else:
-            answers = _answer_serial(chain, encoded, use_prefix, kinds, causal)
+            # 一条序列（引擎把单条也送进这条路）没有可合的东西；≥2 条才是有机会却没合上。
+            if len(encoded) > 1:
+                self.decisions.batch_fallback += 1
+            else:
+                self.decisions.batch_miss += 1
+            answers = self.serial_answers(encoded, kinds, use_prefix=use_prefix, causal=causal)
         elapsed = time.perf_counter() - started
         out: list[tuple[tuple[Answer, ...], int, float]] = []
         for request, (first, last) in zip(requests, spans):
             own = tuple(answers[first:last])
-            tokens = sum(len(encoded[index][0]) for index in range(first, last))
+            tokens = sum(len(encoded[index].ids) for index in range(first, last))
             out.append((own, tokens, elapsed))
         return out
 
@@ -301,6 +276,10 @@ class SplitRunner(VisionRunner):
         if abs(sum(answer.probs) - 1.0) > 1e-3:
             raise NotReadyError("split 预热前向概率未归一", strategy="split", total=sum(answer.probs))
         self._warm_ok = True
+
+    def _require_ready(self) -> None:
+        """基类在编码之前调它：没装权重就当场 `ConfigError`，别先记一笔不会发生的 miss。"""
+        self._require_chain()
 
     def _require_chain(self) -> ModelChain:
         if self._chain is None:
@@ -320,57 +299,8 @@ class SplitRunner(VisionRunner):
         return values
 
 
-def _shared_prefix(
-    encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
-) -> tuple[int, ...] | None:
-    """所有题共用同一条前缀时返回它，否则 `None`。
-
-    前缀只由 `state` 决定（`MudePrompter` 按 state 缓存它），所以一次请求里天然一致；仍然
-    逐题比对：分词边界可能把某题的尾巴和前缀粘成一个 token，那时 `prefix_len` 或前缀内容
-    就不一样，不能复用（复用会改变那一题的数值）。
-    """
-    length = encoded[0][1]
-    if length <= 0:
-        return None
-    prefix = encoded[0][0][:length]
-    for sequence, prefix_len, _, _ in encoded[1:]:
-        if prefix_len != length or sequence[:length] != prefix:
-            return None
-    return prefix
-
-
-def _answer_shared(
-    forward_shared: Callable[..., Sequence[object]],
-    prefix: tuple[int, ...],
-    encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
-    kinds: Sequence[str],
-    causal: bool = False,
-    mm: object | None = None,
-) -> list[Answer]:
-    """共享前缀的一条路：`prefix` + 每题的尾巴，一次调用拿到所有题的概率。"""
-    tails = [sequence[len(prefix):] for sequence, *_ in encoded]
-    options = [len(labels) for _, _, labels, _ in encoded]
-    raw = forward_shared(prefix, tails, options=options, causal=causal, mm=mm)
-    answers: list[Answer] = []
-    for index, (_, _, labels, indexes) in enumerate(encoded):
-        probs = SplitRunner._shares(raw[index])
-        values = tuple(probs[item] for item in indexes)
-        best = max(range(len(values)), key=values.__getitem__)
-        answers.append(
-            Answer(
-                question_index=index,
-                kind=kinds[index],
-                value=labels[best],
-                probs=values,
-                labels=labels,
-                confidence=values[best],
-            )
-        )
-    return answers
-
-
 def _batchable(
-    encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
+    encoded: Sequence[Encoded],
     chain: object,
 ) -> bool:
     """这批能不能走块对角合批：每条序列 ≤ 桶宽、总列数 ≤ 缓冲宽度。
@@ -378,15 +308,15 @@ def _batchable(
     判据与 `Pipeline.run_batched` 的入参约束一致；这里先判一次是为了**静默退回逐条**而不是
     让一次超长的合批在流水线里抛异常。
 
-    **这个退回没有计数器**，`metrics()` 里也读不到，只能从墙时看出来。这不是小毛病：生产默认
-    `bucket = 1024`，而票据 07 §7.25p 量到的真实决策 prompt 是 1–2k —— 超过 1024 的那一半一律
-    退成逐条，"批处理已开"在它们身上等于没开（实测 1.02×）。
+    退回现在记在 `DecisionMetrics.batch_fallback` 里：以前它没有任何计数，只能从墙时看出来。
+    这不是小毛病 —— 生产默认 `bucket = 1024`，而票据 07 §7.25p 量到的真实决策 prompt 是
+    1–2k，超过 1024 的那一半一律退成逐条，"批处理已开"在它们身上等于没开（实测 1.02×）。
     """
     bucket = int(getattr(chain, "bucket", 0) or 0)
     width = int(getattr(chain, "width", 0) or 0)
     if bucket <= 0 or width <= 0:
         return False
-    lengths = [len(sequence) for sequence, *_ in encoded]
+    lengths = [len(item.ids) for item in encoded]
     if max(lengths) > bucket:
         return False
     return (len(lengths) - 1) * bucket + max(lengths) <= width
@@ -394,58 +324,30 @@ def _batchable(
 
 def _answer_independent(
     forward_batched: Callable[..., Sequence[object]],
-    encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
+    encoded: Sequence[Encoded],
     kinds: Sequence[str],
     causal: bool = False,
 ) -> list[Answer]:
     """块对角合批：N 条**独立**序列并排跑一个 pass（各段互不可见、各段状态从零起）。"""
-    sequences = [sequence for sequence, *_ in encoded]
-    options = [len(labels) for _, _, labels, _ in encoded]
+    sequences = [item.ids for item in encoded]
+    options = [len(item.labels) for item in encoded]
     # 每条序列自带它自己的 `prefix_noncausal` 前缀长度：块对角只隔离序列之间的可见性，
-    # **不改变一条序列内部**的前缀语义（前缀行只看前缀、尾部行看整段）。
-    prefixes = [prefix_len for _, prefix_len, _, _ in encoded]
+    # **不改变一条序列内部**的前缀语义（前缀行只看前缀、尾部行看整段）。`None` 只出现在量不出
+    # 边界的链上（它们只开因果共享，那时这个长度不决定掩码），按 0 处理。
+    prefixes = [0 if item.prefix_len is None else item.prefix_len for item in encoded]
     raw = forward_batched(sequences, options=options, prefixes=prefixes, causal=causal)
     answers: list[Answer] = []
-    for index, (_, _, labels, indexes) in enumerate(encoded):
+    for index, item in enumerate(encoded):
         probs = SplitRunner._shares(raw[index])
-        values = tuple(probs[item] for item in indexes)
+        values = tuple(probs[position] for position in item.indexes)
         best = max(range(len(values)), key=values.__getitem__)
         answers.append(
             Answer(
                 question_index=index,
                 kind=kinds[index],
-                value=labels[best],
+                value=item.labels[best],
                 probs=values,
-                labels=labels,
-                confidence=values[best],
-            )
-        )
-    return answers
-
-
-def _answer_serial(
-    chain: ModelChain,
-    encoded: Sequence[tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]],
-    use_prefix: bool,
-    kinds: Sequence[str],
-    causal: bool = False,
-    mm: object | None = None,
-) -> list[Answer]:
-    """逐题整趟（今天的行为；单题与不可复用时走这条）。"""
-    answers: list[Answer] = []
-    for index, (sequence, prefix_len, labels, indexes) in enumerate(encoded):
-        probs = SplitRunner._shares(
-            chain.forward(sequence, options=len(labels),
-                          prefix=prefix_len if use_prefix else 0, causal=causal, mm=mm))
-        values = tuple(probs[item] for item in indexes)
-        best = max(range(len(values)), key=values.__getitem__)
-        answers.append(
-            Answer(
-                question_index=index,
-                kind=kinds[index],
-                value=labels[best],
-                probs=values,
-                labels=labels,
+                labels=item.labels,
                 confidence=values[best],
             )
         )

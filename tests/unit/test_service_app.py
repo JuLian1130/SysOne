@@ -76,6 +76,10 @@ class FakeEngine:
     def vision_stats(self) -> dict[str, object]:
         return {"available": False}
 
+    def decision_stats(self) -> dict[str, object] | None:
+        """这个替身不认决策 runner 的契约：`/metrics` 里就该是空的，而不是一排伪造的 0。"""
+        return None
+
 
 def _decider(engine: FakeEngine | None = None) -> service_app.EngineDecider:
     return service_app.EngineDecider(
@@ -490,6 +494,8 @@ def test_metrics_report_the_engine_layers_and_the_admission(start_server) -> Non
     assert set(payload["engine"]["request"]) == {"requests", "questions", "tokens"}
     assert set(payload["engine"]["stage"]) == {"prefill_s", "readout_s"}
     assert set(payload["engine"]["startup"]) == {"load_s", "compile_s", "warmup_s"}
+    # 不认决策 runner 契约的替身：这一栏是空的，不是一排伪造的 0。
+    assert payload["engine"]["decision"] is None
 
 
 def test_metrics_count_admission_refusals(start_server) -> None:
@@ -516,3 +522,42 @@ def test_metrics_count_admission_refusals(start_server) -> None:
     assert admission["rejected"] == 1
     assert admission["capacity"] == 1
     assert admission["active"] == 0
+
+
+def test_metrics_carry_the_decision_counters_and_capabilities(start_server) -> None:
+    """`/metrics` 的 `decision` 一栏来自执行器：能力位与命中数一起给出，读的人不用去翻代码。"""
+
+    class DecisionEngine(FakeEngine):
+        def decision_stats(self) -> dict[str, object]:
+            return {
+                "shared_hit": 1, "shared_miss": 2, "batch_hit": 0, "batch_miss": 0,
+                "batch_fallback": 0, "media_skip": 1,
+                "supports_shared": True, "supports_batch": False,
+            }
+
+    server, gate = start_server(engine=DecisionEngine())
+    assert gate.wait(5.0)
+    status, _, raw = _call(server, "GET", "/metrics")
+    assert status == 200
+    decision = _json(raw)["engine"]["decision"]
+    assert decision["supports_shared"] is True and decision["supports_batch"] is False
+    assert decision["shared_hit"] == 1 and decision["media_skip"] == 1
+
+
+def test_an_engine_that_cannot_batch_is_not_given_a_batcher() -> None:
+    """`batch_limit == 1` 时不该建攒批器：它会绕过 `Engine.run`，把每条请求送进 `Engine.batch`，
+    而那条路要求执行器有 `answers_batch`（h2o / vendor 没有）—— 建了就是每条请求都 500。
+    """
+
+    class SerialEngine(FakeEngine):
+        def batch(self, requests):
+            raise AssertionError("batch_limit = 1 的引擎不该被送进合批路径")
+
+        @property
+        def batch_limit(self) -> int:
+            return 1
+
+    decider = service_app.EngineDecider(SerialEngine(), model_name="m", max_input_tokens=16384)
+    assert decider.batcher is None
+    assert decider.metrics()["batching"] is None
+    assert decider.answer(CHOICE)["answers"]

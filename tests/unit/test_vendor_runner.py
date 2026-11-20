@@ -313,3 +313,14 @@ def test_option_descriptions_survive_the_trip_to_a_vendor() -> None:
     bare = Question(text="Which option?", options=("admit", "deny_score"))
     assert question_spec(bare)["criteria"] == {"admit": "admit", "deny_score": "deny_score"}
     assert question_spec(Question(text="Does it hold?", kind="noul"))["criteria"] == {}
+
+
+def test_the_bridge_declares_no_shared_or_batch_capability() -> None:
+    """厂商桥不透明：两条能力位保持 False，也**不记** miss —— 那些数字会永远不动。"""
+    bridge = FakeBridge(trained=MaskMode)
+    runner = VendorRunner(bridge)
+    runner.load_weights()
+    stats = runner.decision_stats()
+    assert stats["supports_shared"] is False and stats["supports_batch"] is False
+    assert stats["shared_hit"] == stats["shared_miss"] == 0
+    assert stats["batch_hit"] == stats["batch_miss"] == stats["batch_fallback"] == 0

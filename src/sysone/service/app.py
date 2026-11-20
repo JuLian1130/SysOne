@@ -58,6 +58,8 @@ class EngineSource(Protocol):
 
     def vision_stats(self) -> dict[str, Any]: ...
 
+    def decision_stats(self) -> dict[str, Any] | None: ...
+
 
 class EngineDecider:
     """把引擎包成前门要的形状：健康信息、模型信息、跑一道请求、报三层统计。"""
@@ -74,8 +76,15 @@ class EngineDecider:
         self.model_name = model_name
         self.max_input_tokens = int(max_input_tokens)
         self.debug_timings = bool(debug_timings)
-        # 攒批器只在执行器支持 `batch` 时才有：不支持的装配（reference、替身）走原来的直路。
-        self.batcher = Batcher(engine) if callable(getattr(engine, "batch", None)) else None
+        # 攒批器只在执行器**真有**合批能力时才建：它会绕过 `Engine.run`、把每条请求送进
+        # `Engine.batch`，而那条路要求执行器有 `answers_batch`。h2o / vendor 没有 —— 建了就是
+        # "每条请求都 500"，而不是"批没批上"。
+        self.batcher = (
+            Batcher(engine)
+            if callable(getattr(engine, "batch", None))
+            and int(getattr(engine, "batch_limit", 1)) > 1
+            else None
+        )
         if self.batcher is not None:
             self.batcher.start()
 
@@ -94,6 +103,7 @@ class EngineDecider:
     def metrics(self) -> dict[str, Any]:
         """引擎那三层的数字（`RunStats`）。准入的计数属于服务这一层，在 `_answer` 里合并。"""
         stats = self.engine.stats()
+        decision = getattr(self.engine, "decision_stats", None)
         return {
             "request": {
                 "requests": stats.request.requests,
@@ -111,6 +121,8 @@ class EngineDecider:
             },
             # 塔在不在、占多少字节、装过几次：`--vision-idle` 卸载之后这里要能看出来回到 0。
             "vision": self.engine.vision_stats(),
+            # 共享前缀与合批：能力位 + 今天各命中多少（`None` = 执行器不认这条契约）。
+            "decision": decision() if callable(decision) else None,
             "batching": self.batcher.stats() if self.batcher is not None else None,
         }
 
