@@ -292,7 +292,7 @@ static inline uint at_owner_of(uint m) { return ((m & 3u) << 1) | ((m >> 2) << 4
     if (jlast) { op[0] = half(y0); } \
     else { const float y1 = c_##EG.thread_elements()[1] * iv1 * float(gp[1]); \
            *(device half2 *)op = half2(half(y0), half(y1)); } }
-#define AT_STAGE(P, CHAN, TB) at_stage(&kbuf[((P) == kb0) ? 0u : 1u][0][0], kv, tid, T, (CHAN), (TB));
+#define AT_STAGE(P, CHAN, TB) at_stage(&kbuf[((P) == kb0) ? 0u : 1u][0][0], kv, tid, T, (CHAN), (TB), at_pad_keys);
 // S6: visible keys are [0, nka) plus the query row's own slot [nkb, nkc).  With `segw` = 0 a
 // caller passes nka = nkc = nk and nkb = 0, so this is exactly the pre-S6 `t < nk`.
 // M3: the two bounds are *caller-side*, not mask-side -- a causal pass hands in its own row's
@@ -377,15 +377,36 @@ static inline bool at_visible(uint t, uint nka, uint nkb, uint nkc) {
 // Metal`），而快核用一个捕获上下文的分片搬运闭包。这里把它展开成普通函数：参数与原闭包捕获的
 // 变量一一对应（剩余使用到的 `AT_KC` / `AT_LDK` / `AT_TG` 是宏），循环体和分支逐字保留，
 // 语义不变。改动仅限本仓库内的这份副本，`docs/` 里的旧实现不动。
+
+// 两个 half 一起看：half 的指数 5 位全 1 就是 NaN 或 inf，坏了那个置成 +0。
+static inline uint at_finite_pair(uint w) {
+    const uint lo = (w & 0x7C00u) == 0x7C00u ? 0u : (w & 0x0000FFFFu);
+    const uint hi = ((w >> 16) & 0x7C00u) == 0x7C00u ? 0u : (w & 0xFFFF0000u);
+    return lo | hi;
+}
+
 static inline void at_stage(threadgroup half *buf, device const half *kv, uint tid, uint T,
-                            uint chan_base, uint tbase) {
+                            uint chan_base, uint tbase, bool clamp_v) {
+    // 槽位规则下，被掩码的 key 的 V 仍然进 PV 矩阵乘：`p = 0` 挡不住 NaN（0 × NaN 还是 NaN），所以
+    // 一片永远不该被读的填充列就能把整个瓦片所有真行的答案变成 NaN（实测：只毒垫列的 V，真实列
+    // 的注意力输出 100 % 变 NaN；只毒 K 则 0 % —— 不可见的分数在 AT_SM1 里被**替换**成
+    // -INFINITY，NaN 到不了 softmax）。`E8_KV_PROJ` 是 K 半的通道数，所以 V 段按
+    // `chan_base >= E8_KV_PROJ` 认。单条整趟没有槽位（`clamp_v` 为假），退化成改动前那次拷贝。
+    const bool guard = clamp_v && chan_base >= uint(E8_KV_PROJ);
     #pragma unroll
     for (uint u = tid; u < AT_KC * 8u; u += AT_TG) {
         const uint c = u >> 3, j = u & 7u;
         const uint t = tbase + j * 8u;
         threadgroup uint4 *dst = (threadgroup uint4 *)(buf + c * AT_LDK + j * 8u);
         if (t + 8u <= T) {
-            *dst = *(device const uint4 *)(kv + (ulong)(chan_base + c) * T + t);
+            uint4 raw = *(device const uint4 *)(kv + (ulong)(chan_base + c) * T + t);
+            if (guard) {
+                raw.x = at_finite_pair(raw.x);
+                raw.y = at_finite_pair(raw.y);
+                raw.z = at_finite_pair(raw.z);
+                raw.w = at_finite_pair(raw.w);
+            }
+            *dst = raw;
         } else {
             *dst = uint4(0u, 0u, 0u, 0u);   // masked out by the score mask
         }
@@ -446,6 +467,9 @@ kernel void k_attn(device const half  *qg      [[buffer(0)]],
         cnt = (word >> ((rel & 1u) * 16u)) & 0xFFFFu;
     }
     const uint nkc  = a.segw ? min(nkb + cnt, T) : nk;              // one past its last key
+    // 只有按槽位的派发（块对角 / 共享前缀的批尾巴）会有垫列：槽位短于槽宽时，后面那些被掩码的
+    // key 列照样进 PV 的矩阵乘。单条整趟没有槽位，这个开关是假，出货主路不多发一条指令。
+    const bool at_pad_keys = a.segw != 0u;
     const uint kvh = head / uint(E8_Q_HEADS / E8_KV_HEADS);
     const float K1 = a.scale * AT_LOG2E;                // score -> base-2 logit
 

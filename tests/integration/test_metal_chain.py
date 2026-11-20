@@ -563,3 +563,52 @@ def test_forward_batched_returns_none_when_the_batch_does_not_pack(chains) -> No
     _, gpu = chains
     sequences = [_ids(100, seed=index) for index in range(3)]
     assert gpu.forward_batched(sequences, options=[4, 4, 4]) is None
+
+
+def test_masked_padding_columns_cannot_poison_a_batched_pass(chains) -> None:
+    """槽位后面那些被掩码的 key，V 就算坏成 NaN，也不能动真列的答案。
+
+    块对角的槽位很少刚好填满槽宽：最后那个 128 列带里，序列结束之后的列是 padding，被槽位
+    掩码挡住（`p = 0`）。但**掩码只挡住分数，挡不住 PV 矩阵乘**：`0 × NaN` 还是 NaN，所以一片
+    永远不该被读的列能把整个瓦片所有真行的答案变成 NaN（h2o 4B 的几何上实测过：24 遍里 11 槽次，
+    只毒垫列的 V 时真实列 100 % 变 NaN，只毒 K 则 0 %）。
+
+    这里把垫列的 V **直接写成 NaN**，然后要求批里每条的末行与它单独整趟一致 —— 也就是要求
+    staging 的 V 半把那几个非有限值钳掉。没有那条钳位时这里会得到 NaN。
+    """
+    _, gpu = chains
+    length = 100            # 槽宽 128：每条序列的末带只有 100 列是真的
+    sequences = [_ids(length, seed=index + 3) for index in range(2)]
+    alone = [gpu.forward(sequence, options=4) for sequence in sequences]
+
+    pipeline = gpu._pipeline
+    assert pipeline is not None
+    slotw = 128
+    vstart = gpu._geometry.kv_rows - gpu._geometry.kv_heads * gpu._geometry.head_dim
+    original = type(pipeline)._issue
+    poisoned = 0
+
+    def issuing(self, chain, step):
+        original(self, chain, step)
+        nonlocal poisoned
+        if step.work == "prep_kv":
+            # `prep_kv` 是这一层 K/V 落地的屏障，它之后、`attn` 之前就是 kv 的内容已定型的时刻。
+            # 先排空（主机写不进任何 lane 的序），再往 V 半的 padding 列写 NaN。
+            self._wait_all()
+            view = self.kv.array(np.float16, (self._geometry.kv_rows, gpu._width))
+            for slot in range(len(sequences)):
+                view[vstart:, slot * slotw + length:(slot + 1) * slotw] = np.nan
+            poisoned += 1
+
+    type(pipeline)._issue = issuing
+    try:
+        batched = gpu.forward_batched(sequences, options=[4, 4])
+    finally:
+        type(pipeline)._issue = original
+    assert poisoned, "没有触发任何一次注意力派发，这个用例什么都没验到"
+    assert batched is not None, "两条短序列该能排进一个桶"
+    for index, (got, want) in enumerate(zip(batched, alone)):
+        assert np.all(np.isfinite(got)), f"第 {index} 条序列的读数里有非有限值"
+        drift = float(np.abs(got - want).max())
+        assert drift <= SHARED_TOL, f"第 {index} 条序列差 {drift:.3e}，超过 {SHARED_TOL}"
+        assert int(np.argmax(got)) == int(np.argmax(want)), f"第 {index} 条序列的答案变了"
