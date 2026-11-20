@@ -8,6 +8,7 @@ from sysone.devices.apple.schedule import (
     Chain,
     attention_steps,
     blocks,
+    dead_tiles,
     gdn_steps,
     ring_columns,
     ring_slot,
@@ -202,6 +203,23 @@ def test_dead_tiles_keep_the_first_pass_only(dead):
         assert set(KV_PHASE) <= {
             step.work for step in steps if step.tile == tile
         }
+
+
+@pytest.mark.parametrize(
+    "chunks,prefix,last_row_only,expected",
+    [
+        ((), 0, True, 0),
+        ([(0, 64)], 0, True, 0),
+        ([(0, 64), (64, 64), (128, 64), (192, 64)], 0, True, 3),
+        ([(0, 64), (64, 64), (128, 64), (192, 64)], 0, False, 0),
+        ([(0, 64), (64, 64), (128, 64), (192, 64)], 64, False, 1),
+        ([(0, 64), (64, 64), (128, 64), (192, 64)], 256, False, 3),
+        ([(0, 64), (64, 64), (128, 40)], 128, False, 2),
+    ],
+)
+def test_dead_tiles(chunks, prefix, last_row_only, expected):
+    """末行规则只丢末瓦片之前；prefix 规则只丢整段落在前缀里的，末瓦片永远留。"""
+    assert dead_tiles(chunks, prefix, last_row_only=last_row_only) == expected
 
 
 def test_the_readout_tiles_always_keep_their_tail():

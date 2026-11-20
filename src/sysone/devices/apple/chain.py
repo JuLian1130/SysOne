@@ -492,7 +492,8 @@ class SplitChain:
     def logits(self, tokens: Sequence[int], *, trace: list[np.ndarray] | None = None,
                prefix: int = 0, causal: bool = False,
                debug: dict | None = None,
-               mm: object | None = None) -> np.ndarray:
+               mm: object | None = None,
+               last_row_only: bool = True) -> np.ndarray:
         """整条 prompt 走 20 层，返回 `[rows]` 原始 logits（rows = 读出表的行数）（fp32，未除温度）。
 
         `trace` 非空时把每层输出（最后一条 token 的 `[hidden]`）按顺序追加进去，
@@ -509,6 +510,9 @@ class SplitChain:
         读回）：16k 上整段读回归一要 87 ms，末行是 0.02 ms。
 
         `mm` 是图像合流的入口（`_embeddings`），今天传非 `None` 会报 `NotReadyError`。
+
+        `last_row_only` 只影响 Metal 路径：默认 `True` 时最后一层省掉除末瓦片外的第二相
+        （读出本来只要末行）；做 A/B 时才传 `False`。
         """
         ids, length = self._ids_and_length(tokens, prefix)
         # 码表先要：没有码表的模型（h2o 是 pooled）连前向都不必跑，报错也不必等到算完。
@@ -518,7 +522,8 @@ class SplitChain:
             if trace is not None or debug is not None:
                 raise ValueError("Metal 流水线不提供逐层 trace 或 debug（中间量留在面上）",
                                  hint="用 metal=False 的 numpy 链做逐层对拍")
-            return readout @ self.last_hidden(tokens, prefix=prefix, causal=causal, mm=mm)
+            return readout @ self.last_hidden(tokens, prefix=prefix, causal=causal, mm=mm,
+                                              last_row_only=last_row_only)
         x = _place(self._embeddings(ids, mm), self._geometry.hid, self._width)
         if trace is not None:
             # 先记 embedding 输出，这样 trace[i] 是"第 i 层的输入"（i=0 即 embedding），
@@ -577,17 +582,22 @@ class SplitChain:
         return rms_norm(x.T, self._final_norm)[:length]
 
     def last_hidden(self, tokens: Sequence[int], *, prefix: int = 0,
-                    causal: bool = False, mm: object | None = None) -> np.ndarray:
+                    causal: bool = False, mm: object | None = None,
+                    last_row_only: bool = True) -> np.ndarray:
         """最后一条 token 的最终归一化 hidden（`[hidden]` fp32）。
 
         `hidden(tokens)[-1]` 的那一行，但不读回整段：16k 上整段读回 + 归一 87 ms，只取末行
         0.02 ms（票据 08 §3）。`pooled` 的读出与 `logits()` 都只要这一行。
+
+        `last_row_only=True`（默认）让流水线在最后一层省掉除末瓦片外的第二相（S3 的末行
+        规则）。它是纯优化：末行读出的语义不变。只有做 A/B 时才传 `False`。
         """
         ids, length = self._ids_and_length(tokens, prefix)
         if self._pipeline is not None:
             self._prepare_rope(mm, length)
             self._pipeline.run(self._embeddings(ids, mm), length=length,
-                               prefix=prefix, causal=causal)
+                               prefix=prefix, causal=causal,
+                               last_row_only=last_row_only)
             return rms_norm(self._pipeline.last_hidden(length)[None, :], self._final_norm)[0]
         # numpy 那条路不是热点：整段本来就是一小块 host 内存，直接复用 `hidden()`。
         return self.hidden(tokens, prefix=prefix, causal=causal, mm=mm)[-1]

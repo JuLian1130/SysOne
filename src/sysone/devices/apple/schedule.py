@@ -207,6 +207,27 @@ def ring_slot(tile: int, bucket: int) -> int:
     return (int(tile) % NCH) * int(bucket)
 
 
+def dead_tiles(
+    chunks: Sequence[tuple[int, int]], prefix: int, *, last_row_only: bool
+) -> int:
+    """最后一层里没有读者的瓦片数（S3）。
+
+    `last_row_only` 表示读出只要第 `length-1` 行：除末瓦片外，第二相的注意力与 MLP 输出
+    都没有读者；这些瓦片仍保留第一相，因为末瓦片的注意力要读它们的 K/V。
+
+    否则只在 `prefix > 0` 时丢整段落在公共前缀里的瓦片；末瓦片永远不丢 ——
+    `prefix == length` 时读出那一行自己就在前缀里，它就是读者。
+    """
+    if not chunks:
+        return 0
+    if last_row_only:
+        return len(chunks) - 1
+    if prefix <= 0:
+        return 0
+    inside = sum(1 for start, n in chunks if start + n <= prefix)
+    return min(inside, len(chunks) - 1)
+
+
 def blocks(
     roles: Sequence[AttentionRole], *, ring: int = RING
 ) -> tuple[tuple[int, ...], ...]:

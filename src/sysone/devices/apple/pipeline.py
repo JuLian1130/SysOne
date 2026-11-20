@@ -32,6 +32,7 @@ from .schedule import (
     Step,
     attention_steps,
     blocks,
+    dead_tiles,
     gdn_steps,
     ring_columns,
     ring_slot,
@@ -180,6 +181,7 @@ class MudePipeline:
             self._length = 0
             self._prefix = 0
             self._causal = False
+            self._last_row_only = False
             self._dead = 0
             # 只有模型的最后一层能把前缀瓦片的第二相省掉：别层的 `h` 还有读者。
             self._last_is_full = bool(self.buffers) and (
@@ -276,7 +278,7 @@ class MudePipeline:
             view[:, s0 + start:s0 + start + block.shape[0]] = block.T
 
     def run(self, rows: np.ndarray, *, length: int, prefix: int = 0,
-            causal: bool = False) -> None:
+            causal: bool = False, last_row_only: bool = False) -> None:
         """跑完 20 层。`rows` 是 `[length, hidden]` 的 embedding，按桶写进 `x` 画布。
 
         **步骤图驱动**：一层被拆成 `schedule.py` 的订单式 `(chain, step)` 序列 ——
@@ -288,6 +290,8 @@ class MudePipeline:
         之间整段排空，因为表面池与 qg/kv 画布是跨层复用的。
 
         `prefix` 非 0 时还会省掉最后一层的死瓦片（S3，见下面 `dead` 的注释）。
+        `last_row_only=True` 表示调用方只读第 `length-1` 行（`last_hidden` / `logits`）：
+        除末瓦片外的最后一层第二相都可以省掉。它不改变任何缓冲或掩码，只改 `dead`。
 
         `[length, width)` 那几列**不清零**：调度只覆盖 `[0, length)` 切出来的瓦片，核读的
         每一列都在自己那一相写过（探针 `.scratch/probe_stale_canvas.py` 拿"短 → 长 → 短"
@@ -303,7 +307,8 @@ class MudePipeline:
             view = self.x.array(np.float16, (self._hidden, self._width))
             self._write_rows(view, rows, 0)
             self._chunks_list = list(self._chunks(length))
-            self._prepare(length, prefix, fresh=True, causal=causal)
+            self._prepare(length, prefix, fresh=True, causal=causal,
+                          last_row_only=last_row_only)
             for index, block_of_layers in enumerate(self._blocks()):
                 if self._residency is not None:
                     self._residency.begin(index)
@@ -522,7 +527,9 @@ class MudePipeline:
                               longest=max(lengths), bucket=self._bucket)
         if len(rows) == 1:
             # 一条不成批：走普通那条路（与 `run` 逐位同一条代码），省得为 1 条造一个槽位布局。
-            self.run(np.asarray(rows[0]), length=lengths[0], causal=causal)
+            # 这条出口只读末行，所以末层可以走 S3 的末行规则。
+            self.run(np.asarray(rows[0]), length=lengths[0], causal=causal,
+                     last_row_only=True)
             return [self.last_hidden(lengths[0])]
         # 打包：一条序列一个**槽**，槽宽取"最长序列向上取到 AT_BM"，一格里能塞几条就塞几条。
         # 这一步决定赚多少 —— ANE 的算力是按**瓦片**计的（program 的静态宽度就是桶宽），
@@ -609,7 +616,8 @@ class MudePipeline:
 
     def _prepare(self, length: int, prefix: int, *, fresh: bool,
                  segw: int = 0, counts: Sequence[int] = (), causal: bool = False,
-                 fresh_slots: bool = False, prefixes: Sequence[int] = ()) -> None:
+                 fresh_slots: bool = False, prefixes: Sequence[int] = (),
+                 last_row_only: bool = False) -> None:
         """开一个执行相：掩码模型、S3 的死瓦片，以及各条链的游标账。
 
         `fresh=False` 表示这一相接着上一相的状态跑（共享前缀的尾巴相）：GDN 的递归状态与
@@ -618,6 +626,9 @@ class MudePipeline:
         self._length = int(length)
         self._prefix = int(prefix)
         self._fresh = bool(fresh)
+        # 末行读出：只有 `last_hidden` / `logits` 那条出口会打开它。它只影响最后一层
+        # 的 dead 计数（见下面 S3 注释），不改变掩码或任何缓冲。
+        self._last_row_only = bool(last_row_only)
         # M3：这一相的掩码是不是三角。它与 `segw` 正交：批尾巴的槽位规则之上再按行收到自己
         # 那一列（见 `kernels.attn_args` 的 `caus`）。
         self._causal = bool(causal)
@@ -629,16 +640,19 @@ class MudePipeline:
         # 独立序列合批：每瓦片一条序列，它自己的 `prefix_noncausal` 前缀长度（0 = 没有前缀项）。
         self._slot_prefix = tuple(int(value) for value in prefixes)
         self._slot_per = (self._bucket // int(segw)) if segw else 0
-        # S3（旧引擎的 `LASTDEAD`，`docs/ANE/anebench/e8_a3.py:291-302`）：模型最后一层里整段落在
-        # 公共前缀中的瓦片只欠 K/V —— 前缀行的注意力输出与 MLP 输出都没有读者（读出在 query
-        # 行上，K/V 出自投影那一步，不依赖注意力）。所以这些瓦片丢掉第二相（`attn` 与它之后的
+        # S3（旧引擎的 `LASTDEAD`，`docs/ANE/anebench/e8_a3.py:291-302`）：模型最后一层里
+        # 没有读者的瓦片只欠 K/V —— 它们的注意力输出与 MLP 输出都没有下游（K/V 出自投影
+        # 那一步，不依赖注意力）。所以这些瓦片丢掉第二相（`attn` 与它之后的
         # `out`/`norm2`/`ffn`/`tail`）。
         #
-        # 最后一个瓦片永远不丢：`prefix == length` 时读出那一行自己也在前缀里，它就变成读者了。
+        # 两个触发条件：
+        # - `prefix > 0`：整段落在公共前缀里的瓦片没有读者（前缀行的读出不存在）；
+        # - `last_row_only`：读出只要最后一行，于是除末瓦片外都没有读者（`last_hidden` /
+        #   `logits` 的出口）。末瓦片永远不丢：末行读出的那一行就在里面。
         dead = 0
-        if self._skip_dead and self._prefix > 0 and self._last_is_full:
-            dead = sum(1 for start, n in self._chunks_list if start + n <= self._prefix)
-            dead = min(dead, len(self._chunks_list) - 1)
+        if self._skip_dead and self._last_is_full:
+            dead = dead_tiles(self._chunks_list, self._prefix,
+                              last_row_only=self._last_row_only)
         self._dead = dead
         # 每条 lane 的命令缓冲账：本相提交了几个、其中前几个已经结算。
         self._committed = {LANE_LONG: 0, LANE_SMALL: 0}

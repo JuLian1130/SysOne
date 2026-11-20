@@ -38,8 +38,9 @@ class StubPipeline:
         self.runs: list[dict] = []
         self.whole_readbacks = 0
 
-    def run(self, rows, *, length, prefix, causal):
-        self.runs.append({"length": length, "prefix": prefix, "causal": causal})
+    def run(self, rows, *, length, prefix, causal, last_row_only=False):
+        self.runs.append({"length": length, "prefix": prefix, "causal": causal,
+                          "last_row_only": last_row_only})
 
     def hidden_rows(self, length: int) -> np.ndarray:
         self.whole_readbacks += 1
@@ -88,7 +89,8 @@ def test_metal_hidden_returns_every_position():
     assert out.shape == (3, 4)
     # 整段都过了 final norm（与 numpy 那条路同一个函数），不是只归一了末位那一行
     np.testing.assert_allclose(out, rms_norm(rows, final_norm), rtol=1e-6, atol=1e-6)
-    assert chain._pipeline.runs == [{"length": 3, "prefix": 0, "causal": True}]
+    assert chain._pipeline.runs == [{"length": 3, "prefix": 0, "causal": True,
+                                     "last_row_only": False}]
 
 
 def test_metal_hidden_applies_the_final_norm_to_every_row():
@@ -116,4 +118,18 @@ def test_metal_last_hidden_reads_only_the_last_row():
     assert out.shape == (4,)
     np.testing.assert_allclose(out, rms_norm(rows, final_norm)[-1], rtol=1e-6, atol=1e-6)
     assert chain._pipeline.whole_readbacks == 0
-    assert chain._pipeline.runs == [{"length": 3, "prefix": 0, "causal": True}]
+    assert chain._pipeline.runs == [{"length": 3, "prefix": 0, "causal": True,
+                                     "last_row_only": True}]
+
+
+def test_metal_last_hidden_can_disable_the_skip_for_ab():
+    """A/B 用：关掉末行规则时同一条出口仍然只读末行，只是流水线不省死瓦片。"""
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4)
+    final_norm = np.full(4, 2.0, dtype=np.float32)
+    chain = make_chain(rows, final_norm=final_norm, width=8)
+
+    out = chain.last_hidden([11, 22, 33], causal=True, last_row_only=False)
+
+    np.testing.assert_allclose(out, rms_norm(rows, final_norm)[-1], rtol=1e-6, atol=1e-6)
+    assert chain._pipeline.runs == [{"length": 3, "prefix": 0, "causal": True,
+                                     "last_row_only": False}]

@@ -246,7 +246,8 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
 
             pipeline._step_attn = counted_attn         # type: ignore[method-assign]
         try:
-            return chunked.logits(tokens, prefix=prefix)
+            # 这条用例只钉 prefix 规则；关掉末行规则，免得 dead 从 1 变成 3。
+            return chunked.logits(tokens, prefix=prefix, last_row_only=False)
         finally:
             pipeline._step_attn = original               # type: ignore[method-assign]
 
@@ -266,6 +267,56 @@ def test_dead_prefix_tiles_are_skipped_without_changing_the_answer(chunked) -> N
     finally:
         pipeline._nch = original_nch
         pipeline._skip_dead = True
+
+
+def test_last_row_only_skips_every_tile_but_the_readout_tile(chunked) -> None:
+    """末行读出：最后一层只留末瓦片，答案逐位相同，注意力少发「瓦片数 − 1」片。
+
+    这条与上一条的区别：上一条钉 `prefix` 规则（dead=1），这条钉末行规则（dead=3）。
+    两条都不能少：`prefix` 规则在 causal 下不成立（causal 不看 prefix），末行规则在
+    `hidden()` 的整段出口上不能开（每一行都是读者）。
+    """
+    tokens = TOKENS * (S // len(TOKENS))
+    pipeline = chunked._pipeline
+    assert pipeline is not None
+    original_nch = pipeline._nch
+    original = pipeline._step_attn
+    tiles = S // pipeline._bucket
+
+    def run(nch: int, last_row_only: bool, counted: dict | None = None) -> np.ndarray:
+        pipeline._nch = nch
+        if counted is not None:
+            def counted_attn(chain, entry, tile):      # type: ignore[no-untyped-def]
+                counted["n"] += 1
+                return original(chain, entry, tile)
+
+            pipeline._step_attn = counted_attn         # type: ignore[method-assign]
+        try:
+            return chunked.last_hidden(tokens, causal=True, last_row_only=last_row_only)
+        finally:
+            pipeline._step_attn = original               # type: ignore[method-assign]
+
+    try:
+        full = run(1, False)
+        skipped = run(1, True)
+        assert np.array_equal(full, skipped), "末行规则改变了答案（被丢的瓦片不该有读者）"
+
+        live_count, dead_count = {"n": 0}, {"n": 0}
+        run(1, False, live_count)
+        run(1, True, dead_count)
+        assert dead_count["n"] == live_count["n"] - (tiles - 1), (
+            f"末行规则没有少发 {tiles - 1} 片注意力："
+            f"开 {dead_count['n']} 次、关 {live_count['n']} 次"
+        )
+
+        # prefix 路径同样不能因为末行规则改变答案。
+        prefix = S // 4
+        prefixed = chunked.logits(tokens, prefix=prefix, last_row_only=False)
+        prefixed_skipped = chunked.logits(tokens, prefix=prefix, last_row_only=True)
+        assert np.array_equal(prefixed, prefixed_skipped), "末行规则改变了 prefix 路径的答案"
+    finally:
+        pipeline._nch = original_nch
+        pipeline._step_attn = original
 
 
 def _ids(count: int, seed: int = 20261114) -> tuple[int, ...]:
