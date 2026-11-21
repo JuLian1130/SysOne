@@ -5,43 +5,26 @@ English | [简体中文](README.zh.md)
 A fast, local decision inference engine. System-1 speed for edge AI.
 
 SysOne takes a structured state (a JSON object or a piece of text) plus a set of
-questions and options, and returns a probability for every option. The shipped
-Apple Silicon path is split across two devices: ANE programs for the projection
-and FFN stages, and runtime-compiled Metal kernels for attention and the GDN
-state. Both halves share IOSurfaces zero-copy.
-
-This README is the complete public path from a fresh clone to a running service
-on an Apple Silicon Mac. It does not require any private repository. It is the
-master copy; the Chinese translation is `README.zh.md` and both are kept in
-sync.
+questions and options, and returns a probability for every option.
 
 ## What is supported
 
-| Backend | Family | Model | Verified path |
-|---|---|---|---|
-| `pooled` | h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) | ANE + Metal, vendor pooled readout |
-| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) | ANE + Metal, code-row readout |
+| Backend | Family | Model |
+|---|---|---|
+| `pooled` | h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
+| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
 
-`--backend reference` is the M0 semantic judge used by tests. It is not a
-production path and requires an explicit `--descriptor`.
-
-Both released models answer `choice`, `noul` and `score` questions. h2o judges
-them with its vendor `format_answer`; mude shows a score's levels as ordered
-options and reports the expected level. The two therefore agree on both the
-prompt contract and the answer shape.
+Both models answer `choice`, `noul` and `score` questions.
 
 ## Requirements
 
 - Apple Silicon (M1 or newer) on macOS 14 or newer.
-- 8 GB of memory or more. The weights are memory-mapped and only the resident
-  layer window (`--W`, four layers by default) is held on the ANE, so a running
-  h2o service sits at about 0.6 GB; `--W 0` keeps all 32 layers resident and
-  needs about 4.5 GB.
+- 8 GB of memory or more; the weights are read from disk on demand, not
+  loaded whole.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
 - Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus about 4 GiB
-  of compiled artifacts for h2o, the vision tower included. The weights are
-  downloaded on first use.
+  of compiled artifacts. The weights are downloaded on first use.
 
 ## Install
 
@@ -55,18 +38,6 @@ python -m pip install --upgrade pip
 pip install -e ./src
 ```
 
-`pip install -e ./src` is the supported install. It pulls `huggingface_hub`, which
-is also what the first run uses to fetch the weights. A non-editable wheel is not
-supported today: the Metal kernel sources live in `src/sysone/devices/apple/shaders/`,
-and `env.scratch_root()` is anchored at the source tree. Both expect the checkout
-to stay in place.
-
-If you do not want to install the package, every command below also works as:
-
-```sh
-PYTHONPATH=src python -m sysone.cli <command> ...
-```
-
 ## Build the native libraries
 
 `serve` needs three small native libraries. They are built from the `.m` sources
@@ -77,30 +48,17 @@ the first `serve` will not start without it:
 tools/build_ane.sh
 ```
 
-The script writes `libe8ane.dylib` (the ANE private-API host), `libe8mtl.dylib`
-(the Metal host) and `libe8image.dylib` (the ImageIO decoder used only by the
-vision path) into `.tmp/e8`. The engine finds that directory on its own;
-`SYS1_E8_DIR` overrides it. Do not use `/tmp`: macOS clears it on reboot. The
-dylibs carry a macOS 14.0 deployment target, which is what sets the floor in
-Requirements.
-
 ## Start the service
 
 ```sh
 sysone serve --model h2o
 ```
 
-That one command is the whole path. On the first start it downloads the pinned
-weights, compiles the missing ANE programs (the vision tower's 26 included) and
-then prints `sysone serve: ready in ...s`; later starts read the artifact cache
-and report `compile 0.00s`. Run it again at any time: it is idempotent and never
-rebuilds what is already on disk.
+The first start downloads the weights and compiles the ANE programs, then prints
+`sysone serve: ready in ...s`; later starts report `compile 0.00s`. Running it
+again is safe.
 
-The port is bound before loading, so `/health` and `/v1/systemone` answer `503`
-until the ready line. For mude use `--model mude`. h2o also accepts the
-bidirectional `noncausal_full` mode, which requires the whole prompt to fit in
-one ANE bucket: long prompts need `--bucket 4096` (the default bucket is 1024),
-while the causal default has no such constraint.
+For mude use `--model mude`.
 
 Check it from another shell:
 
@@ -180,15 +138,3 @@ win over the variables.
 - `429` — raise `--queue`/`--admit-timeout` or retry after `Retry-After`.
 - h2o fails at `Serve.open` — `serve_config.json` or `h2o_lightning_shim.py` is
   missing; delete the cached package and let the next start re-download it.
-
-## Repository layout
-
-- `src/sysone/` — the engine (Python only; dependencies are numpy, tokenizers,
-  and jinja2).
-- `src/sysone/devices/apple/shaders/` — vendored Metal kernel sources, compiled
-  at process startup.
-- `tools/native/` — the three `.m` sources for the dylibs; `tools/build_ane.sh`
-  builds them.
-- `examples/` — one request for each wire shape.
-- `tests/` — unit tests and Apple integration tests; integration tests skip when
-  weights or dylibs are absent.

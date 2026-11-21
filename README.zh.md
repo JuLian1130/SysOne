@@ -5,33 +5,24 @@
 一个快速、本地的决策推理引擎。为边缘 AI 提供 System-1 级别的速度。
 
 SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问题与选项，为每个选项返回一个
-概率。发布的 Apple Silicon 路径跨两个设备：投影与 FFN 阶段走 ANE 程序，注意力与 GDN
-状态走运行时编译的 Metal kernel。两半共用 IOSurface 零拷贝。
-
-本 README 是从干净 clone 到在 Apple Silicon Mac 上跑起服务的完整公开路径，不依赖任何
-私有仓库。英文版是主稿，本文件（`README.zh.md`）是它的中文翻译，两者必须同步修改。
+概率。
 
 ## 支持范围
 
-| 后端 | 家族 | 模型 | 已验证路径 |
-|---|---|---|---|
-| `pooled` | h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) | ANE + Metal，厂商 pooled 读出 |
-| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) | ANE + Metal，code-row 读出 |
+| 后端 | 家族 | 模型 |
+|---|---|---|
+| `pooled` | h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
+| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
 
-`--backend reference` 是测试用的 M0 语义裁判，不是生产路径，必须显式给 `--descriptor`。
-
-两个发布模型都答 `choice`、`noul` 与 `score` 三类问题：h2o 用厂商的 `format_answer` 判
-答案，mude 把 score 的档位按顺序摆成选项、答面报期望档位。题面契约与答案形状因此两边一致。
+两个模型都答 `choice`、`noul` 与 `score` 三类问题。
 
 ## 环境要求
 
 - Apple Silicon（M1 或更新），macOS 14 或更新。
-- 8 GB 或更多内存。权重按需 mmap，ANE 上只驻留待命的层窗口（`--W`，默认 4 层），
-  跑起来的 h2o 服务约占 0.6 GB；`--W 0` 把 32 层全部常驻，约需 4.5 GB。
+- 8 GB 或更多内存；权重按需从磁盘读，不会整体载入。
 - arm64 Python 3.11 或更新。
 - Xcode Command Line Tools（`xcode-select --install`），`clang` 需要它。
-- 磁盘：h2o 权重约 9.3 GB、mude 约 4 GB，另加约 4 GiB 编译产物（h2o，含视觉塔）。
-  权重在首次使用时下载。
+- 磁盘：h2o 权重约 9.3 GB、mude 约 4 GB，另加约 4 GiB 编译产物。权重在首次使用时下载。
 
 ## 安装
 
@@ -45,17 +36,6 @@ python -m pip install --upgrade pip
 pip install -e ./src
 ```
 
-`pip install -e ./src` 是受支持的安装方式，它会带上 `huggingface_hub`——首次运行拉权重
-用的也是它。目前不支持非 editable 的 wheel：Metal kernel 源码在
-`src/sysone/devices/apple/shaders/`，`env.scratch_root()` 也锚在源码树上，两者都要求
-仓库留在原地。
-
-不想安装也可以，下面所有命令都可以这样跑：
-
-```sh
-PYTHONPATH=src python -m sysone.cli <command> ...
-```
-
 ## 构建原生库
 
 `serve` 需要三份小的原生库。它们由 `tools/native/` 里的 `.m` 源码构建，仓库不附带
@@ -65,25 +45,16 @@ PYTHONPATH=src python -m sysone.cli <command> ...
 tools/build_ane.sh
 ```
 
-脚本把 `libe8ane.dylib`（ANE 私有 API 宿主）、`libe8mtl.dylib`（Metal 宿主）与
-`libe8image.dylib`（只有视觉路径用到的 ImageIO 解码器）写进 `.tmp/e8`。引擎自己会找
-这个目录；`SYS1_E8_DIR` 可覆盖。不要用 `/tmp`：macOS 重启会清空它。dylib 带着
-macOS 14.0 的部署目标，环境要求里的系统下限就来自这一项。
-
 ## 启动服务
 
 ```sh
 sysone serve --model h2o
 ```
 
-这一条命令就是全部路径。首次启动会下载固定权重、编译缺失的 ANE 程序（含视觉塔的 26
-份），然后打印 `sysone serve: ready in ...s`；之后再启动读产物缓存，编译段报
-`compile 0.00s`。随时可以重跑：它是幂等的，不会重建磁盘上已有的东西。
+首次启动会下载权重并编译 ANE program，完成后打印 `sysone serve: ready in ...s`；之后
+再启动报 `compile 0.00s`。随时可以重跑，不会重复做已完成的事。
 
-端口在装载前就绑好，所以在 ready 行出现前，`/health` 与 `/v1/systemone` 都回 `503`。
-mude 用 `--model mude`。h2o 也接受双向的 `noncausal_full` 模式，它要求整条 prompt 装进
-一个 ANE 桶：长 prompt 需要 `--bucket 4096`（默认桶宽 1024），而默认的 causal 没有这个
-限制。
+mude 用 `--model mude`。
 
 另开一个 shell 检查：
 
@@ -158,11 +129,3 @@ HTTP：
 - `429`——加大 `--queue`/`--admit-timeout`，或按 `Retry-After` 重试。
 - h2o 在 `Serve.open` 处失败——缺 `serve_config.json` 或 `h2o_lightning_shim.py`；删掉
   缓存里的包，下次启动会重下。
-
-## 仓库布局
-
-- `src/sysone/`——引擎（纯 Python；依赖 numpy、tokenizers、jinja2）。
-- `src/sysone/devices/apple/shaders/`——随仓库携带的 Metal kernel 源码，进程启动时编译。
-- `tools/native/`——三份 dylib 的 `.m` 源码；`tools/build_ane.sh` 负责构建。
-- `examples/`——每种线格式各一个请求。
-- `tests/`——单测与 Apple 集成测试；缺权重或缺 dylib 时集成测试自动跳过。
