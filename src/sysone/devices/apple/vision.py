@@ -802,8 +802,9 @@ class VisionSlot:
 
     * **"挂起"省不了内存**（627.6 MB 里只还 20–56 MB，§4.12）⇒ 这里只有"装"和"真卸载"；
       卸载就是 `VisionTower.close()`：26 个 program 卸掉、面释放。
-    * **不预热**（`e8e-service-plan.md` T6）⇒ 第一次带图请求才建塔。启动时就把塔装上等于选了
-      常驻，0 常驻的契约当场作废。
+    * **不常驻**（`e8e-service-plan.md` T6）⇒ 第一次带图请求才把塔装上。首启的预处理只编
+      26 份产物、编完就归还（`release()`），0 常驻的契约不变；这样第二次启动既不重编，也
+      不用为一张可能永远不会来的图付 630–690 MB。
 
     `idle` 秒之后没有新请求就卸（`threading.Timer`，到点先查"最近一次使用"再决定，所以并发
     请求不会把一个正在跑的塔卸掉）。`idle = 0` 表示"每次请求之后立刻卸"，那是 `finish()`
@@ -835,7 +836,7 @@ class VisionSlot:
 
     # -- 装载与卸载 ----------------------------------------------------------
     def warm(self) -> VisionTower:
-        """只装不跑：`sysone compile --vision` 用它把 26 份产物提前建出来。"""
+        """只装不跑：首启预处理用它把 26 份产物提前建出来，随后由 `release()` 归还。"""
         with self._lock:
             return self._ensure()
 
@@ -882,12 +883,20 @@ class VisionSlot:
             with self._lock:
                 self._drop()
 
-    def close(self) -> None:
+    def release(self) -> None:
+        """建完产物就把设备上的塔还回去：槽位保留，下一次 `media()` 会重新装。
+
+        与 `close()` 同一个动作，区别在调用方意图：这里只归还"为编译产物暂装的那一份"内存，
+        不是进程收尾；槽位本身仍可再次 `_ensure()`。
+        """
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
             self._drop()
+
+    def close(self) -> None:
+        self.release()
 
     # -- 跑 ------------------------------------------------------------------
     def encode(self, img: np.ndarray) -> np.ndarray:

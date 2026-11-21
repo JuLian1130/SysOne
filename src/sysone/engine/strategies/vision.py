@@ -36,6 +36,8 @@ class VisionRunner:
     _image_token: int | None
     _load_tower: Callable[[object], object] | None
     _vision: object | None
+    _vision_state: Callable[[object], dict[str, Any]] | None
+    _chain: object | None
 
     # -- 能力 ----------------------------------------------------------------
     def vision_unavailable(self) -> str | None:
@@ -61,13 +63,37 @@ class VisionRunner:
         stats: dict[str, Any] = {} if self._vision is None else self._vision.stats()  # type: ignore[attr-defined]
         return {"available": self.vision_unavailable() is None, **stats}
 
+    def vision_artifacts(self) -> dict[str, Any] | None:
+        """塔产物的磁盘账（`reusable` / `total`）：只读，不装塔。
+
+        `_vision_state` 是装配层给的闭包（`chain → artifacts`），所以这里与 `doctor` 的
+        `vision_devices.artifact_state` 是同一个判据；一条纯文本装配没有这个闭包，返回
+        `None`，调用方不需要再判断"有没有塔"。
+        """
+        state = getattr(self, "_vision_state", None)
+        if state is None or self._chain is None:
+            return None
+        return state(self._chain)
+
+    def prepare_vision(self) -> dict[str, Any] | None:
+        """首启把 26 份产物建出来（装上 → 编 → 归还），全命中时什么都不做。
+
+        为什么值得做：冷产物上的首次带图请求要现编 26 份，实测 7.1–7.8 s、进程 RSS 涨
+        ~900 MB；而编完之后把塔归还，服务仍是 0 常驻，第一次带图请求只付装载（约 0.6–2 s）。
+        第二次启动 26/26 命中，连 `VisionTower` 都不构造。
+        """
+        state = self.vision_artifacts()
+        if state is None or int(state["reusable"]) >= int(state["total"]):
+            return None
+        report = self.vision_warmup()
+        self._park_vision()
+        return report
+
     def vision_warmup(self) -> dict[str, Any] | None:
-        """`sysone compile --with-vision`：把 26 份产物建出来（**装上、不跑**）。
+        """把 26 份产物建出来（**装上、不跑**）；首启预处理与显式预热共用这一条。
 
         建塔本身就是编译那一步（构造时 `cached_program` 未命中就现编），所以这里不需要一张
-        假图。为什么值得单独做一遍：冷产物上的首次带图请求要现编 26 份产物（实测 7.1–7.8 s，
-        期间进程 RSS 涨 ~900 MB），而这条命令是**短命进程**，那笔占用随它退出就没了
-        （`.scratch/p4_gate_cold.json` 与 `p4_gate_warm.json` 的对比）。
+        假图。
         """
         if self._vision is None:
             return None
@@ -93,6 +119,11 @@ class VisionRunner:
             return self._answers(request, mode, media)    # type: ignore[attr-defined]
         finally:
             self._vision.finish()                         # type: ignore[attr-defined]
+
+    def _park_vision(self) -> None:
+        """编完产物把塔归还：`_vision` 槽位保留，下一次 `media()` 会按需重装。"""
+        if self._vision is not None:
+            self._vision.release()                        # type: ignore[attr-defined]
 
     def _release_vision(self) -> None:
         """关进程时先卸塔：塔复用链的权重容器与运行时，反过来做会让它去找已经关掉的句柄。"""

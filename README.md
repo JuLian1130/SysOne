@@ -295,7 +295,9 @@ serialized as JSON into the prompt.
 | Max input tokens | `--width` (default 16384) | `--width` (default 16384) |
 | Vision | available by default (`--vision auto`) | available by default (`--vision auto`) |
 
-Text-only requests never build the vision tower. The third dylib
+The first start also builds the vision tower's 26 programs, then releases the
+tower: text-only processes stay at 0 resident, and the first image request pays
+only the load. `--vision off` skips the tower and its programs. The third dylib
 (`libe8image.dylib`) is only needed when an image request is actually served.
 
 ## Resources and tuning
@@ -305,8 +307,9 @@ Text-only requests never build the vision tower. The third dylib
   downloads. Deleting the directory forces a re-download.
 - Default artifacts directory: `~/Library/Caches/sysone/artifacts`. Override with
   `--artifacts` or `SYS1_ARTIFACTS_DIR`. Deleting it forces a recompile.
-- `sysone compile` pre-builds the artifacts. The first compile is minutes-level;
-  later starts hit the cache and the compile phase is about 0 s.
+- `sysone compile` pre-builds the artifacts, including the vision tower's 26
+  programs when vision is enabled. The first compile is minutes-level; later
+  starts hit the cache and the compile phase is about 0 s.
 - `--quant {int8,fp16}` selects the ANE weight storage (default `int8`):
   per-output-channel codes with fp16 scales, or plain fp16. Compute stays fp16
   either way (ANE has no int8 MAC). The two artifact sets live side by side,

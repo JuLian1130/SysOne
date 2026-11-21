@@ -112,6 +112,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
         max_len: int,
         image_token_id: int | None = None,
         load_tower: Callable[[object], object] | None = None,
+        vision_state: Callable[[object], dict[str, object]] | None = None,
     ) -> None:
         if max_len < 1:
             raise ConfigError("max_len 必须为正", max_len=max_len)
@@ -122,6 +123,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
         # 允许"带塔却不说 id"，所以这里的 `None` 只出现在纯文本装配里。
         self._image_token = image_token_id
         self._load_tower = load_tower
+        self._vision_state = vision_state
         self._vision: object | None = None
         self._chain: ModelChain | None = None
         self._warm_ok = False
@@ -146,6 +148,8 @@ class SplitRunner(VisionRunner, DecisionRunner):
             raise ConfigError("split 策略尚未装载权重", strategy="split")
         started = time.perf_counter()
         self._warm()
+        # 视觉产物与链的产物同一条启动路径：首启补齐，全命中时不动塔（见 `prepare_vision`）。
+        self.prepare_vision()
         # 装载与编译的拆分由链自己量（只有它知道哪几层是从头构建的）；预热是这里量的。
         return CompilationTimes(
             load_s=self._chain.load_s,
@@ -343,9 +347,18 @@ def mude_runner(
         )
         return slot
 
+    def tower_state(chain: object) -> dict[str, object]:
+        from ...devices.apple import vision as vision_device
+
+        state = vision_device.artifact_state(
+            chain.store, descriptor=weights.descriptor, s=tower_s, artifacts_dir=scratch_dir,
+        )
+        return {"directory": str(state.directory), "reusable": state.hits, "total": state.total}
+
     load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
     return SplitRunner(load_chain, prompter, max_len=buffer_width,
-                       image_token_id=weights.descriptor.image_token_id, load_tower=load)
+                       image_token_id=weights.descriptor.image_token_id, load_tower=load,
+                       vision_state=tower_state if load is not None else None)
 
 
 def _load_tokenizer(model_dir: str | Path) -> object:

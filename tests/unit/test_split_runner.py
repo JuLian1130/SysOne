@@ -747,6 +747,7 @@ class FakeSlot:
         self.calls: list[object] = []
         self.finished = 0
         self.closed = 0
+        self.released = 0
 
     def media(self, refs):
         self.calls.append(tuple(refs))
@@ -759,6 +760,9 @@ class FakeSlot:
     def close(self) -> None:
         self.closed += 1
 
+    def release(self) -> None:
+        self.released += 1
+
     def warm(self) -> None:
         self.calls.append("warm")
 
@@ -768,14 +772,17 @@ class FakeSlot:
                 "evals": 0, "ane_ms": 0.0, "gpu_ms": 0.0}
 
 
-def _vision_runner(chain, slot: FakeSlot | None, *, metal: bool = True):
-    """一条"有塔"的装配：`image_token_id` 与工厂都给了，链上挂着 `metal_runtime`。"""
+def _vision_runner(chain, slot: FakeSlot | None, *, metal: bool = True, missing: int = 0):
+    """一条"有塔"的装配：`image_token_id`、工厂与产物账都给了，链上挂着 `metal_runtime`。"""
     prompter, _ = _prompter()
     if metal:
         chain.metal_runtime = object()          # 只用来回答"有没有 Metal 运行时"
-    return SplitRunner(lambda: chain, prompter, max_len=4096,
-                       image_token_id=248056,
-                       load_tower=(lambda held: slot) if slot is not None else None)
+    state = None if slot is None else (lambda held: {"reusable": 26 - missing, "total": 26})
+    return SplitRunner(
+        lambda: chain, prompter, max_len=4096, image_token_id=248056,
+        load_tower=(lambda held: slot) if slot is not None else None,
+        vision_state=state,
+    )
 
 
 def test_a_tower_less_assembly_refuses_images_with_the_reason() -> None:
@@ -843,7 +850,7 @@ def test_the_contract_says_which_of_the_four_reasons_applies() -> None:
 
 
 def test_vision_warmup_reports_the_artifacts_of_the_tower() -> None:
-    """`compile --with-vision` 的落地：装上（= 编译产物），报 26 份里命中几个。"""
+    """首启预处理与显式预热共用这一条：装上（= 编译产物），报 26 份里命中几个。"""
     chain = FakeChain()
     slot = FakeSlot()
     runner = _vision_runner(chain, slot)
@@ -872,3 +879,22 @@ def test_a_chain_without_the_primitive_is_declared_incapable_and_runs_serially()
     assert len(chain.calls) == 2, "没有共享原语就逐题整趟"
     assert runner.decisions.shared_miss == 1, "机会在、能力不在：这一笔是 Stage 3 的立项依据"
     assert runner.decision_stats()["supports_shared"] is False
+
+
+def test_prepare_vision_burns_the_26_programs_then_parks_the_tower() -> None:
+    """首启：缺产物才装塔，编完立刻归还（0 常驻）；第二次启动不构造塔。"""
+    chain = FakeChain()
+    slot = FakeSlot()
+    runner = _vision_runner(chain, slot, missing=26)
+    runner.load_weights()
+
+    report = runner.prepare_vision()
+    assert report is not None
+    assert report["programs"] == {"reusable": 26, "total": 26}
+    assert slot.calls == ["warm"]
+    assert slot.released == 1
+
+    runner = _vision_runner(FakeChain(), FakeSlot(), missing=0)
+    runner.load_weights()
+    assert runner.prepare_vision() is None
+    assert runner._vision.calls == [] and runner._vision.released == 0

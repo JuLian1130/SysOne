@@ -80,6 +80,7 @@ class PooledRunner(VisionRunner, DecisionRunner):
         max_len: int,
         image_token_id: int | None = None,
         load_tower: Callable[[object], object] | None = None,
+        vision_state: Callable[[object], dict[str, object]] | None = None,
     ) -> None:
         if max_len < 1:
             raise ConfigError("max_len 必须为正", max_len=max_len)
@@ -91,6 +92,7 @@ class PooledRunner(VisionRunner, DecisionRunner):
         # 视觉塔的工厂（`chain → VisionSlot`）：塔要复用链的权重容器与运行时，所以只能在
         # `load_weights()` 之后建。`None` 表示这条装配不做图（`--vision off` 或没有塔）。
         self._load_tower = load_tower
+        self._vision_state = vision_state
         self._vision: object | None = None
         self._chain: PooledChain | None = None
         self._load_s = 0.0
@@ -140,6 +142,7 @@ class PooledRunner(VisionRunner, DecisionRunner):
         if abs(sum(probs) - 1.0) > 1e-3:
             raise NotReadyError("pooled 预热前向概率未归一", strategy="pooled",
                                 total=sum(probs))
+        self.prepare_vision()
         self._warm_ok = True
         return CompilationTimes(
             load_s=self._load_s,
@@ -346,9 +349,20 @@ def h2o_runner(
             idle=vision_idle,
         )
 
+    def tower_state(chain: object) -> dict[str, object]:
+        from ...devices.apple import vision as vision_device
+
+        state = vision_device.artifact_state(
+            chain.store, descriptor=weights.descriptor, s=tower_s, artifacts_dir=scratch_dir,
+        )
+        return {"directory": str(state.directory), "reusable": state.hits, "total": state.total}
+
     load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
-    return PooledRunner(load_chain, serve, rows, max_len=buffer_width,
-                        image_token_id=weights.descriptor.image_token_id, load_tower=load)
+    return PooledRunner(
+        load_chain, serve, rows, max_len=buffer_width,
+        image_token_id=weights.descriptor.image_token_id, load_tower=load,
+        vision_state=tower_state if load is not None else None,
+    )
 
 
 __all__ = ["PooledRunner", "h2o_runner"]

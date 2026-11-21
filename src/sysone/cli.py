@@ -221,16 +221,10 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--admit-timeout", type=float, default=120.0, help="排队超过这么多秒就 429")
     serve.add_argument("--name", default=None, help="回包里的 model 名（默认模型 id）")
 
-    compile = sub.add_parser(
+    sub.add_parser(
         "compile", parents=[_model_flags()],
         help="按给定形状预编译产物，不起服务（部署时跑一次，之后起服务不必再编）",
     )
-    compile.add_argument(
-        "--with-vision", action="store_true", dest="with_vision",
-        help="连视觉塔的 26 份产物一起建出来（默认**不**建：塔是按需装载的，"
-             "预编它就是选常驻的语义）。接受不了 `--vision` 这个短名：它已经是能力开关",
-    )
-
     doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
     doctor.add_argument("--platform", default="auto", choices=("auto", "reference", "apple"))
     doctor.add_argument(
@@ -467,8 +461,8 @@ def _vision_report(
     }
     if state.missing:
         report["note"] = (
-            f"第一次带图请求要现编这 {state.missing} 份产物；"
-            "`sysone compile --with-vision` 可以把这一步提前做掉"
+            f"{state.missing} 份塔产物缺失；下一次 `sysone compile` 或首启预处理会补建，"
+            "补建后塔本身仍按第一次带图请求才常驻"
         )
     return report
 
@@ -577,27 +571,20 @@ def _compile(args: argparse.Namespace) -> int:
             hint="给 --backend split（mude）或 pooled（h2o）；reference 后端不产生产物",
         )
     engine = _build_engine(args, _parse_mode(args.attention_mode))
+    vision = None
     try:
         times = engine.start()
-        tower = None
-        if args.with_vision:
-            warm = getattr(engine._runner, "vision_warmup", None)  # noqa: SLF001 - compile 就是"替服务把活干完"
-            if not callable(warm):
-                raise ConfigError("这条装配没有视觉塔，--with-vision 无从做起",
-                                  backend=args.backend, model=args.model)
-            tower = warm()
-            if tower is None:
-                raise ConfigError("视觉被关掉了：--vision off 与 --with-vision 互相矛盾",
-                                  vision=args.vision)
+        # 预处理已在 `compile_or_warm_up` 里做完：这里只读一遍磁盘账，不重新装塔。
+        runner = getattr(engine, "_runner", None)
+        query = None if runner is None else getattr(runner, "vision_artifacts", None)
+        vision = query() if callable(query) else None
     finally:
         # 这条命令比服务寿命短：退出前把 ANE 程序与表面还回去（不还也只是进程退出）。
         engine.shutdown()
     print(f"sysone compile: {times.total_s:.2f}s{startup_report(times)}")
     print(f"artifacts: {engine.config.storage.resolved_artifacts_dir()}")
-    if tower is not None:
-        programs = tower["programs"]
-        print(f"vision: {programs['reusable']}/{programs['total']} programs, "
-              f"{tower['bytes'] / 1e6:.1f} MB resident (load {tower['load_s']:.2f}s)")
+    if vision is not None:
+        print(f"vision: {vision['reusable']}/{vision['total']} programs")
     return 0
 
 
