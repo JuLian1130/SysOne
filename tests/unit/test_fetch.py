@@ -106,6 +106,7 @@ def test_offline_without_weights_says_how_to_download_them(tmp_path: Path) -> No
     assert context["revision"] == SOURCE.revision
     assert "hf download" in context["command"]
     assert "rev-a" in context["command"]
+    assert "--weights" in context["hint"]
 
 
 def test_offline_with_local_weights_is_silent(tmp_path: Path) -> None:

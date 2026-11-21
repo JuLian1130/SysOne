@@ -1,9 +1,8 @@
 """两份发布权重从哪来：仓库、固定修订与引擎读的文件清单。
 
-这份清单原先只写在 README 的 `hf download` 命令里。首启自动下载把它搬进代码，因为
-"固定修订"是契约：`README` 写明 revisions are pinned（follow branch 会换权重，而产物
-缓存只认权重文件的指纹，换了等于悄悄重编一遍）。license 文件也在清单里，README 要求
-随权重保留。
+这份清单原先只写在 README 的 `hf download` 命令里，现在它是唯一事实来源：首启自动下载
+按它取文件，`DownloadError` 按它拼出手动命令。修订必须钉死 —— follow branch 会换权重，
+而产物缓存只认权重文件的指纹，换了等于悄悄重编一遍。license 文件也在清单里，随包保留。
 """
 
 from __future__ import annotations

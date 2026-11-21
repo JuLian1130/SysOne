@@ -1,9 +1,10 @@
 """检查点目录的两种容器形态：单文件张量，或 row-int8 分片目录。
 
-mude 发布的是 bf16 的 `model.safetensors`；4B 的 h2o 发布的是 row-int8（`__q` 码 + `__s`
-fp32 标度 + `int8_manifest.json`）。两者 dtype 与标度精度都不同，但读出来是同一件事：
-`read(name)` 给 float32、`read_rows` 给若干行。装载侧只该看见这件事，容器差异留在这里 ——
-否则每个读权重的地方都要再长一遍"这份 checkpoint 是哪种形态"的分支。
+两份发布权重都是单文件 bf16 `model.safetensors`；row-int8（`__q` 码 + `__s` 标度 +
+`int8_manifest.json`）是可选输入 —— 本地打过包就复用它的码，否则引擎在编译期现量化。
+两者 dtype 与标度精度都不同，但读出来是同一件事：`read(name)` 给 float32、`read_rows`
+给若干行。装载侧只该看见这件事，容器差异留在这里 —— 否则每个读权重的地方都要再长
+一遍"这份 checkpoint 是哪种形态"的分支。
 """
 
 from __future__ import annotations

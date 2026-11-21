@@ -4,7 +4,7 @@
 算内容哈希 —— 9 GB 读一遍正是"第二次启动"要省掉的那一段，而修订已经固定，文件由
 Hugging Face 的 etag 保证。
 
-下载走 `snapshot_download`（README 的 `hf download` 同一条路径），先落临时目录，写完
+下载走 `snapshot_download`（与 `hf download` 同一条路径），先落临时目录，写完
 marker 再换入正式目录；换入前的中间态也有恢复路径，崩溃不会把一份旧权重变成半份新权重。
 """
 
@@ -25,6 +25,12 @@ MARKER_NAME = "source.json"
 # `snapshot_download(local_dir=...)` 会在目录里自建一份元数据缓存；它不参与完整性判据。
 Downloader = Callable[[WeightsSource, Path], None]
 
+# `hf download` 只把文件放到位、不写 `source.json`，所以手动命令之后必须走显式 `--weights`
+# ——否则下一次启动仍判为不完整并重下。
+MANUAL_HINT = (
+    "跑完这条命令后用 --weights 指向该目录启动：显式路径只读，不查 source.json；"
+    "整份复制缓存时要连 source.json 一起带上"
+)
 
 
 def ensure_weights(
@@ -57,6 +63,7 @@ def ensure_weights(
                 revision=source.revision,
                 directory=str(target),
                 command=manual_command(source, target),
+                hint=MANUAL_HINT,
             )
         partial = _partial(target)
         shutil.rmtree(partial, ignore_errors=True)
@@ -79,6 +86,7 @@ def ensure_weights(
                 directory=str(target),
                 error=f"{type(exc).__name__}: {exc}",
                 command=manual_command(source, target),
+                hint=MANUAL_HINT,
             ) from exc
         missing = [name for name in source.files if not (partial / name).is_file()]
         if missing:
@@ -90,6 +98,7 @@ def ensure_weights(
                 directory=str(target),
                 missing=missing,
                 command=manual_command(source, target),
+                hint=MANUAL_HINT,
             )
         _write_marker(partial, source)
         _swap(partial, target)
@@ -98,7 +107,7 @@ def ensure_weights(
 
 
 def manual_command(source: WeightsSource, target: Path) -> str:
-    """离线/失败时给用户的等价手命令（与 README 的下载段同一形状）。"""
+    """离线/失败时给用户的等价手命令：把文件放到 `target`；之后的启动见 `MANUAL_HINT`。"""
     files = " ".join(source.files)
     return (
         f"hf download {source.repo_id} --revision {source.revision} "

@@ -103,60 +103,14 @@ directory; later starts read the `source.json` marker and touch no network.
 - Default directory: `~/Library/Caches/sysone/weights/<repo directory>`
   (`mude-1.0`, `h2o-lightning-4b`). `SYS1_WEIGHTS_DIR` overrides it.
 - `--offline` forbids the download. A missing package then fails with the exact
-  `hf download` command to run by hand.
+  pinned `hf download` command; an air-gapped host copies a finished package
+  (including its `source.json`) under `SYS1_WEIGHTS_DIR`.
 - An explicit `--weights` is read-only: it never downloads, so a typo in a path
   cannot start a multi-GB fetch.
 - The download list contains only the files the engine reads plus each
   repository's license files; it is pinned in `src/sysone/models/sources.py`.
 - `HF_TOKEN` is honoured through `huggingface_hub`'s standard environment for
   private mirrors.
-
-### Manual download (optional)
-
-Both revisions are pinned; do not follow the branch. Download only the files
-the engine reads, plus each repository's license files.
-
-mude (commit `0b6a5c4ea9ca2267707a28ff568737f54ae219c5`, MIT changes plus
-Apache-2.0 Qwen base):
-
-```sh
-hf download qybaihe/mude-1.0 \
-  --revision 0b6a5c4ea9ca2267707a28ff568737f54ae219c5 \
-  model.safetensors readout.safetensors decision_config.json config.json \
-  tokenizer.json tokenizer_config.json chat_template.jinja \
-  LICENSE NOTICE LICENSES/Apache-2.0.txt \
-  --local-dir models/mude-1.0
-```
-
-h2o (commit `659fc412de8486dbc2477b0d1cb4121e97e72471`, Apache-2.0):
-
-```sh
-hf download h2oai/h2o-lightning-4b \
-  --revision 659fc412de8486dbc2477b0d1cb4121e97e72471 \
-  model.safetensors config.json tokenizer.json tokenizer_config.json \
-  serve_config.json h2o_lightning_shim.py box.py assets.py card_common.py \
-  pooled_readout.py selector_v2.py label_rows.lightning \
-  LICENSE \
-  --local-dir models/h2o
-```
-
-Then pass `--weights models/mude-1.0` or `--weights models/h2o`: an explicit
-path is read-only and never triggers a download.
-
-Notes:
-
-- Do **not** use `qybaihe/mude-1.0-mlx-8bit`. Its MLX q8 layout is not readable by
-  the ANE chain and its filename is not `model.safetensors`.
-- `serve_config.json` and `h2o_lightning_shim.py` are required by the `pooled`
-  path. The shim imports its siblings by name: the official config has `image`
-  and `box` blocks, so `box.py` is required at startup. `pooled_readout.py` and
-  `label_rows.lightning` are read when the two-way block is constructed;
-  `selector_v2.py`, `assets.py`, and `card_common.py` complete the official
-  package. The engine does not run the vendor's vLLM.
-- Keep the repository `LICENSE`, `NOTICE`, and `LICENSES/` files. They are not
-  duplicated by the engine.
-- The Hugging Face reported `usedStorage` for h2o includes historical LFS
-  revisions; the checked-out snapshot is about 9.3 GB.
 
 ## Run mude (`split`)
 
@@ -321,8 +275,10 @@ only the load. `--vision off` skips the tower and its programs. The third dylib
   resident window in layers (default 4 = one block).
 - On a 16 GB machine, lower `--width` (for example `--width 8192`) to shrink the
   GPU-side buffers. A prompt longer than `--width` is rejected with `422`.
-- `sysone doctor --platform apple --model h2o --weights models/h2o --artifacts <dir>`
-  reports how many compiled layers are reusable and which are missing.
+- `sysone doctor --platform apple --model h2o
+  --weights ~/Library/Caches/sysone/weights/h2o-lightning-4b --artifacts <dir>`
+  reports how many compiled layers are reusable and which are missing (`doctor`
+  takes an explicit path; it never downloads).
 - A geometry outside the measured whitelist still runs, but its numbers are
   experimental; the doctor output says so.
 
@@ -333,8 +289,13 @@ only the load. `--vision off` skips the tower and its programs. The third dylib
 - `ModuleNotFoundError: tokenizers` (or `jinja2`/`numpy`/`huggingface_hub`) —
   reinstall the package in the active venv: `pip install -e ./src`.
 - A `download` error with `--offline` — drop `--offline` to let the first run
-  fetch the weights, run the printed `hf download …` command by hand, or point
-  `SYS1_WEIGHTS_DIR` at a pre-seeded directory.
+  fetch the weights; run the printed `hf download …` command and start with
+  `--weights <that directory>`; or copy a finished package (including its
+  `source.json`) under `SYS1_WEIGHTS_DIR`.
+- `权重文件不存在` from an explicit `--weights` — the directory must be the
+  published layout: a single `model.safetensors`, or a row-int8 directory with
+  `int8_manifest.json`. Do not use `qybaihe/mude-1.0-mlx-8bit`: its MLX q8
+  shards are not readable by the ANE chain.
 - `422` with `prompt 超过链的缓冲宽度` — raise `--width` (and `--bucket` if
   needed), or shorten the prompt.
 - Out-of-memory or a wired-memory warning — lower `--width`, and check that no
@@ -344,8 +305,7 @@ only the load. `--vision off` skips the tower and its programs. The third dylib
   and `/metrics`.
 - `429` — raise `--queue`/`--admit-timeout` or retry after `Retry-After`.
 - h2o fails at `Serve.open` — `serve_config.json` or `h2o_lightning_shim.py` is
-  missing; delete the cached package (next start re-downloads it) or re-run the
-  manual download above.
+  missing; delete the cached package and let the next start re-download it.
 - `--backend reference` requires `--descriptor`; it is the semantic-judge path,
   not a model runtime.
 
