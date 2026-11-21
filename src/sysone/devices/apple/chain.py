@@ -640,6 +640,28 @@ class SplitChain:
         """
         if len(options) != len(sequences):
             raise ValueError(f"options 与序列条数不一致：{len(options)} vs {len(sequences)}")
+        hidden = self.last_hidden_batched(sequences, causal=causal, prefixes=prefixes)
+        if hidden is None:
+            return None
+        readout = self._require_readout()
+        return [self._probabilities(readout @ row, int(count))
+                for row, count in zip(hidden, options)]
+
+    def last_hidden_batched(
+        self, sequences: Sequence[Sequence[int]], *, prefixes: Sequence[int] = (),
+        causal: bool = False,
+    ) -> list[np.ndarray] | None:
+        """块对角的末行 hidden：N 条互不相干的序列并排一个 pass，各交一份最终归一化 hidden。
+
+        `last_hidden()` 的"多条序列"版本。它与 `last_hidden_shared` 的差别是**没有共享前缀**：
+        它合的是"不同 state 的独立请求"，后者合的是"同一个 state 的多个问题"。
+
+        装不进一趟的打包区（每条 ≤ 桶宽、槽宽整除桶宽、总列数 ≤ 缓冲宽度）返回 `None` ——
+        不是错误，调用方退回逐条整趟即可（形状判据只有 `Pipeline._slot_layout` 一份）。
+
+        没有码表读出的模型（h2o 的 pooled）走这条出口：它的读出是"标签行 × hidden"，那一步
+        在策略层，链只该交 hidden。
+        """
         if self._pipeline is None:
             raise NotReadyError("numpy 链没有零拷贝流水线，合批只对 Metal 链开放")
         lengths = [int(np.asarray(seq).size) for seq in sequences]
@@ -649,12 +671,9 @@ class SplitChain:
         hidden = self._pipeline.run_batched(rows, prefixes=prefixes, causal=causal)
         if hidden is None:
             return None
-        readout = self._require_readout()
         # 流水线给的是**最后一层的原始隐态**，`_final_norm` 还没做 —— 与 `last_hidden()`
         # 那条路一样，读出之前必须先过最终 RMSNorm，否则整批答案会系统性偏移。
-        return [self._probabilities(readout @ rms_norm(row[None, :], self._final_norm)[0],
-                                    int(count))
-                for row, count in zip(hidden, options)]
+        return [rms_norm(row[None, :], self._final_norm)[0] for row in hidden]
 
     def forward_shared(
         self, prefix: Sequence[int], tails: Sequence[Sequence[int]], *, options: Sequence[int],

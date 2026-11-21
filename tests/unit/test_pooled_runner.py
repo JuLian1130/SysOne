@@ -284,3 +284,109 @@ def test_a_chain_without_a_prefix_buffer_goes_serial():
     assert subject._chain.shared_calls == []
     assert len(subject._chain.calls) == 2
     assert subject.decisions.shared_miss == 1
+
+
+# ------------------------------------------------------------- 块对角的账
+
+
+class BatchedChain(SharedChain):
+    """会块对角的链：N 条独立序列一个 pass，各交一份末行 hidden。"""
+
+    def __init__(self, last: tuple[float, ...] = (0.0, 0.0, 0.0, 1.0), *, fits: bool = True):
+        super().__init__(last=last)
+        self.batched_calls: list[tuple[tuple[tuple[int, ...], ...], tuple[int, ...], bool]] = []
+        self._fits = fits
+
+    def last_hidden_batched(self, sequences, *, prefixes=(), causal=False):
+        self.batched_calls.append((
+            tuple(tuple(sequence) for sequence in sequences),
+            tuple(int(prefix) for prefix in prefixes),
+            bool(causal),
+        ))
+        return [self._last for _ in sequences] if self._fits else None
+
+
+class FloatBatchedChain(BatchedChain):
+    """有块对角原语的**名字**、但链没有零拷贝流水线（`metal=False` 的 numpy 形态）。"""
+
+    can_share_prefix = False
+
+
+def independent_requests() -> tuple[DecisionRequest, DecisionRequest]:
+    """两条 state 首词就不同的请求：公共前缀是 0，所以走块对角而不是共享前缀。"""
+    return (make_request(questions=1, state="alpha record"),
+            make_request(questions=1, state="omega record"))
+
+
+def test_batch_capability_follows_the_chain_primitive():
+    """能力位按链问：有 `last_hidden_batched` 才声明；numpy 形态仍不声明。
+
+    与 `supports_shared` 同一个口径 —— 声明了却调不到是一条 500，退回串行只是一次没有收益的
+    前向。
+    """
+    assert runner().supports_batch is False
+    assert runner(chain=BatchedChain()).supports_batch is True
+    assert runner(chain=FloatBatchedChain()).supports_batch is False
+
+
+def test_the_batch_primitive_does_not_turn_batching_on():
+    """原语到位 ≠ 默认开：`batch_limit` 仍是 1，引擎据此不攒批、也不把单条送进批路。
+
+    真要对 h2o 开合批，改的是这个上限（且先补"垫列钳位之后连跑 N 遍"的形状矩阵回归），
+    不是 `supports_batch`。
+    """
+    subject = runner(chain=BatchedChain(), max_len=16384)
+    assert subject.batch_limit == 1
+    assert subject.decision_stats()["supports_batch"] is True
+
+
+def test_two_independent_requests_share_one_pass():
+    """两条前缀不同的请求：走块对角，一条序列一个槽，前缀长度按 0 传。"""
+    chain = BatchedChain()
+    subject = runner(chain=chain, max_len=16384)
+    first, second = independent_requests()
+    results = subject.answers_batch((first, second), MaskMode.CAUSAL)
+
+    assert len(results) == 2
+    assert len(chain.batched_calls) == 1, "两条请求应该合成一趟"
+    sequences, prefixes, causal = chain.batched_calls[0]
+    assert len(sequences) == 2
+    assert prefixes == (0, 0), "h2o 的答面给不出前缀切点，按 0 传"
+    assert causal is True
+    assert chain.calls == [], "批那条路不该再逐题整趟"
+    assert subject.decisions.batch_hit == 1 and subject.decisions.batch_fallback == 0
+
+
+def test_a_batch_that_does_not_fit_falls_back_to_serial():
+    """形状挤不进一趟时链返回 `None`：退回逐题，答案与逐条调用逐位相同。"""
+    subject = runner(chain=BatchedChain(fits=False), max_len=16384)
+    first, second = independent_requests()
+    batched = subject.answers_batch((first, second), MaskMode.CAUSAL)
+    assert subject.decisions.batch_fallback == 1 and subject.decisions.batch_hit == 0
+
+    reference = runner()
+    for request, (answers, tokens, _) in zip((first, second), batched):
+        expected, expected_tokens, _ = reference.answers_for(request, MaskMode.CAUSAL)
+        assert [(item.value, item.probs) for item in answers] == \
+               [(item.value, item.probs) for item in expected]
+        assert tokens == expected_tokens
+
+
+def test_a_chain_without_the_batch_primitive_goes_serial():
+    """没有原语的链：不去试批，直接逐题 —— 记一次 fallback，而不是假装成功。"""
+    subject = runner()
+    first, second = independent_requests()
+    subject.answers_batch((first, second), MaskMode.CAUSAL)
+    assert len(subject._chain.calls) == 2
+    assert subject.decisions.batch_fallback == 1 and subject.decisions.batch_hit == 0
+
+
+def test_a_shared_prefix_wins_over_block_diagonal():
+    """两条请求 state 相同：共享前缀那条更便宜，不该按块对角排。"""
+    chain = BatchedChain()
+    subject = runner(chain=chain, max_len=16384)
+    same = make_request(questions=1, state="same record")
+    subject.answers_batch((same, same), MaskMode.CAUSAL)
+    assert chain.batched_calls == []
+    assert chain.shared_calls, "同前缀应该走共享那条"
+    assert subject.decisions.batch_hit == 1

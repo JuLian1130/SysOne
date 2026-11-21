@@ -45,8 +45,9 @@ _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one"
 class PooledChain(Protocol):
     """这条策略只需要链的两件事：末位 token 的最终 hidden 与卸载。
 
-    "前缀一遍、每题一条尾巴"是可选的第四条：有 `last_hidden_shared` 才共享（`supports_shared`
-    按链问）。`ModelChain` 的协议不强制它，替身链与 numpy 形态的链都可能没有。
+    另外两条是**可选的**：`last_hidden_shared`（"前缀一遍、每题一条尾巴"）与
+    `last_hidden_batched`（"多条独立序列并排一个 pass"）。有就走，没有就退回逐题 ——
+    `ModelChain` 的协议不强制它们，替身链与 numpy 形态的链都可能没有。
     """
 
     def last_hidden(self, tokens: Sequence[int], *, prefix: int = 0, causal: bool = False,
@@ -65,11 +66,26 @@ class PooledRunner(VisionRunner, DecisionRunner):
     题数与能力位决定，这里只提供原语 —— `encode`（厂商答面渲染）、`forward`（末行 hidden）、
     `forward_shared`（前缀一遍 + 每条尾巴的末行）、`answer`（标签行 × hidden 交回厂商）。
 
-    跨请求合批不声明（`supports_batch = False`，`batch_limit` 因此是基类的 1）：h2o 的真实
-    prompt p90 是 2644 token、桶宽 1024，块对角基本排不进一趟（Stage 4 才有结论）。
+    跨请求合批的**原语**已接（`forward_batched` → `last_hidden_batched`），但**策略默认关闭**：
+    `batch_limit` 仍是基类的 1，所以引擎既不攒批、也不把单条送进批路。理由与形状无关的那一半
+    才是结构性的（每条序列 ≤ 桶宽，见 `Pipeline.run_batched`）；收益那一半取决于真实输入分布在
+    不在可打包长度带上，样本语料给不出结论（`docs/sysone/decision-runner.md` Stage 4）。
     """
 
-    supports_batch = False
+    @property
+    def supports_batch(self) -> bool:
+        """这条链能不能"多条独立序列一个 pass"：`last_hidden_batched` 与零拷贝流水线两样都要。
+
+        与 `supports_shared` 同一个口径：`SplitChain` 上可能有这个名字，但 numpy 形态没有打包区
+        的落脚点（`can_share_prefix` 为假）。声明了却调不到是一条 500；退回串行只是一次没有
+        收益的前向。声明也不等于每次都走：装不下、带图、单条都按原样退回逐题。
+
+        **这一位不决定默认开关**：`batch_limit` 仍是基类的 1。真要对 h2o 开合批，改的是那个上限
+        （以及先补齐"V 侧钳位之后连跑 N 遍"的形状矩阵回归），不是这里。
+        """
+        chain = self._chain
+        return (callable(getattr(chain, "last_hidden_batched", None))
+                and bool(getattr(chain, "can_share_prefix", False)))
 
     def __init__(
         self,
@@ -174,8 +190,8 @@ class PooledRunner(VisionRunner, DecisionRunner):
         在 h2o 上会算出一个"看起来正常"的答案，所以它必须当场拒绝，而不是等数值对不上才发现。
 
         `media` 是给门与替身用的旁路（塔已经算完的图像侧）；请求自带的图仍走真路径，两条路
-        在基类汇合。跨请求合批那条入口不需要这道门：这条 runner 的 `supports_batch` 是 False、
-        `batch_limit` 是 1，引擎据此既不攒批、也不把单条送进批路。
+        在基类汇合。跨请求合批那条入口不需要这道门：`batch_limit` 是基类的 1，引擎据此既不
+        攒批、也不把单条送进批路（`supports_batch` 只回答"链有没有那条原语"）。
         """
         if mode not in _SUPPORTED_MODES:
             raise UnsupportedModeError(
@@ -226,6 +242,32 @@ class PooledRunner(VisionRunner, DecisionRunner):
         chain = self._require_chain()
         return chain.last_hidden_shared(  # type: ignore[attr-defined]
             prefix, tails, causal=causal, mm=mm)
+
+    def forward_batched(self, encoded: Sequence[Encoded], *, causal: bool = False,
+                        use_prefix: bool = True) -> Sequence[np.ndarray] | None:
+        """N 条独立序列并排一个 pass：链给每题一份末行 hidden；装不下就 `None`。
+
+        与 `forward_shared` 的分工是**没有共享前缀**：每条序列从第 0 列起，GDN 状态每槽一份
+        零值、注意力按块对角互不可见。所以它合的是"不同 state 的独立请求"。
+
+        `use_prefix=False`（`noncausal_full`）时前缀长度传 0：那条掩码没有前缀行，带进去会让
+        批里的序列按另一种掩码收行。h2o 的 `prefix_len` 恒为 `None`（厂商答面给不出切点），
+        所以 `prefixes` 实际上总是 0 —— 保留这条口径是为了与 split 同构。
+
+        形状由链自己判（`Pipeline._slot_layout` 一处）：`None` 就是"这批没有一次前向的解法"，
+        编排拿到它退回逐题，结果与逐条调用逐位相同。
+        """
+        chain = self._require_chain()
+        batch = getattr(chain, "last_hidden_batched", None)
+        if not callable(batch):
+            return None
+        return batch(
+            [item.ids for item in encoded],
+            prefixes=tuple(
+                0 if not use_prefix or item.prefix_len is None else item.prefix_len
+                for item in encoded),
+            causal=causal,
+        )
 
     def answer(self, encoded: Encoded, raw: object, *, index: int, kind: str) -> Answer:
         """末行 hidden × 标签行 → logits → 厂商判答案。

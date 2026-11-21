@@ -62,3 +62,33 @@ def test_layout_needs_a_bucket_of_slack() -> None:
     """宽缓冲只到前缀（真实 `serve` 的形状）：打包区没地方放，退回逐题。"""
     stub = SimpleNamespace(_bucket=1024, _width=16384)
     assert MudePipeline._slot_layout(stub, 16384, (60, 60)) is None
+
+
+# 桶 1024 下"能打包"的形状是**离散的四段**（槽宽必须整除桶宽），不是"短就能批"。
+# 这是"只对短提示词开合批"最容易被误判的地方：615 token 的 prompt 槽宽 640，一样进不去。
+@pytest.mark.parametrize("length,packable", [
+    (64, True),      # (0,128] → 槽宽 128、每桶 8 格
+    (128, True),
+    (129, True),     # (128,256] → 槽宽 256、每桶 4 格
+    (256, True),
+    (257, False),    # 槽宽 384 不整除 1024
+    (384, False),
+    (385, True),     # (384,512] → 槽宽 512、每桶 2 格
+    (512, True),
+    (513, False),    # 槽宽 640/768/896 都不整除 1024
+    (615, False),
+    (896, False),
+    (897, True),     # (896,1024] → 槽宽 1024、每桶 1 格
+    (1024, True),
+    (1025, False),   # 超过桶宽：一条序列会跨瓦片，而 GDN 的递归状态只有一份
+])
+def test_layout_packs_only_the_bands_whose_slot_divides_the_bucket(length: int,
+                                                                  packable: bool) -> None:
+    layout = _layout(0, (length, length))
+    assert (layout is not None) is packable, f"长度 {length} 的判定变了"
+
+
+def test_layout_uses_the_longest_sequence_for_the_slot() -> None:
+    """槽宽由**最长**那条决定：混进一条落在洞里的长度，整批一起退回逐题。"""
+    assert _layout(0, (100, 100)) is not None
+    assert _layout(0, (100, 615)) is None

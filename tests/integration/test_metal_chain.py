@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from sysone.errors import NotReadyError
 from sysone.models.families import mude
 
 MUDE = os.environ.get("SYS1_MUDE_WEIGHTS")
@@ -563,6 +564,37 @@ def test_forward_batched_returns_none_when_the_batch_does_not_pack(chains) -> No
     _, gpu = chains
     sequences = [_ids(100, seed=index) for index in range(3)]
     assert gpu.forward_batched(sequences, options=[4, 4, 4]) is None
+
+
+def test_last_hidden_batched_stays_finite_and_steady_over_repeated_passes(chains) -> None:
+    """块对角的末行 hidden：连跑几遍都要与逐条整趟一致，而不只是第一遍。
+
+    h2o 4B 几何（`core_out != hidden`）上曾经每 4–5 遍在"槽内最后一个没填满的 128 列带"
+    出一次 NaN/inf（量级到 2.5e2）：被掩码的 V 照样进 PV 矩阵乘，`0 × NaN` 还是 NaN。
+    `at_stage` 的 V 侧钳位挡住了它（`decision-runner.md` §9），而这类缺陷**单发验证看不到**
+    —— 所以这里连跑几遍，每一遍都查非有限值与漂移。
+    """
+    _, gpu = chains
+    sequences = [_ids(120, seed=21), _ids(120, seed=22)]
+    alone = [gpu.last_hidden(sequence) for sequence in sequences]
+    for step in range(6):
+        got = gpu.last_hidden_batched(sequences)
+        assert got is not None, "两条短序列该能排进一个桶"
+        for index, row in enumerate(got):
+            assert np.isfinite(row).all(), f"第 {step + 1} 遍槽 {index} 出现非有限值"
+            drift = float(np.abs(row - alone[index]).max())
+            assert drift <= SHARED_TOL, f"第 {step + 1} 遍槽 {index} 差 {drift:.3e}"
+
+
+def test_last_hidden_batched_needs_the_pipeline(chains) -> None:
+    """numpy 链没有打包区：这里报错，而不是静默 `None`。
+
+    `None` 的含义只有一个 —— "这批形状挤不进一趟"（调用方据此退回逐题）。把"这条链根本
+    没有块对角"也混进 `None`，一次本该报错的装配会变成永远静默的串行。
+    """
+    cpu, _ = chains
+    with pytest.raises(NotReadyError):
+        cpu.last_hidden_batched([_ids(8, seed=1), _ids(8, seed=2)])
 
 
 def test_masked_padding_columns_cannot_poison_a_batched_pass(chains) -> None:
