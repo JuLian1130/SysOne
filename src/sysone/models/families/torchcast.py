@@ -19,6 +19,7 @@ from pathlib import Path
 from ...config import EngineConfig
 from ...domain.attention import MaskMode
 from ..descriptor import ModelDescriptor, ReadoutPlan
+from ...weights.checkpoint import stored_quant
 from ..layer_plan import LayerPlan, WeightPlan
 from ..recipe import PooledRecipe
 from ..registry import register_family
@@ -34,7 +35,11 @@ MODES = frozenset({MaskMode.NONCAUSAL_FULL})
 
 
 def parse_config(model_dir: Path) -> ModelDescriptor:
-    """读出方案是 `lm_head` 的 A..Z 行；没有因果读法（引擎里也没有开关）。"""
+    """读出方案是 `lm_head` 的 A..Z 行；没有因果读法（引擎里也没有开关）。
+
+    `quant` 报的是**这份目录存成什么**（`int8_manifest.json` ⇒ row-int8），与 h2o 同一条判据：
+    不填的话 `Provenance` 与 `inspect` 会声称"未量化"，而机器上跑的正是 int8 权重。
+    """
     config = qwen35.load_json(model_dir / "config.json")
     return qwen35.descriptor_from(
         config,
@@ -45,6 +50,7 @@ def parse_config(model_dir: Path) -> ModelDescriptor:
         trained_modes=MODES,
         default_mode=MaskMode.NONCAUSAL_FULL,
         tied_embeddings=False,
+        quant=stored_quant(model_dir),
     )
 
 

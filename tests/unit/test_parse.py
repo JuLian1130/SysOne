@@ -141,6 +141,19 @@ def test_torchcast_untied() -> None:
     assert descriptor.readout.kind == "letter_rows"
     assert descriptor.readout.weight == "lm_head.weight"
     assert descriptor.supported_modes == frozenset({MaskMode.NONCAUSAL_FULL})
+    # 预热与默认掩码只有一种：它没训练过因果读法，`noncausal_full` 也没有前缀可复用。
+    assert descriptor.default_mode is MaskMode.NONCAUSAL_FULL
+
+
+def test_torchcast_reports_the_quantisation_it_is_stored_in(tmp_path) -> None:
+    """与 h2o 同一条判据：目录里有 `int8_manifest.json` 就报 row-int8。
+
+    不报的话 `Provenance` 与 `inspect` 会声称"未量化"，而机器上跑的正是那份 int8 权重。
+    """
+    shutil.copy(FIXTURES / "torchcast" / "config.json", tmp_path / "config.json")
+    assert torchcast.parse_config(tmp_path).quant.scheme is Scheme.NONE
+    (tmp_path / "int8_manifest.json").write_text('{"tensors": {}}', encoding="utf-8")
+    assert torchcast.parse_config(tmp_path).quant.scheme is Scheme.PER_ROW_SYM_INT8
 
 
 def test_heads_need_not_cover_hidden() -> None:
