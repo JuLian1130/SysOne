@@ -7,22 +7,22 @@ A fast, local decision inference engine. System-1 speed for edge AI.
 SysOne takes a structured state (a JSON object or a piece of text) plus a set of
 questions and options, and returns a probability for every option.
 
-## Models
+## Why SysOne
 
-| Family | Model |
-|---|---|
-| h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
-| mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
-
-Both models answer `choice`, `noul` and `score` questions.
+- **Both compute units at once.** The Neural Engine (ANE) runs the projection
+  and FFN layers while the GPU runs attention and the state update; the two
+  overlap instead of taking turns, which makes the same model at least 2.5×
+  faster than a GPU-only path.
+- **Memory that does not follow the model.** h2o's weights are 9.3 GB on disk
+  and the service settles at about 0.6 GB, because only the resident layer
+  window lives on the ANE; a conventional engine keeps every weight resident.
 
 ## Requirements
 
 - Apple Silicon (M1 or newer) on macOS 14 or newer.
 - 8 GB of memory or more. The weights are memory-mapped, and only the resident
-  layer window (`--W`, four layers by default) is held on the ANE: a running h2o
-  service sits at about 0.6 GB. `--W 0` keeps all 32 layers resident and needs
-  about 4.5 GB.
+  layer window (`--W`, four layers by default) is held on the ANE; `--W 0` keeps
+  all 32 layers resident and needs about 4.5 GB.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
 - Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus about 4 GiB
@@ -83,7 +83,7 @@ optional.
 | `--backend {split,pooled,reference}` | `pooled` for h2o, `split` for mude | execution path; `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |
-| `--quant {int8,fp16}` | `int8` | Apple Neural Engine (ANE) weight storage; compute stays fp16 either way |
+| `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
 | `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `16384` | GPU buffer width, also the max input tokens |

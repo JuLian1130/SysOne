@@ -7,20 +7,18 @@
 SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问题与选项，为每个选项返回一个
 概率。
 
-## 模型
+## 为什么用 SysOne
 
-| 家族 | 模型 |
-|---|---|
-| h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
-| mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
-
-两个模型都答 `choice`、`noul` 与 `score` 三类问题。
+- **两颗芯片同时在算。** 投影与 FFN 跑在神经网络引擎（ANE）上，注意力与状态更新跑在
+  GPU 上，两边重叠而不是轮流；同一个模型因此比纯 GPU 路径至少快 2.5 倍。
+- **内存不跟着模型涨。** h2o 的权重在磁盘上是 9.3 GB，跑起来只占约 0.6 GB：ANE 上只
+  驻留待命的层窗口，传统推理引擎则把整份权重常驻。
 
 ## 环境要求
 
 - Apple Silicon（M1 或更新），macOS 14 或更新。
-- 8 GB 或更多内存。权重按需 mmap，ANE 上只驻留待命的层窗口（`--W`，默认 4 层）：跑起来
-  的 h2o 服务约占 0.6 GB；`--W 0` 把 32 层全部常驻，约需 4.5 GB。
+- 8 GB 或更多内存。权重按需 mmap，ANE 上只驻留待命的层窗口（`--W`，默认 4 层）；
+  `--W 0` 把 32 层全部常驻，约需 4.5 GB。
 - arm64 Python 3.11 或更新。
 - Xcode Command Line Tools（`xcode-select --install`），`clang` 需要它。
 - 磁盘：h2o 权重约 9.3 GB、mude 约 4 GB，另加约 4 GiB 编译产物。权重在首次使用时下载。
@@ -78,7 +76,7 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 | `--backend {split,pooled,reference}` | h2o 用 `pooled`、mude 用 `split` | 执行路径；`reference` 是只用于测试的语义裁判 |
 | `--weights PATH` | 自动下载 | 显式包；只读，永不下网 |
 | `--offline` | 关 | 不碰网络 |
-| `--quant {int8,fp16}` | `int8` | Apple Neural Engine（ANE）权重存储形态；计算始终 fp16 |
+| `--quant {int8,fp16}` | `int8` | ANE 权重存储形态；计算始终 fp16 |
 | `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`） | 掩码；请求可覆盖 |
 | `--bucket N` | `1024` | ANE program 列宽 |
 | `--width N` | `16384` | GPU 缓冲宽度，也是最大输入 token 数 |
