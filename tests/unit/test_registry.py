@@ -15,8 +15,8 @@ def _noop_plan(descriptor, config):
     return None  # 注册表不调用它
 
 
-def test_five_families_registered() -> None:
-    assert {"d3", "h2o", "mude", "pplx", "torchcast"} <= set(registered())
+def test_four_families_registered() -> None:
+    assert {"d3", "h2o", "mude", "torchcast"} <= set(registered())
 
 
 def test_unknown_family_reports_available() -> None:
@@ -43,8 +43,8 @@ def test_a_family_must_declare_its_readout_strategy() -> None:
 def test_executor_families_declare_a_weight_plan() -> None:
     """设备层要的那四项从注册表就能拿到：查产物（`sysone doctor`）不必先装配执行器。
 
-    五家都居于设备链上（mude / d3 / pplx 走码表，h2o 与 torchcast 走池化读出），所以五家都有；
+    四家都居于设备链上（mude / d3 走码表，h2o 与 torchcast 走池化读出），所以四家都有；
     这个字段仍然可选，`vendor` 策略不建设备链，接进来的家族可以不给。
     """
-    for name in ("d3", "h2o", "mude", "pplx", "torchcast"):
+    for name in ("d3", "h2o", "mude", "torchcast"):
         assert family(name).weight_plan is not None

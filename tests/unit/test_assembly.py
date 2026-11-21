@@ -52,10 +52,9 @@ def builders(monkeypatch):
 
 
 def test_families_declare_how_their_answers_are_read():
-    """声明是**家族**给的：mude / d3 / pplx 固定码表、h2o 与 torchcast 走池化读出。"""
+    """声明是**家族**给的：mude / d3 固定码表、h2o 与 torchcast 走池化读出。"""
     assert family("mude").strategy == "split"
     assert family("d3").strategy == "split"
-    assert family("pplx").strategy == "split"
     assert family("h2o").strategy == "pooled"
     assert family("torchcast").strategy == "pooled"
 
@@ -71,10 +70,9 @@ def test_each_family_brings_the_pieces_of_its_own_readout():
     assert isinstance(family("torchcast").recipe, PooledRecipe)
     assert family("torchcast").recipe is not family("h2o").recipe
     assert family("torchcast").recipe.serve is not family("h2o").recipe.serve
-    # d3 / pplx 与 mude 是同一条线格式的另外两份检查点：题面、255 个回答码与置信度口径没有
-    # 第二套定义，所以**显式**共用同一份配方（`bare-split` 那条测试守的是"静默借"）。
+    # d3 与 mude 是同一条线格式的另一份检查点：题面、255 个回答码与置信度口径没有第二套
+    # 定义，所以**显式**共用同一份配方（`bare-split` 那条测试守的是"静默借"）。
     assert family("d3").recipe is family("mude").recipe
-    assert family("pplx").recipe is family("mude").recipe
 
 
 def test_the_family_recipe_and_weight_plan_reach_the_factory(tmp_path, builders):

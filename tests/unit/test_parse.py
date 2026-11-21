@@ -13,7 +13,7 @@ from sysone.devices.apple.geometry import Geometry, mude_geometry
 from sysone.domain.attention import AttentionRole, MaskMode
 from sysone.domain.quant import Scheme
 from sysone.errors import ConfigError
-from sysone.models.families import d3, h2o, mude, pplx, qwen35, torchcast
+from sysone.models.families import d3, h2o, mude, qwen35, torchcast
 
 
 def test_mude_geometry() -> None:
@@ -254,13 +254,13 @@ def test_missing_config_is_config_error(tmp_path) -> None:
         mude.parse_config(tmp_path)
 
 
-def test_d3_and_pplx_read_the_same_wire_format_on_the_4b_body(tmp_path) -> None:
-    """两家都是 d3 线格式的 4B 检查点：255 行码表、`language_model` 前缀、只有双向。
+def test_d3_reads_the_mude_wire_format_on_the_4b_body(tmp_path) -> None:
+    """d3-mini 是 d3 线格式的 4B 检查点：255 行码表、`language_model` 前缀、只有双向。
 
     与 mude 的差别只有几何与掩码声明：读出方案、`norm` 存法（`w + 1`）都与那两份 4B 家族
-    相同，所以它们共用同一条 `SplitChain`，不需要新的设备路径。
+    相同，所以它共用同一条 `SplitChain`，不需要新的设备路径。
     """
-    for module, name in ((d3, "d3"), (pplx, "pplx")):
+    for module, name in ((d3, "d3"),):
         root = make_code_checkpoint(tmp_path / name)
         descriptor = module.parse_config(root)
         assert descriptor.family == name
@@ -300,3 +300,16 @@ def test_a_text_only_decision_checkpoint_declares_no_tower(tmp_path) -> None:
     assert descriptor.vision is None
     assert descriptor.image_token_id is None
     assert descriptor.vision_start_token_id is None
+
+
+def test_a_decision_config_without_the_d3_format_id_is_refused(tmp_path) -> None:
+    """d3 线格式的码表函数要认 `format_id`：另一套决策检查点（pplx-decider-flash）同样有 255 个
+    码，但 `decision_config.json` 里没有它，读法也不同。缺这一项时必须当场拒绝，而不是把别人的
+    码表当成 mude 的用。"""
+    root = make_code_checkpoint(tmp_path)
+    decision = json.loads((root / "decision_config.json").read_text(encoding="utf-8"))
+    del decision["format_id"]
+    (root / "decision_config.json").write_text(json.dumps(decision), encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        mude.read_codes(root)
+    assert caught.value.context["format_id"] is None

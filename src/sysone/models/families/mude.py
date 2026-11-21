@@ -297,9 +297,10 @@ def weight_plan(model_dir: Path) -> WeightPlan:
 # 交给 split 策略的接入件：答案码表、题面渲染、置信度口径。换一份 checkpoint 就换这里，
 # 策略与设备层都不动。
 #
-# d3 与 pplx（`families/d3.py` / `pplx.py`）是同一条线格式的另外两份 4B 检查点，直接共用这
-# 一份配方：题面、255 个回答码与置信度口径没有第二套定义。它们各自的差异（4B 几何、单双向
-# 掩码）在各自的家族模块里声明。
+# d3（`families/d3.py`）是同一条线格式的另一份 4B 检查点，直接共用这一份配方：题面、255 个
+# 回答码与置信度口径没有第二套定义。它的差异（4B 几何、单双向掩码）在自己的家族模块里声明。
+# 另一套决策检查点（pplx-decider-flash）虽然也有 255 个码，但题面与读出位置都不同，不能借
+# 这份配方 —— 见 `docs/sysone/plan.md` 票据 22 末节。
 RECIPE = SplitRecipe(labels=read_codes, prompter=MudePrompter, confidence=confidence)
 
 register_family("mude", parse_config, build_layer_plan,
