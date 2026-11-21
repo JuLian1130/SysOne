@@ -7,12 +7,12 @@ A fast, local decision inference engine. System-1 speed for edge AI.
 SysOne takes a structured state (a JSON object or a piece of text) plus a set of
 questions and options, and returns a probability for every option.
 
-## What is supported
+## Models
 
-| Backend | Family | Model |
-|---|---|---|
-| `pooled` | h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
-| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
+| Family | Model |
+|---|---|
+| h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
+| mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
 
 Both models answer `choice`, `noul` and `score` questions.
 
@@ -42,9 +42,8 @@ pip install -e ./src
 
 ## Build the native libraries
 
-`serve` needs three small native libraries. They are built from the `.m` sources
-in `tools/native/`, not shipped in the repository. Run this once per checkout;
-the first `serve` will not start without it:
+`serve` needs three native libraries, which the repository does not ship. Run
+this once per checkout; the first `serve` will not start without it:
 
 ```sh
 tools/build_ane.sh
@@ -71,21 +70,20 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
   -d @examples/request-service.json
 ```
 
-The full contract — routes, authentication, status codes, request and response
-shapes, and per-model capabilities — is in [API.md](API.md).
+Routes, status codes and request/response shapes: [API.md](API.md).
 
 ### Options
 
-`sysone serve` takes the shared model flags plus the HTTP ones. Defaults are
-what a first run needs; every flag is optional.
+`sysone serve` takes the shared model flags plus the HTTP ones; every flag is
+optional.
 
 | Flag | Default / values | Meaning |
 |---|---|---|
 | `--model {h2o,mude}` | from `--backend` or `--weights` | model family |
-| `--backend {split,pooled,reference}` | from `--model` | execution path; `reference` is the test-only semantic judge |
+| `--backend {split,pooled,reference}` | `pooled` for h2o, `split` for mude | execution path; `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |
-| `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
+| `--quant {int8,fp16}` | `int8` | Apple Neural Engine (ANE) weight storage; compute stays fp16 either way |
 | `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `16384` | GPU buffer width, also the max input tokens |

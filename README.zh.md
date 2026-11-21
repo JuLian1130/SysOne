@@ -7,12 +7,12 @@
 SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问题与选项，为每个选项返回一个
 概率。
 
-## 支持范围
+## 模型
 
-| 后端 | 家族 | 模型 |
-|---|---|---|
-| `pooled` | h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
-| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
+| 家族 | 模型 |
+|---|---|
+| h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) |
+| mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) |
 
 两个模型都答 `choice`、`noul` 与 `score` 三类问题。
 
@@ -39,8 +39,8 @@ pip install -e ./src
 
 ## 构建原生库
 
-`serve` 需要三份小的原生库。它们由 `tools/native/` 里的 `.m` 源码构建，仓库不附带
-二进制。每个 checkout 只跑一次；不跑的话第一次 `serve` 起不来：
+`serve` 需要三份原生库，仓库不附带。每个 checkout 只跑一次；不跑的话第一次 `serve`
+起不来：
 
 ```sh
 tools/build_ane.sh
@@ -66,21 +66,19 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
   -d @examples/request-service.json
 ```
 
-完整的契约——路由、认证、状态码、请求与响应的形状、各模型能力——见
-[API.zh.md](API.zh.md)。
+路由、状态码与请求/响应形状见 [API.zh.md](API.zh.md)。
 
 ### 参数
 
-`sysone serve` 接收共用的模型参数与 HTTP 参数。默认值就是首次运行需要的样子；所有参数
-都可选。
+`sysone serve` 接收共用的模型参数与 HTTP 参数；所有参数都可选。
 
 | 参数 | 默认 / 取值 | 含义 |
 |---|---|---|
 | `--model {h2o,mude}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
-| `--backend {split,pooled,reference}` | 由 `--model` 推断 | 执行路径；`reference` 是只用于测试的语义裁判 |
+| `--backend {split,pooled,reference}` | h2o 用 `pooled`、mude 用 `split` | 执行路径；`reference` 是只用于测试的语义裁判 |
 | `--weights PATH` | 自动下载 | 显式包；只读，永不下网 |
 | `--offline` | 关 | 不碰网络 |
-| `--quant {int8,fp16}` | `int8` | ANE 权重存储形态；计算始终 fp16 |
+| `--quant {int8,fp16}` | `int8` | Apple Neural Engine（ANE）权重存储形态；计算始终 fp16 |
 | `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`） | 掩码；请求可覆盖 |
 | `--bucket N` | `1024` | ANE program 列宽 |
 | `--width N` | `16384` | GPU 缓冲宽度，也是最大输入 token 数 |
