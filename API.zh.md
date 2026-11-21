@@ -88,7 +88,7 @@
 | 读出 | 厂商 pooled 读出 | 固定 255 行码表 | 26 行 `lm_head` 字母 |
 | 每题最多选项 | 255 | 255（`score` 为 10） | 26（`score` 为 10） |
 | 最大输入 token | `--width` (default 16384) | `--width` (default 16384) | `--width` (default 16384) |
-| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 这条装配不做图 |
+| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
 
 首次启动还会把视觉塔的 26 份产物编好，然后归还塔：纯文本进程保持 0 常驻，第一次带图
 请求只付装载。`--vision off` 跳过塔及其产物。第三份 dylib（`libe8image.dylib`）只在真的

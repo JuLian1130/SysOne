@@ -9,6 +9,11 @@
 **这里没有前向。** `vendors/torchcast_bridge.py`（厂商 torch 引擎，对拍基线）与
 `engine/strategies/pooled.py`（我们的 ANE 链）都走这一份答面。
 
+**图**：厂商带图时把消息改成结构化 content 交给模板展开图块，这里是字符串拼接
+（`VISION_BLOCK`）—— 两者渲染出的文本逐字节相同，所以 token 也相同。占位符展开成
+`counts[i]` 行、M-RoPE 三轴位置与行覆盖都在链上（`models/vision/merge`、`chain._mrope`），
+这条面只负责"图放在题面的哪儿"。
+
 与厂商有意的两处差别，都会出声而不是静默改变数值：
 
 1. 题面超过 16 384 token 时厂商把 state 首尾留下、中间插一行 `\\n...\\n`；我们不改写（重新切
@@ -41,6 +46,12 @@ from .base import Prepared, wire_answer
 
 VERSION = "jev_render_v3"
 CONFIG_FILE = "decision_config.json"
+# 一张图一个占位符。分词器模板对 `{"type": "image"}` 渲染出的就是这三个特殊 token（`add_vision_id`
+# 未定义，所以模板不加 "Picture k:"），实测与字符串拼接**逐字节相同**；`image_pad` 的 id 与
+# `config.json` 的 `image_token_id` 一致，链据此把占位符展开成 `counts[i]` 行。
+VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
+# state 里可以用它标"图放这儿"（厂商 `_state_with_images` 同一记号）；不写就放在 state 之前。
+IMAGE_MARK = "<image>"
 SYSTEM = (
     "Apply the criterion to the evidence. Choose exactly one listed option. "
     "Answer with its letter only."
@@ -98,6 +109,34 @@ def state_as_text(state: object) -> str:
     if isinstance(state, str):
         return state
     return "" if state in (None, {}, []) else json.dumps(_positions(state), ensure_ascii=False)
+
+
+def with_images(state: object, count: int) -> str:
+    """带图请求的 state 文本：按厂商 `_state_with_images` 的同一套位置规则拼进图块。
+
+    三种情形，与厂商逐条对应：
+
+    - state 里有 `count` 个 `<image>` 记号 → 每个记号换成一块（图跟着文字走）；
+    - 有记号但数对不上 → 拒（`422`：请求自相矛盾，重试也一样）；
+    - 没有记号 → 一张图放在 state 之前；多张按 `Image k:` 逐行列出，再接空行与 state。
+
+    模板那条路是"结构化 content 交给 jinja 展开"，这里是字符串拼接 —— `add_vision_id` 未定义
+    时两者渲染出的**字符串逐字节相同**，所以 token 也相同（见 `test_torchcast_serve.py`）。
+    """
+    if count < 1:
+        raise UnsupportedMediaError("图数必须为正", images=count)
+    text = state_as_text(state)
+    marks = text.count(IMAGE_MARK)
+    if marks == count:
+        return text.replace(IMAGE_MARK, VISION_BLOCK)
+    if marks:
+        raise UnsupportedMediaError(
+            "state 里的 <image> 记号数与图数不一致", marks=marks, images=count)
+    if count == 1:
+        lead = VISION_BLOCK
+    else:
+        lead = "\n".join(f"Image {index}: {VISION_BLOCK}" for index in range(1, count + 1))
+    return lead if not text.strip() else lead + "\n\n" + text
 
 
 def _text_or_none(value: object) -> str | None:
@@ -270,9 +309,8 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
 class Serve:
     """厂商的答面。`config` / `tokenizer` 都能注入，单测不需要真模型目录。"""
 
-    # 这条面把图块渲染成 state 里的 `<image>` 记号是由厂商前向填 embedding 才成立的；我们的链
-    # 没有那条路，所以装配不为它建塔（`prepare(images>0)` 也会拒）。
-    supports_images = False
+    # 图块由 `prepare` 拼进 state（`with_images`），链负责展开占位符与 M-RoPE 位置，装配据此建塔。
+    supports_images = True
 
     def __init__(self, config: dict, tokenizer: object) -> None:
         prompt_format = config.get("prompt_format", VERSION)
@@ -317,9 +355,14 @@ class Serve:
 
         `label_ids` 是字母 token 的 id（读出表按它取 `lm_head` 的行），`labels` 是**选项 id**
         —— 字母只是题面里的记号，答面直接给引擎的判词口径，不用把字母再翻回 id。
+
+        `images > 0` 时图块已由 `with_images` 拼进 state，这里照常渲染：返回的 id 里每张图只有
+        **一个** `image_pad`，展开成 `counts[i]` 行是链的事（`merge.attach`）。
         """
+        if images < 0:
+            raise UnsupportedMediaError("图数不能为负", images=images)
         if images:
-            raise UnsupportedMediaError("torchcast 这条装配不做图", images=images)
+            state = with_images(state, images)
         item = question(state, spec)
         ids = _ids(self._tokenizer, chat_text(self._tokenizer, chat(item)))
         if len(ids) > BUDGET:
@@ -380,4 +423,4 @@ class Serve:
 
 
 __all__ = ["Serve", "chat", "chat_text", "letter_ids", "option_lines", "question", "state_as_text",
-           "user_text"]
+           "user_text", "with_images"]

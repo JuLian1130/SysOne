@@ -14,7 +14,7 @@ import sysone
 import sysone.config, sysone.domain.attention, sysone.engine.engine
 import sysone.devices.reference
 import sysone.models.families
-import sysone.models.tokenizer, sysone.models.vendors.h2o_serve
+import sysone.models.tokenizer, sysone.models.vendors.h2o_serve, sysone.models.vendors.torchcast_serve
 assert "torch" not in sys.modules, sorted(m for m in sys.modules if m == "torch")
 assert "transformers" not in sys.modules, sorted(m for m in sys.modules if m == "transformers")
 print("ok")

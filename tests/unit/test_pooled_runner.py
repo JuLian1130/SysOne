@@ -16,7 +16,13 @@ from sysone.domain.attention import MaskMode
 from sysone.domain.decision import DecisionRequest, Question
 from sysone.engine.strategies.decision import shared_prefix
 from sysone.engine.strategies.pooled import PooledRunner
-from sysone.errors import ConfigError, NotReadyError, RequestTooLongError, UnsupportedModeError
+from sysone.errors import (
+    ConfigError,
+    NotReadyError,
+    RequestTooLongError,
+    UnsupportedMediaError,
+    UnsupportedModeError,
+)
 from sysone.models.vendors.base import Prepared
 from sysone.models.vendors.h2o_serve import Serve
 
@@ -123,6 +129,110 @@ def two_question_request() -> DecisionRequest:
         ),
         request_id="two-q",
     )
+
+
+# --------------------------------------------------------------------- 图
+IMAGE_TOKEN = 248056
+
+
+class FakeSlot:
+    """`VisionSlot` 的替身：只记"被调了几次、收尾了几次"，并按给定的行数交一份 `Media`。"""
+
+    def __init__(self, rows: int = 4) -> None:
+        self.rows = rows
+        self.calls: list[object] = []
+        self.finished = 0
+        self.closed = 0
+
+    def media(self, refs):
+        from sysone.models.vision import merge
+
+        self.calls.append(tuple(refs))
+        return merge.Media(counts=(self.rows,), grids=((1, self.rows),),
+                           rows=np.zeros((self.rows, HIDDEN), np.float32))
+
+    def finish(self) -> None:
+        self.finished += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def warm(self) -> None:
+        self.calls.append("warm")
+
+    def stats(self) -> dict:
+        return {"loaded": bool(self.calls), "bytes": 1, "reuse": [26, 26], "loads": 1,
+                "unloads": 0, "load_s": 0.0, "idle_s": 60.0, "evals": 0, "ane_ms": 0.0,
+                "gpu_ms": 0.0}
+
+
+class ImageServe:
+    """答面替身：题面里带**一个**图块占位符（真实答案是 `prepare` 拼好后交出来的）。"""
+
+    supports_images = True
+
+    def prepare(self, state, spec, *, images=0):
+        ids = (IMAGE_TOKEN,) * images + (ord("x"), ord("y"))
+        return Prepared(ids=ids, label_ids=(1, 2), labels=("A", "B"), names=("A", "B"),
+                        descs=("a", "b"), kind="choice", temperature=1.0, threshold=None)
+
+    def answer(self, prepared, logits):
+        return "A", ("A", "B"), (0.75, 0.25), 0.5
+
+
+def vision_runner(chain=None, *, slot: FakeSlot | None = None, rows: int = 4):
+    """一条"有塔"的 pooled 装配：`prefix_len` 是 `None`（答面量不出前缀边界）就是这条路的常态。"""
+    chain = chain if chain is not None else FakeChain()
+    if slot is not None:
+        chain.metal_runtime = object()      # 只用来回答"有没有 Metal 运行时"
+    runner = PooledRunner(
+        lambda: chain, ImageServe(), rows_by_label,
+        supported_modes=frozenset({MaskMode.NONCAUSAL_FULL}),
+        default_mode=MaskMode.NONCAUSAL_FULL, max_len=64,
+        image_token_id=IMAGE_TOKEN,
+        load_tower=(lambda held: slot) if slot is not None else None,
+        vision_state=(lambda held: {"reusable": 26, "total": 26}) if slot is not None else None,
+    )
+    runner.load_weights()
+    return runner, chain
+
+
+def with_media(request):
+    import dataclasses
+
+    from sysone.domain.decision import MediaRef
+
+    return dataclasses.replace(
+        request, media=(MediaRef(kind="image", data=b"\x89PNG\r\n\x1a\n"),))
+
+
+def test_an_image_request_expands_the_placeholder_before_the_forward():
+    """一张图一个占位符 → `counts[0]` 个 token；链拿到的是**展开之后**那条序列。
+
+    这条同时钉住另一件事：pooled 的 `prefix_len` 是 `None`（答面给不出切点），所以"前缀里
+    的图"这一段是空的 —— 拿全请求的 counts 去展开空前缀会立刻报错，那条路不能走。
+    """
+    slot = FakeSlot(rows=4)
+    runner, chain = vision_runner(slot=slot)
+    request = with_media(two_option_request())
+
+    answers, tokens, _ = runner.answers_for(request, MaskMode.NONCAUSAL_FULL)
+
+    assert answers[0].value == "A"
+    # 占位符 1 个 → 4 行，再加 2 个文本 token
+    assert len(chain.calls[-1][0]) == 6
+    assert chain.calls[-1][0][:4] == (IMAGE_TOKEN,) * 4, "占位符就地展开成一行一块"
+    assert tokens == 6, "报给协议的 token 数是展开之后的长度"
+    assert slot.calls and slot.finished == 1, "一次请求结束要 finish（TTL 从这儿起算）"
+    assert runner.decisions.media_skip == 1, "带图请求不进共享/合批，要记这一笔"
+
+
+def test_a_loader_without_a_tower_refuses_images_with_a_reason():
+    runner, chain = vision_runner(slot=None)
+    with pytest.raises(UnsupportedMediaError) as caught:
+        runner.answers_for(with_media(two_option_request()), MaskMode.NONCAUSAL_FULL)
+    assert chain.calls == [], "拒收之前不该发生任何前向"
+    assert "--vision" in caught.value.message
 
 
 # ------------------------------------------------------------------- 答案

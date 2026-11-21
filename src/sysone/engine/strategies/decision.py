@@ -341,11 +341,15 @@ class DecisionRunner:
                     "展开图像占位符之后超过链的缓冲宽度",
                     length=len(expanded), max_len=self._max_len, question=index)
             # 前缀里也有图块，所以前缀长度要跟着展开（模型量的是未展开的那串）。
-            # `prefix_len is None` 只出现在量不出边界的链上：按 0 处理等于退回逐题，
-            # 不会假装共享。
+            # `prefix_len is None` 只出现在量不出边界的链上（pooled 的答面给不出切点）：
+            # 按 0 处理等于退回逐题，不会假装共享 —— 这时前缀是空的，**它里面没有图**，
+            # 拿全请求的 `counts` 去展开会立刻报"占位符数与图数不一致"。
             cut = 0 if item.prefix_len is None else item.prefix_len
-            prefix_ids, _ = merge.expand_image_tokens(
-                item.ids[:cut], media.counts, image_token_id=self._image_token)  # type: ignore[arg-type]
+            if cut:
+                prefix_ids, _ = merge.expand_image_tokens(
+                    item.ids[:cut], media.counts, image_token_id=self._image_token)  # type: ignore[arg-type]
+            else:
+                prefix_ids = []
             placed.append(replace(item, ids=tuple(expanded), prefix_len=len(prefix_ids)))
             placements.append(placement)
         return placed, placements

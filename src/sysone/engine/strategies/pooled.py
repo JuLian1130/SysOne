@@ -457,9 +457,9 @@ def pooled_runner(
         )
         return {"directory": str(state.directory), "reusable": state.hits, "total": state.total}
 
-    # 答面收不了图时不建塔：编 26 份塔产物是每次启动几秒与一块常驻，而请求会在编码前就 422。
-    # `image_token_id=None` 让 `VisionRunner` 报出**真实**原因（"这个模型没有视觉塔"），
-    # 而不是"视觉被关掉了：给 --vision auto" —— 后者是错的建议。
+    # 答面收不了图时不建塔（今天两家都能收，这一位留给下一个 pooled 家族）：编 26 份塔产物是
+    # 每次启动几秒与一块常驻，而请求会在编码前就 422。`image_token_id=None` 让 `VisionRunner`
+    # 报出**真实**原因（"这个模型没有视觉塔"），而不是错误的建议"给 --vision auto"。
     images_ok = bool(getattr(serve, "supports_images", True))
     load = (load_tower
             if (images_ok and vision is not False and weights.descriptor.vision is not None)

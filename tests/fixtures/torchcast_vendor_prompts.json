@@ -591,5 +591,54 @@
     }
    }
   }
+ ],
+ "images": [
+  {
+   "name": "one_image_no_mark",
+   "state": "ticket: Checkout returns 500 for every customer since 09:12.\nplan: \"enterprise\"",
+   "count": 1,
+   "text": "<|vision_start|><|image_pad|><|vision_end|>\n\nticket: Checkout returns 500 for every customer since 09:12.\nplan: \"enterprise\""
+  },
+  {
+   "name": "two_images_no_mark",
+   "state": "ticket: Checkout returns 500 for every customer since 09:12.\nplan: \"enterprise\"",
+   "count": 2,
+   "text": "Image 1: <|vision_start|><|image_pad|><|vision_end|>\nImage 2: <|vision_start|><|image_pad|><|vision_end|>\n\nticket: Checkout returns 500 for every customer since 09:12.\nplan: \"enterprise\""
+  },
+  {
+   "name": "three_images_no_mark",
+   "state": "record",
+   "count": 3,
+   "text": "Image 1: <|vision_start|><|image_pad|><|vision_end|>\nImage 2: <|vision_start|><|image_pad|><|vision_end|>\nImage 3: <|vision_start|><|image_pad|><|vision_end|>\n\nrecord"
+  },
+  {
+   "name": "one_image_empty_state",
+   "state": "",
+   "count": 1,
+   "text": "<|vision_start|><|image_pad|><|vision_end|>"
+  },
+  {
+   "name": "mark_after_text",
+   "state": "claim: HX-2026-118804\n<image>\nnote: second page",
+   "count": 1,
+   "text": "claim: HX-2026-118804\n<|vision_start|><|image_pad|><|vision_end|>\nnote: second page"
+  },
+  {
+   "name": "two_marks",
+   "state": "before <image> middle <image> after",
+   "count": 2,
+   "text": "before <|vision_start|><|image_pad|><|vision_end|> middle <|vision_start|><|image_pad|><|vision_end|> after"
+  },
+  {
+   "name": "dict_state_with_image",
+   "state": {
+    "policy": {
+     "id": "HM-3"
+    },
+    "scan": "<image>"
+   },
+   "count": 1,
+   "text": "{\"policy\": {\"id\": \"HM-3\"}, \"scan\": \"<|vision_start|><|image_pad|><|vision_end|>\"}"
+  }
  ]
 }

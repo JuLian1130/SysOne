@@ -38,6 +38,9 @@ from sysone.models.vendors.torchcast_serve import (
     user_text,
 )
 
+# 真实 checkpoint 的 `image_token_id`（`config.json`）：图块中间那个 token。
+IMAGE_TOKEN_ID = 248056
+
 FIXTURE = json.loads(
     (Path(__file__).resolve().parents[1] / "fixtures" / "torchcast_vendor_prompts.json").read_text(
         encoding="utf-8"
@@ -52,6 +55,10 @@ class FakeTokenizer:
     模板套用的原文要能被逐字比对，所以这里把消息直接拼成一段可读文本。
     """
 
+    # 图块那三个是**原子** token：真分词器上它们各是一个 id（`added_tokens`）。
+    specials = {"<|vision_start|>": 248053, "<|image_pad|>": IMAGE_TOKEN_ID,
+                "<|vision_end|>": 248054}
+
     def __init__(self, letters: tuple[int, ...] = LETTER_IDS) -> None:
         self.letters = dict(zip(LETTERS, letters))
         self.calls: list[str] = []
@@ -63,9 +70,19 @@ class FakeTokenizer:
         """
         assert add_special_tokens is False
         self.calls.append(text)
-        return {"input_ids": [
-            self.letters.get(char, ord(char)) for char in text if char.strip()
-        ]}
+        ids: list[int] = []
+        rest = text
+        while rest:
+            for token, value in self.specials.items():
+                if rest.startswith(token):
+                    ids.append(value)
+                    rest = rest[len(token):]
+                    break
+            else:
+                char, rest = rest[0], rest[1:]
+                if char.strip():
+                    ids.append(self.letters.get(char, ord(char)))
+        return {"input_ids": ids}
 
     def apply_chat_template(self, messages, *, tokenize=False, add_generation_prompt=True,
                             **kwargs):
@@ -194,13 +211,44 @@ def test_a_prompt_over_the_budget_is_refused_rather_than_truncated() -> None:
                               "criteria": {"a": "A", "b": "B"}})
 
 
-def test_images_are_refused_and_the_tower_is_not_built() -> None:
-    """这条面收不了图：`prepare` 直接拒，装配据此**不建**视觉塔（26 份产物是每次启动几秒）。"""
+# --------------------------------------------------------------------- 图
+@pytest.mark.parametrize("case", FIXTURE["images"], ids=lambda case: case["name"])
+def test_the_image_block_lands_where_the_vendor_puts_it(case: dict) -> None:
+    """图块的位置与厂商 `_state_with_images` 逐字节相同（金标由厂商那句生成一次）。
+
+    三种情形都在里面：没有记号（图在前，多图是 `Image k:` 逐行）、记号数对得上（图跟着文字
+    走）、以及 dict state（记号在压缩后的 JSON 里）。
+    """
+    assert torchcast_serve.with_images(case["state"], case["count"]) == case["text"]
+
+
+def test_a_mark_count_that_disagrees_with_the_images_is_refused() -> None:
+    """记号与图各说各话时不能"照旧覆盖"：那会把一张图的行盖到另一张的位置上。"""
+    with pytest.raises(UnsupportedMediaError):
+        torchcast_serve.with_images("one <image> only", 2)
+
+
+def test_prepare_keeps_exactly_one_placeholder_per_image() -> None:
+    """展开成 `counts[i]` 行是链的事（`merge.attach`）；这条面只放**一个**占位符。
+
+    放两个就会让 `expand_image_tokens` 数不对而报错，或者更糟：两个占位符各取一半行。
+    """
     subject = serve()
-    assert subject.supports_images is False
+    prepared = subject.prepare("record", {"type": "choice", "instructions": "q",
+                                          "criteria": {"a": "A", "b": "B"}}, images=2)
+    assert subject.supports_images is True
+    assert list(prepared.ids).count(IMAGE_TOKEN_ID) == 2
+    # 两张图的题面比一张长两行左右的 `Image k: …`，且都以图块开头
+    single = subject.prepare("record", {"type": "choice", "instructions": "q",
+                                        "criteria": {"a": "A", "b": "B"}}, images=1)
+    assert len(prepared.ids) > len(single.ids)
+
+
+def test_a_negative_image_count_is_refused() -> None:
+    subject = serve()
     with pytest.raises(UnsupportedMediaError):
         subject.prepare("record", {"type": "choice", "instructions": "q",
-                                   "criteria": {"a": "A", "b": "B"}}, images=1)
+                                   "criteria": {"a": "A", "b": "B"}}, images=-1)
 
 
 def test_the_letters_must_match_decision_config() -> None:

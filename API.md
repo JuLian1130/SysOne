@@ -100,7 +100,7 @@ rejected. When `--vision off` is set, image requests are rejected with `422`.
 | Readout | vendor pooled readout | fixed 255-row code table | 26 `lm_head` letter rows |
 | Max options per question | 255 | 255 (10 for a `score`) | 26 (10 for a `score`) |
 | Max input tokens | `--width` (default 16384) | `--width` (default 16384) | `--width` (default 16384) |
-| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | not in this assembly |
+| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) |
 
 The first start also builds the vision tower's 26 programs, then releases the
 tower: text-only processes stay at 0 resident, and the first image request pays
