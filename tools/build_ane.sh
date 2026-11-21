@@ -12,6 +12,12 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${ANE_SRC:-$REPO/tools/native}"
 OUT="${SYS1_E8_DIR:-$REPO/.tmp/e8}"
 
+# 部署目标显式钉住，别让 SDK 默认值说了算：不给这一项时，产物 `LC_BUILD_VERSION` 的 minos
+# 就是当前 SDK 的最低系统（clang 16 + SDK 15.2 → minos 15.0），而 dyld 会拒绝加载 minos 比
+# 系统新的 dylib —— 在 14 上是 dlopen 直接失败，不是数值差异。改这里要同时改 README 的
+# Requirements 一节（两版一起改）。
+DEPLOY_TARGET="-mmacosx-version-min=14.0"
+
 if [ ! -d "$SRC" ]; then
   echo "找不到 native 源码目录：$SRC（本仓库的源在 tools/native/；可用 ANE_SRC 覆盖）" >&2
   exit 1
@@ -22,17 +28,20 @@ mkdir -p "$OUT"
 cd "$SRC"
 # 这台机器只有 Command Line Tools、没有 Xcode，`xcrun metal` 不存在，所以 .metal 核由
 # Metal 框架在进程启动时用运行期编译器编译（见 e8_mtl.py 的 e8m_init_src）。
-clang -dynamiclib -fobjc-arc -O2 -framework Foundation -framework Metal -framework IOSurface \
+clang -dynamiclib -fobjc-arc -O2 $DEPLOY_TARGET \
+      -framework Foundation -framework Metal -framework IOSurface \
       -o "$OUT/libe8mtl.dylib" e8_mtl.m
 
 # ANE dylib 关掉 fp 收缩：`-ffp-contract=off` 保证 MIL 里的乘法不被合进 FMA，
 # 与旧引擎测出的数值逐位一致（旧引擎的结论都建立在这个编译选项上）。
-clang -dynamiclib -fobjc-arc -O2 -ffp-contract=off -framework Foundation -framework IOSurface \
+clang -dynamiclib -fobjc-arc -O2 $DEPLOY_TARGET -ffp-contract=off \
+      -framework Foundation -framework IOSurface \
       -o "$OUT/libe8ane.dylib" e8_ane.m
 
 # 视觉的图片解码（P1）：ImageIO 的系统解码器，不应用 EXIF 方向、丢 alpha 不合成。
 # 与旧引擎的视觉解码 shim 同一条命令行，三者放在一起是为了"三份 dylib 一条命令重建"。
-clang -dynamiclib -fobjc-arc -O2 -framework Foundation -framework ImageIO \
+clang -dynamiclib -fobjc-arc -O2 $DEPLOY_TARGET \
+      -framework Foundation -framework ImageIO \
       -framework CoreGraphics -o "$OUT/libe8image.dylib" e8_image.m
 
 ls -l "$OUT/libe8mtl.dylib" "$OUT/libe8ane.dylib" "$OUT/libe8image.dylib"

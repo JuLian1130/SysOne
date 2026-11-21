@@ -25,11 +25,12 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
 
 ## 环境要求
 
-- Apple Silicon（M1 或更新），macOS 15 或更新。
-- 16 GB 或更多内存；h2o 的权重本身约 9.3 GB。
+- Apple Silicon（M1 或更新），macOS 14 或更新。
+- 8 GB 或更多内存。权重按需 mmap，ANE 上只驻留待命的层窗口（`--W`，默认 4 层），
+  跑起来的 h2o 服务约占 0.6 GB；`--W 0` 把 32 层全部常驻，约需 4.5 GB。
 - arm64 Python 3.11 或更新。
 - Xcode Command Line Tools（`xcode-select --install`），`clang` 需要它。
-- 磁盘：h2o 权重约 9.3 GB、mude 约 4 GB，另加数 GiB 编译产物（h2o 约 3.33 GiB）。
+- 磁盘：h2o 权重约 9.3 GB、mude 约 4 GB，另加约 4 GiB 编译产物（h2o，含视觉塔）。
   权重在首次使用时下载。
 
 ## 安装
@@ -66,7 +67,8 @@ tools/build_ane.sh
 
 脚本把 `libe8ane.dylib`（ANE 私有 API 宿主）、`libe8mtl.dylib`（Metal 宿主）与
 `libe8image.dylib`（只有视觉路径用到的 ImageIO 解码器）写进 `.tmp/e8`。引擎自己会找
-这个目录；`SYS1_E8_DIR` 可覆盖。不要用 `/tmp`：macOS 重启会清空它。
+这个目录；`SYS1_E8_DIR` 可覆盖。不要用 `/tmp`：macOS 重启会清空它。dylib 带着
+macOS 14.0 的部署目标，环境要求里的系统下限就来自这一项。
 
 ## 启动服务
 
@@ -164,10 +166,3 @@ HTTP：
 - `tools/native/`——三份 dylib 的 `.m` 源码；`tools/build_ane.sh` 负责构建。
 - `examples/`——每种线格式各一个请求。
 - `tests/`——单测与 Apple 集成测试；缺权重或缺 dylib 时集成测试自动跳过。
-
-## 许可
-
-模型权重带各自的许可：h2o 是 Apache-2.0；mude 的改动文件是 MIT，Qwen 基座是
-Apache-2.0。它们的 `LICENSE`、`NOTICE` 与 `LICENSES/` 属于下载内容，必须保留。
-
-本仓库的引擎源码还没有根 `LICENSE`；这是待办的发布项。

@@ -31,13 +31,16 @@ does not.
 
 ## Requirements
 
-- Apple Silicon (M1 or newer) on macOS 15 or newer.
-- 16 GB of memory or more; h2o's weights alone are about 9.3 GB.
+- Apple Silicon (M1 or newer) on macOS 14 or newer.
+- 8 GB of memory or more. The weights are memory-mapped and only the resident
+  layer window (`--W`, four layers by default) is held on the ANE, so a running
+  h2o service sits at about 0.6 GB; `--W 0` keeps all 32 layers resident and
+  needs about 4.5 GB.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
-- Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus several
-  GiB of compiled artifacts (h2o is about 3.33 GiB). The weights are downloaded
-  on first use.
+- Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus about 4 GiB
+  of compiled artifacts for h2o, the vision tower included. The weights are
+  downloaded on first use.
 
 ## Install
 
@@ -76,7 +79,9 @@ tools/build_ane.sh
 The script writes `libe8ane.dylib` (the ANE private-API host), `libe8mtl.dylib`
 (the Metal host) and `libe8image.dylib` (the ImageIO decoder used only by the
 vision path) into `.tmp/e8`. The engine finds that directory on its own;
-`SYS1_E8_DIR` overrides it. Do not use `/tmp`: macOS clears it on reboot.
+`SYS1_E8_DIR` overrides it. Do not use `/tmp`: macOS clears it on reboot. The
+dylibs carry a macOS 14.0 deployment target, which is what sets the floor in
+Requirements.
 
 ## Start the service
 
@@ -186,12 +191,3 @@ win over the variables.
 - `examples/` — one request for each wire shape.
 - `tests/` — unit tests and Apple integration tests; integration tests skip when
   weights or dylibs are absent.
-
-## Licenses
-
-The model weights carry their own licenses: h2o is Apache-2.0; mude is MIT for
-the changed files plus Apache-2.0 for the Qwen base. Their `LICENSE`, `NOTICE`,
-and `LICENSES/` files are part of the download and must be kept.
-
-The engine source in this repository does not yet carry a root `LICENSE`; that
-is an open release item.
