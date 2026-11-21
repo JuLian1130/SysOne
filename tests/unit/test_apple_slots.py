@@ -9,8 +9,8 @@ from sysone.devices.apple.pipeline import MudePipeline
 STUB = SimpleNamespace(_bucket=1024, _width=20480)   # 16k 前缀 + 两块打包区
 
 
-def _layout(prefix: int, lengths: tuple[int, ...]):
-    return MudePipeline._slot_layout(STUB, prefix, lengths)
+def _layout(prefix: int, lengths: tuple[int, ...], *, round_up: bool = False):
+    return MudePipeline._slot_layout(STUB, prefix, lengths, round_up=round_up)
 
 
 def test_layout_packs_equal_and_unequal_tails() -> None:
@@ -82,8 +82,8 @@ def test_layout_needs_a_bucket_of_slack() -> None:
     (1024, True),
     (1025, False),   # 超过桶宽：一条序列会跨瓦片，而 GDN 的递归状态只有一份
 ])
-def test_layout_packs_only_the_bands_whose_slot_divides_the_bucket(length: int,
-                                                                  packable: bool) -> None:
+def test_tail_layout_packs_only_the_bands_whose_slot_divides_the_bucket(length: int,
+                                                                      packable: bool) -> None:
     layout = _layout(0, (length, length))
     assert (layout is not None) is packable, f"长度 {length} 的判定变了"
 
@@ -92,3 +92,22 @@ def test_layout_uses_the_longest_sequence_for_the_slot() -> None:
     """槽宽由**最长**那条决定：混进一条落在洞里的长度，整批一起退回逐题。"""
     assert _layout(0, (100, 100)) is not None
     assert _layout(0, (100, 615)) is None
+
+
+def test_block_diagonal_rounds_the_slot_up_to_fit_every_short_shape() -> None:
+    """块对角把槽宽取到最近的“整除桶宽的 128 倍数”：落在洞里的长度也能合（最差 per=1）。
+
+    h2o 真实题面 p50 是 615 token —— 贴紧取整给出 640，`640 ∤ 1024`，旧规则下它永远合不上。
+    向上取到 1024 只多算 padding 列，而 ANE 按瓦片计费（一瓦片一条序列时成本与列宽无关）。
+    """
+    hole = _layout(0, (615, 615), round_up=True)
+    assert hole is not None and (hole.slotw, hole.per) == (1024, 1)
+
+    band = _layout(0, (257, 257), round_up=True)
+    assert band is not None and (band.slotw, band.per) == (512, 2)
+
+    small = _layout(0, (100, 100), round_up=True)
+    assert small is not None and (small.slotw, small.per) == (128, 8), "能贴紧时不该被抬高"
+
+    assert _layout(0, (1025, 1025), round_up=True) is None, "超过桶宽仍然不行"
+    assert _layout(0, (615, 615)) is None, "批尾巴仍按贴紧槽宽，不吃这个放宽"

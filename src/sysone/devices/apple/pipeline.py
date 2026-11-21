@@ -409,8 +409,15 @@ class MudePipeline:
             raise NotReadyError("共享前缀漏读了某题的读出", questions=len(tails))
         return [row for row in result if row is not None]
 
-    def _slot_layout(self, prefix: int, lengths: Sequence[int]) -> SlotLayout | None:
-        """批尾巴的槽位布局；批不了就 None（调用方原样逐题）。
+    def _slot_layout(self, prefix: int, lengths: Sequence[int], *,
+                     round_up: bool = False) -> SlotLayout | None:
+        """槽位布局（批尾巴与块对角共用）；批不了就 None（调用方原样逐题）。
+
+        `round_up=True`（只给块对角用）允许槽宽**不贴紧最长序列**：往上取到最近的、且整除桶宽的
+        128 倍数。多出来的列是 padding，而 ANE 按**瓦片**计费 —— 一个 1024 宽的瓦片与一个 640 宽
+        的一样贵，所以这不会让这一趟变大；它把落在"洞"里的长度（257–384、513–1024，比如 h2o 的
+        p50 615）放进来，最少也能按 `per=1` 省掉 N−1 趟固定项。批尾巴不用它：那里槽位起点是
+        `prefix + j*slotw`，改槽宽会动到前缀后半块的 64 列分组，收益与验证成本都不划算。
 
         条件：每条尾巴装得进一个桶、槽宽整除桶宽（这样槽位边界落在瓦片边界上、一个槽不跨
         瓦片）、`per <= 8`（可见行数表只有 8 槽），以及**宽缓冲装得下整个打包区** —— 打包区
@@ -427,6 +434,10 @@ class MudePipeline:
         questions = len(lengths)
         longest = max(lengths)
         slotw = -(-int(longest) // AT_BM) * AT_BM
+        if round_up:
+            # 最近的"整除桶宽的 128 倍数"：桶 1024 下是 128 / 256 / 512 / 1024。
+            slotw = next((factor for factor in range(slotw, self._bucket + 1, AT_BM)
+                          if self._bucket % factor == 0), slotw)
         if (questions < 2 or longest > self._bucket
                 or slotw % AT_BM or self._bucket % slotw):
             return None
@@ -514,8 +525,10 @@ class MudePipeline:
 
         **限制**：每条序列必须 ≤ `bucket`（否则一条序列会跨瓦片，而递归状态只有一份）；
         打包区 `ntiles * bucket` 必须 ≤ `width`；每格最多 8 槽（`nkw`/`pcw` 表宽）；槽宽
-        `slotw` 必须**整除** `bucket`（槽边界要落在瓦片边界上，一个槽不能跨瓦片）。任一不满足
-        就返回 `None`：这批没有"一次前向"的解法，调用方退回逐条整趟即可 —— 这不是错误。
+        `slotw` 必须**整除** `bucket`（槽边界要落在瓦片边界上，一个槽不能跨瓦片）。槽宽取
+        "最长序列向上到最近的、整除桶宽的 128 倍数"，所以任何 ≤ 桶宽的形状都装得下（最差
+        `per=1`，每瓦片一条）。任一不满足就返回 `None`：这批没有"一次前向"的解法，调用方退回
+        逐条整趟即可 —— 这不是错误。
 
         形状判据只在 `_slot_layout` 里有一份，调用方**不要**再抄一份预判：抄出来的那份曾经漏过
         "槽宽整除桶宽"，于是它判"能批"、这里拒，一次本该静默回退的请求变成了 500。
@@ -534,7 +547,7 @@ class MudePipeline:
         # 打包：一条序列一个**槽**，槽宽取"最长序列向上取到 AT_BM"，一格里能塞几条就塞几条。
         # 这一步决定赚多少 —— ANE 的算力是按**瓦片**计的（program 的静态宽度就是桶宽），
         # 所以 4 条塞进 1 格只花 1 格的 ANE 时间；一条一格就和逐条跑一样贵。
-        layout = self._slot_layout(0, lengths)
+        layout = self._slot_layout(0, lengths, round_up=True)
         if layout is None:
             return None
         view = self.x.array(np.float16, (self._hidden, self._width))
