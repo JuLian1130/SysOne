@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SVG = "http://www.w3.org/2000/svg"
-CHART = ROOT / "assets" / "h2o-111.svg"
+CHART = ROOT / "assets" / "h2o-speed.svg"
 
 _IMAGE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
@@ -33,7 +33,7 @@ def _readme_images() -> list[str]:
 
 def test_every_image_the_readmes_show_exists() -> None:
     images = _readme_images()
-    assert "assets/h2o-111.svg" in images
+    assert "assets/h2o-speed.svg" in images
     for target in images:
         assert (ROOT / target).is_file(), f"README 引用了不存在的图：{target}"
 
@@ -74,7 +74,7 @@ def test_the_ratio_note_matches_the_bars() -> None:
     notes = [
         (node.text or "").strip()
         for node in root.iter(f"{{{SVG}}}text")
-        if (node.text or "").strip().endswith("less wall clock")
+        if (node.text or "").strip().endswith("faster")
     ]
     assert len(notes) == 1
     assert notes[0].startswith(f"{seconds[1] / seconds[0]:.1f}×")

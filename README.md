@@ -16,12 +16,11 @@ questions and options, and returns a probability for every option.
 - **Memory that does not follow the model.** h2o's weights are 9.3 GB on disk
   and the service settles at about 0.6 GB, because only the resident layer
   window lives on the ANE; a conventional engine keeps every weight resident.
-- **Same weights, one eighth of the wall clock.** On the 111-question benchmark
-  h2o answers in 136 s with `noncausal_full`, against 1137 s for the vendor's
-  own torch engine on the same MPS machine and the same int8 checkpoint — 1.2 s
-  per question against 10.2 s.
+- **Same weights, one eighth of the time.** On the same task set h2o answers in
+  136 s; the vendor's own torch engine needs 1137 s on the same machine with the
+  same int8 weights.
 
-![h2o on the 111-question benchmark: 136.03 s on SysOne, 1137.30 s on the vendor's torch engine](assets/h2o-111.svg)
+![The same task set answered in 136 s by SysOne and 1137 s by the vendor's torch engine](assets/h2o-speed.svg)
 
 ## Requirements
 

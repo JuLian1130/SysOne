@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="168" viewBox="0 0 760 168" role="img" aria-labelledby="title desc" font-family='ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif'>
+  <title id="title">On the same task set: 136 s on SysOne against 1137 s on the vendor's torch engine</title>
+  <desc id="desc">Bar chart of the time it takes to answer the same task set with the same int8 weights. SysOne runs 136 seconds with the ANE and the GPU overlapping; the vendor's own torch engine on MPS runs 1137 seconds, 8.4 times longer.</desc>
+
+  <!-- 白底卡片：GitHub 的浅色与深色主题都直接显示它，不依赖 currentColor。
+       条宽与秒数严格成比例（136 / 1137 × 392 = 46.886），改数字时两处一起改。
+       数据：docs/collective-decision/results/h2o-hard.jsonl（厂商，MPS）与
+       .scratch/h2o_noncausal_111.json（我们这条链，同一套题、同一套形状）。 -->
+  <rect x="0.5" y="0.5" width="759" height="167" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+
+  <text x="24" y="34" font-size="13" fill="#59636e">same task set · h2o 4B · int8</text>
+
+  <text x="230" y="82" font-size="15" fill="#1f2328" text-anchor="end">SysOne — ANE + Metal</text>
+  <rect x="248" y="64" width="392" height="26" rx="4" fill="#f0f3f6"/>
+  <rect x="248" y="64" width="46.886" height="26" rx="4" fill="#1f6feb"/>
+  <text x="305" y="82" font-size="13" fill="#1a7f37">8.4× faster</text>
+  <text x="736" y="82" font-size="15" font-weight="600" fill="#1f2328" text-anchor="end">136 s</text>
+
+  <text x="230" y="124" font-size="15" fill="#1f2328" text-anchor="end">vendor — torch, MPS</text>
+  <rect x="248" y="106" width="392" height="26" rx="4" fill="#f0f3f6"/>
+  <rect x="248" y="106" width="392" height="26" rx="4" fill="#afb8c1"/>
+  <text x="736" y="124" font-size="15" font-weight="600" fill="#1f2328" text-anchor="end">1137 s</text>
+</svg>
