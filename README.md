@@ -25,9 +25,10 @@ sync.
 `--backend reference` is the M0 semantic judge used by tests. It is not a
 production path and requires an explicit `--descriptor`.
 
-Both released models support `choice` and `noul` questions. h2o additionally
-supports `score` through the vendor `format_answer`; mude's code-row readout
-does not.
+Both released models answer `choice`, `noul` and `score` questions. h2o judges
+them with its vendor `format_answer`; mude shows a score's levels as ordered
+options and reports the expected level. The two therefore agree on both the
+prompt contract and the answer shape.
 
 ## Requirements
 

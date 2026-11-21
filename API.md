@@ -70,7 +70,7 @@ rejected. When `--vision off` is set, image requests are rejected with `422`.
 {
   "model": "...",
   "answers": {
-    "q1": {"type": "choice", "choice": "continue", "probabilities": {"continue": 0.7, "divert": 0.3}}
+    "q1": {"type": "choice", "choice": "continue", "probabilities": {"continue": 0.7, "divert": 0.3}, "confidence": 0.4}
   },
   "usage": {"input_tokens": 123, "output_tokens": 0},
   "attention_mode": "causal",
@@ -78,8 +78,16 @@ rejected. When `--vision off` is set, image requests are rejected with `422`.
 }
 ```
 
-- `noul` answers carry `noul` (P(true)); `score` answers carry the expected
-  level in `score` and per-level `probabilities`.
+- `choice` and `score` answers also carry `confidence`: `1` for a point mass,
+  `0` for a distribution as flat as the option count allows. The form is the
+  model's own — h2o reports its top option's probability rescaled against that
+  flat distribution (`0.7`/`0.3` gives `0.4`), mude reports `1 - H/log n`, which
+  gives `0.12` for the same pair. The example above is h2o's number.
+- `noul` answers carry `noul` (P(true)) and no `confidence`: neither vendor's
+  yes/no answer object has one.
+- `score` answers carry the expected level in `score` (0-based), the per-level
+  `probabilities` keyed `"0"`..`"n-1"`, and `confidence`. mude takes 2 to 10
+  levels, h2o up to 255.
 - `attention_mode` in the request body overrides the process default set by
   `--attention-mode` for that request.
 
@@ -87,10 +95,10 @@ rejected. When `--vision off` is set, image requests are rejected with `422`.
 
 | | h2o | mude |
 |---|---|---|
-| Question kinds | `choice`, `noul`, `score` | `choice`, `noul` |
+| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` (2–10 levels) |
 | Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) |
 | Readout | vendor pooled readout | fixed 255-row code table |
-| Max options per question | 255 | 255 |
+| Max options per question | 255 | 255 (10 for a `score`) |
 | Max input tokens | `--width` (default 16384) | `--width` (default 16384) |
 | Vision | available by default (`--vision auto`) | available by default (`--vision auto`) |
 

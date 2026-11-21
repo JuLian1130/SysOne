@@ -20,8 +20,8 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
 
 `--backend reference` 是测试用的 M0 语义裁判，不是生产路径，必须显式给 `--descriptor`。
 
-两个发布模型都支持 `choice` 与 `noul` 问题；h2o 还能通过厂商的 `format_answer` 支持
-`score`，mude 的 code-row 读出不能。
+两个发布模型都答 `choice`、`noul` 与 `score` 三类问题：h2o 用厂商的 `format_answer` 判
+答案，mude 把 score 的档位按顺序摆成选项、答面报期望档位。题面契约与答案形状因此两边一致。
 
 ## 环境要求
 

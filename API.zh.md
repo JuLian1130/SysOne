@@ -63,7 +63,7 @@
 {
   "model": "...",
   "answers": {
-    "q1": {"type": "choice", "choice": "continue", "probabilities": {"continue": 0.7, "divert": 0.3}}
+    "q1": {"type": "choice", "choice": "continue", "probabilities": {"continue": 0.7, "divert": 0.3}, "confidence": 0.4}
   },
   "usage": {"input_tokens": 123, "output_tokens": 0},
   "attention_mode": "causal",
@@ -71,18 +71,22 @@
 }
 ```
 
-- `noul` 的答案带 `noul`（P(true)）；`score` 的答案在 `score` 里带期望等级，并带逐等级
-  `probabilities`。
+- `choice` 与 `score` 的答案还带 `confidence`：退化成一点时是 `1`，和选项数一样平的时候是
+  `0`。口径由模型自己定 —— h2o 报的是把最高那项的概率按那个平分布缩放（`0.7`/`0.3` 得
+  `0.4`），mude 报的是 `1 - H/log n`，同一对概率得 `0.12`。上面那个例子用的是 h2o 的数。
+- `noul` 的答案带 `noul`（P(true)），不带 `confidence`：两家的 yes/no 答面都没有这个字段。
+- `score` 的答案在 `score` 里带期望档位（0 起算），带按序号给的 `probabilities`（键是
+  `"0"`..`"n-1"`）与 `confidence`。mude 收 2 到 10 档，h2o 最多 255 档。
 - 请求体里的 `attention_mode` 只对该请求覆盖 `--attention-mode` 设的进程默认值。
 
 ## 各模型能力
 
 | | h2o | mude |
 |---|---|---|
-| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul` |
+| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score`（2–10 档） |
 | 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) |
 | 读出 | 厂商 pooled 读出 | 固定 255 行码表 |
-| 每题最多选项 | 255 | 255 |
+| 每题最多选项 | 255 | 255（`score` 为 10） |
 | 最大输入 token | `--width` (default 16384) | `--width` (default 16384) |
 | 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
 
