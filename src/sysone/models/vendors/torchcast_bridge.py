@@ -126,13 +126,14 @@ class TorchcastBridge:
         started = time.perf_counter()
         answers, usage = self._engine.decide(state, {"q": question})
         item = self._first(answers)
-        value, labels, probs = wire_answer(item)
+        value, labels, probs, confidence = wire_answer(item)
         tokens = int(usage.get("input_tokens", 0)) if isinstance(usage, dict) else 0
         return VendorAnswer(
             value=value,
             labels=tuple(labels),
             probs=tuple(probs),
             input_tokens=tokens,
+            confidence=confidence,
             readout_s=time.perf_counter() - started,
         )
 

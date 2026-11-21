@@ -405,23 +405,27 @@ def answer_payload(
 
 def _answer_object(answer: Answer, wire: WireQuestion) -> dict[str, Any]:
     if wire.question.kind == "noul":
-        # 引擎里的标签顺序是 ("yes", "no")，线格式要的是 P(true)。
+        # 引擎里的标签顺序是 ("yes", "no")，线格式要的是 P(true)。厂商的 noul 答面只给这一个
+        # 数、不带 `confidence`，所以这里也不带。
         return {"type": "noul", "noul": _normalized(answer.probs, 2)[0]}
     shares = _normalized(answer.probs, len(wire.labels))
     if wire.question.kind == "score":
-        # 厂商口径（`h2o_lightning_shim.format_answer` 的 score 分支）：档位序号上的期望值
-        # `Σ i·p_i`，概率表按 `"0".."n-1"` 给。不带 `legend`：档位就是请求里那些，与 choice
-        # 分支不回选项文本同口径。
+        # 厂商口径（`h2o_lightning_shim.format_answer` 与 `d3_runtime.product_answer` 的 score
+        # 分支）：档位序号上的期望值 `Σ i·p_i`，概率表按 `"0".."n-1"` 给。不带 `legend`：它是
+        # 请求里档位文本的回声，而两家对非字符串档位的写法不同（mude 用键序紧凑 JSON、h2o 用
+        # `describe` 的空格形式），一个字段没法同时是两家的。
         return {
             "type": "score",
             "score": sum(index * share for index, share in enumerate(shares)),
             "probabilities": dict(zip(wire.labels, shares)),
+            "confidence": float(answer.confidence),
         }
     best = max(range(len(shares)), key=shares.__getitem__)
     return {
         "type": "choice",
         "choice": wire.labels[best],
         "probabilities": dict(zip(wire.labels, shares)),
+        "confidence": float(answer.confidence),
     }
 
 

@@ -51,7 +51,12 @@ class DecisionRequest:
 
 @dataclass(frozen=True)
 class Answer:
-    """单题结果。`probs` 与 `labels` 一一对应，且只在候选标签上归一化。"""
+    """单题结果。`probs` 与 `labels` 一一对应，且只在候选标签上归一化。
+
+    `confidence` 是**这个家族自己的口径**，不是我们另定的：码表读出算 `1 - H/log n`
+    （`models/families/mude.confidence`），h2o 与 torchcast 直接用厂商答面返回的那个数。
+    协议层把它原样发出去；noul 不发，因为厂商的 noul 答面没有这个字段。
+    """
 
     question_index: int
     kind: str

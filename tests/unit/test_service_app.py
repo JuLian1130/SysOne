@@ -234,6 +234,7 @@ def test_systemone_answers_a_choice_question(start_server) -> None:
         "type": "choice",
         "choice": "b",
         "probabilities": {"a": 0.25, "b": 0.75},
+        "confidence": 0.75,
     }
     assert body["usage"] == {"input_tokens": 10, "output_tokens": 0}
     assert body["attention_mode"] == "prefix_noncausal"

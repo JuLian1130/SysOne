@@ -128,8 +128,8 @@ class Serve:
 
     def answer(
         self, prepared: Prepared, logits: Sequence[float]
-    ) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
-        """回答槽上的 logits（未除温度）→ (值, 标签, 概率)。按题型判答案的是厂商代码。"""
+    ) -> tuple[str, tuple[str, ...], tuple[float, ...], float]:
+        """回答槽上的 logits（未除温度）→ (值, 标签, 概率, 置信度)。判答案的是厂商代码。"""
         values = [float(value) for value in logits]
         if len(values) != len(prepared.label_ids):
             raise ReadoutError(

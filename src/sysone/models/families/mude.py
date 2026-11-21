@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Callable, Sequence
-
-import numpy as np
 
 from ...config import EngineConfig
 from ...domain.attention import AttentionRole, MaskMode
@@ -198,6 +197,23 @@ def common_prefix(sequence: Sequence[int], prefix: Sequence[int]) -> int:
     while count < limit and sequence[count] == prefix[count]:
         count += 1
     return count
+
+
+# ---------------------------------------------------------------------- 答面
+
+
+def confidence(shares: Sequence[float]) -> float:
+    """码表读出这一家的置信度：`1 - H/log n`（厂商 `d3_runtime._confidence`）。
+
+    与"最大概率"不是一回事：n 个选项平分时它是 0，退化成一点时是 1。协议层原样发出去，所以
+    这里算的不是我们的口径，是厂商的 —— h2o 那一家用的是另一种（归一化最大值），由它自己的
+    答面给。
+    """
+    n = len(shares)
+    if n < 2:
+        return 1.0
+    entropy = -sum(share * math.log(share) for share in shares if share > 0)
+    return max(0.0, min(1.0, 1.0 - entropy / math.log(n)))
 
 
 class MudePrompter:

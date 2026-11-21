@@ -159,12 +159,13 @@ class H2OBridge:
         hidden = out.last_hidden_state[:, -1].float()[0]
         logits = (hidden @ self._option_rows(prepared.label_ids).T).detach().cpu().tolist()
 
-        value, labels, probs = self._serve.answer(prepared, logits)
+        value, labels, probs, confidence = self._serve.answer(prepared, logits)
         return VendorAnswer(
             value=value,
             labels=labels,
             probs=probs,
             input_tokens=len(ids),
+            confidence=confidence,
             readout_s=time.perf_counter() - started,
         )
 

@@ -184,7 +184,7 @@ def test_restarted_warm_up_reports_bad_probabilities():
                             descs=("a", "b"), kind="choice", temperature=1.0, threshold=None)
 
         def answer(self, prepared, logits):
-            return "A", ("A", "B"), (float("nan"), float("nan"))
+            return "A", ("A", "B"), (float("nan"), float("nan")), float("nan")
 
     subject = runner(serve_override=BrokenServe())
     with pytest.raises(NotReadyError):

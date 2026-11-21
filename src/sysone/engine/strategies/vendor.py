@@ -75,7 +75,7 @@ class VendorRunner(DecisionRunner):
                     value=result.value,
                     probs=tuple(result.probs),
                     labels=tuple(result.labels),
-                    confidence=max(result.probs) if result.probs else 0.0,
+                    confidence=result.confidence,
                 )
             )
             tokens += result.input_tokens

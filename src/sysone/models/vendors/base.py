@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from ...domain.attention import MaskMode
 from ...domain.decision import Question
@@ -23,6 +23,7 @@ class VendorAnswer:
     labels: tuple[str, ...]
     probs: tuple[float, ...]
     input_tokens: int
+    confidence: float = 0.0
     readout_s: float = 0.0
 
 
@@ -98,25 +99,40 @@ def normalize(answer: VendorAnswer, question: Question) -> tuple[str, tuple[floa
     return answer.value, probs, answer.labels
 
 
-def wire_answer(result: dict) -> tuple[str, tuple[str, ...], tuple[float, ...]]:
-    """把厂商线格式（choice / noul / score）转成 (值, 标签, 概率)。"""
+def wire_answer(result: dict) -> tuple[str, tuple[str, ...], tuple[float, ...], float]:
+    """把厂商线格式（choice / noul / score）转成 (值, 标签, 概率, 置信度)。
+
+    置信度取厂商答面**自己**算的那个数：两条前向共用这一份判答案的代码，这个口径就不该由
+    我们再算一遍（mude 的码表读出是另一种口径，见 `models/families/mude.confidence`）。
+    noul 的答面不带这个字段 —— 厂商只给 P(true) —— 这里取它 `served_top` 的口径，即较大的
+    那一侧概率。
+    """
     kind = result.get("type")
     if kind == "noul":
         p = float(result.get("noul", 0.0))
         decision = result.get("decision")
         value = "yes" if (decision if decision is not None else p >= 0.5) else "no"
-        return value, ("yes", "no"), (p, 1.0 - p)
+        probs = (p, 1.0 - p)
+        return value, ("yes", "no"), probs, max(probs)
     if kind == "score":
         probabilities = result.get("probabilities") or {}
         labels = tuple(str(key) for key in probabilities)
         probs = tuple(float(value) for value in probabilities.values())
         if not labels:
-            return f"{float(result.get('score', 0.0)):.3f}", (), ()
+            return f"{float(result.get('score', 0.0)):.3f}", (), (), 0.0
         score = float(result.get("score", 0.0))
-        return f"{score:.3f}", labels, probs
+        return f"{score:.3f}", labels, probs, _confidence(result, probs)
     probabilities = result.get("probabilities") or {}
     labels = tuple(str(key) for key in probabilities)
     probs = tuple(float(value) for value in probabilities.values())
     if not labels:
         raise ValueError("厂商的 choice 答案没有概率表")
-    return str(result.get("choice", labels[0])), labels, probs
+    return str(result.get("choice", labels[0])), labels, probs, _confidence(result, probs)
+
+
+def _confidence(result: dict, probs: Sequence[float]) -> float:
+    """厂商答面给的置信度；没给时退回最大概率（只为让类型定下来，不该走到）。"""
+    given = result.get("confidence")
+    if isinstance(given, (int, float)):
+        return float(given)
+    return max(probs) if probs else 0.0

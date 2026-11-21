@@ -137,13 +137,15 @@ def test_answer_hands_the_raw_logits_to_the_vendor():
     """`answer` 不再自己归一化：温度是厂商的，我们只负责把 logits 原样递过去。"""
     subject, _ = serve()
     prepared = subject.prepare("record", spec(options=("A", "B")))
-    value, labels, probs = subject.answer(prepared, [1.0, 0.0])
+    value, labels, probs, confidence = subject.answer(prepared, [1.0, 0.0])
 
     # T=0.5 下的 softmax([1, 0]) = softmax([2, 0])
     assert value == "A"
     assert labels == ("A", "B")
     assert probs[0] == pytest.approx(0.8807970779778823, rel=1e-12)
     assert sum(probs) == pytest.approx(1.0, rel=1e-12)
+    # 置信度是厂商 `format_answer` 自己给的那个数（这个假 shim 取最大概率），原样带出去
+    assert confidence == probs[0]
 
 
 def test_answer_rejects_a_logit_count_that_does_not_match_the_labels():

@@ -230,22 +230,33 @@ def test_a_score_scale_reaches_the_vendor_as_an_ordered_array() -> None:
 def test_wire_answer_shapes() -> None:
     from sysone.models.vendors.base import wire_answer
 
-    value, labels, probs = wire_answer(
-        {"type": "choice", "choice": "B", "probabilities": {"A": 0.25, "B": 0.75}}
+    # 厂商答面带的置信度原样带出去（0.4 既不是最大概率，也不是我们的任何公式）
+    value, labels, probs, confidence = wire_answer(
+        {
+            "type": "choice",
+            "choice": "B",
+            "probabilities": {"A": 0.25, "B": 0.75},
+            "confidence": 0.4,
+        }
     )
     assert value == "B"
     assert labels == ("A", "B")
     assert probs == (0.25, 0.75)
+    assert confidence == 0.4
 
-    value, labels, probs = wire_answer({"type": "noul", "noul": 0.8})
+    # noul 的答面没有这个字段：按 `served_top` 取较大的那一侧
+    value, labels, probs, confidence = wire_answer({"type": "noul", "noul": 0.8})
     assert value == "yes"
     assert labels == ("yes", "no")
+    assert confidence == pytest.approx(0.8)
 
-    value, labels, probs = wire_answer(
+    # score 同理；厂商没给时退回最大概率，而不是我们另算一遍
+    value, labels, probs, confidence = wire_answer(
         {"type": "score", "score": 2.5, "probabilities": {"0": 0.1, "1": 0.4, "2": 0.5}}
     )
     assert value == "2.500"
     assert len(labels) == 3
+    assert confidence == pytest.approx(0.5)
 
 
 def test_engine_config_is_frozen() -> None:

@@ -16,6 +16,7 @@ from ...domain.quant import DType, QuantSpec, Scheme
 from ...domain.work import CompilationTimes, StageOp, WorkPlan
 from ...errors import ConfigError, MissingTensorError, ReadoutError, UnsupportedPrecisionError
 from ...models.descriptor import ModelDescriptor
+from ...models.families.mude import confidence as mude_confidence
 from ...weights.store import TensorStore
 from ..base import Capabilities, CompiledSet, MemoryInfo, Placement, Shape
 
@@ -202,7 +203,7 @@ class ReferenceRunner:
             value=labels[best],
             probs=tuple(float(value) for value in probabilities),
             labels=labels,
-            confidence=float(probabilities[best]),
+            confidence=mude_confidence(probabilities),
         )
 
     def _readout_name(self) -> str:

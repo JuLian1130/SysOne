@@ -22,6 +22,7 @@ from ...errors import (
     NotReadyError,
     ReadoutError,
 )
+from ...models.families.mude import confidence as mude_confidence
 
 # 块对角的一条序列至少占一槽，而槽宽是注意力 query 块（`devices/apple/pipeline.py` 的
 # `AT_BM` = 128）的整数倍 —— 所以一趟缓冲最多并排 `width // 128` 条序列。那个数不 import：
@@ -222,7 +223,10 @@ class SplitRunner(VisionRunner, DecisionRunner):
         )
 
     def answer(self, encoded: Encoded, raw: object, *, index: int, kind: str) -> Answer:
-        """概率 → `Answer`：按标签序号取候选，最大的那一项胜出（码表读出的形状）。"""
+        """概率 → `Answer`：按标签序号取候选，最大的那一项胜出（码表读出的形状）。
+
+        置信度用这一家自己的口径（`mude.confidence`），不取最大概率：协议层把它原样发出去。
+        """
         shares = self._shares(raw)
         values = tuple(shares[position] for position in encoded.indexes)
         best = max(range(len(values)), key=values.__getitem__)
@@ -232,7 +236,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
             value=encoded.labels[best],
             probs=values,
             labels=encoded.labels,
-            confidence=values[best],
+            confidence=mude_confidence(values),
         )
 
     def _warm(self) -> None:

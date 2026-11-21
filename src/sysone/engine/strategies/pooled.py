@@ -239,14 +239,14 @@ class PooledRunner(VisionRunner, DecisionRunner):
             raise ConfigError(
                 "pooled 的读出载体不是厂商答面（编码与读出不是同一条路）", kind=kind)
         logits = self._rows(encoded.indexes) @ np.asarray(raw, dtype=np.float32)
-        value, labels, probs = self._serve.answer(prepared, logits)
+        value, labels, probs, confidence = self._serve.answer(prepared, logits)
         return Answer(
             question_index=index,
             kind=kind,
             value=value,
             probs=tuple(probs),
             labels=tuple(labels),
-            confidence=max(probs) if probs else 0.0,
+            confidence=confidence,
         )
 
     def _require_ready(self) -> None:

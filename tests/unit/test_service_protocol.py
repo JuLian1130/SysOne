@@ -57,14 +57,17 @@ def _answer(
     value: str = "B",
     probs=(0.25, 0.75),
     labels=("A", "B"),
+    confidence: float = 0.4,
 ) -> Answer:
+    # 置信度取一个既不是最大概率、也不是任何我们自己的公式的值：回包里的那个数只可能来自
+    # `Answer.confidence` 的原样透传。
     return Answer(
         question_index=index,
         kind=kind,
         value=value,
         probs=probs,
         labels=labels,
-        confidence=probs[0] if probs else 0.0,
+        confidence=confidence,
     )
 
 
@@ -272,6 +275,7 @@ def test_a_score_answer_is_the_expected_level_and_its_distribution() -> None:
     assert answer["probabilities"] == {"0": 0.25, "1": 0.75, "2": 0.0}
     # 0·0.25 + 1·0.75 + 2·0.0
     assert answer["score"] == pytest.approx(0.75)
+    assert answer["confidence"] == 0.4
 
 
 def test_parse_body_reads_json_and_refuses_nan() -> None:
@@ -297,6 +301,7 @@ def test_answer_payload_choice_shape() -> None:
         "type": "choice",
         "choice": "2",
         "probabilities": {"1": 0.25, "2": 0.75},
+        "confidence": 0.4,
     }
     assert payload["usage"] == {"input_tokens": 123, "output_tokens": 0}
     assert payload["attention_mode"] == "prefix_noncausal"

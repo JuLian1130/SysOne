@@ -298,7 +298,8 @@ def test_answers_cover_every_question_and_forward_the_prefix() -> None:
     assert result.answers[0].question_index == 0
     assert result.answers[0].labels == ("A", "B", "C", "D")
     assert result.answers[0].probs == (0.25, 0.25, 0.25, 0.25)
-    assert result.answers[0].confidence == 0.25
+    # 平分 ⇒ 置信度 0：码表读出这一家用的是 `1 - H/log n`，不是最大概率 0.25
+    assert result.answers[0].confidence == pytest.approx(0.0, abs=1e-12)
     assert result.answers[0].value == "A"  # 平分时取第一个
     assert result.usage.prefill_calls == 2
     assert all(options == 4 for _, options, _, _ in chain.calls[1:])
@@ -321,7 +322,8 @@ def test_the_winning_option_is_the_largest_share() -> None:
     result = engine.run(make_request(mode=MaskMode.PREFIX_NONCAUSAL, questions=1))
     answer = result.answers[0]
     assert answer.value == "B"
-    assert answer.confidence == pytest.approx(0.6)
+    # 不是最大概率 0.6：厂商 `d3_runtime._confidence` 是 1 - H/log 4
+    assert answer.confidence == pytest.approx(0.2145, abs=1e-4)
 
 
 def test_noul_question_reports_yes_no_in_engine_order() -> None:
