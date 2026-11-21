@@ -25,7 +25,8 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
   `--W 0` 把 32 层全部常驻，约需 4.5 GB。
 - arm64 Python 3.11 或更新。
 - Xcode Command Line Tools（`xcode-select --install`），`clang` 需要它。
-- 磁盘：h2o 权重约 9.3 GB、mude 约 4 GB，另加约 4 GiB 编译产物。权重在首次使用时下载。
+- 磁盘：mude 权重约 4 GB、d3 约 9.1 GB、h2o 约 9.3 GB、torchcast 约 10.4 GB
+  （一次装一个模型），另加约 4 GiB 编译产物。权重在首次使用时下载。
 
 ## 安装
 
@@ -57,15 +58,12 @@ sysone serve --model h2o
 首次启动会下载权重并编译 ANE program，完成后打印 `sysone serve: ready in ...s`；之后
 再启动报 `compile 0.00s`。随时可以重跑，不会重复做已完成的事。
 
-mude 用 `--model mude`。torchcast 也没有发布包：用
-`--model torchcast --weights` 指一份本地 int8 模型目录即可。它与 h2o 走同一条 ANE 链，只
-支持全双向掩码，所以题与题之间不共享前缀；vendor 附加依赖
-（`pip install -e './src[vendor]'`）只在要把厂商自己的 torch 引擎当对拍基线时才会用到。
-
-d3-mini 与 mude 共用同一张 255 行 d3 码表，底座是 4B，所以走 split 链，且只支持全双向
-掩码 —— 题与题之间不共享前缀，但合批仍然可用。它的包目前还没有纳入首启下载：用
-`--model d3 --weights` 指一份本地模型目录，并且必须显式给 `--model`（发布包的必需件与
-mude 相同）。
+mude 用 `--model mude`。d3 与 torchcast 的分片包同样在首次使用时下载：`--model d3`
+跑 `vllm-sr/d3-mini`（split 链），`--model torchcast` 跑
+`torchcast-ai/torchcast-decision-4b`（pooled 链）。两者都只支持全双向掩码，所以题与
+题之间不共享前缀，但合批仍然可用。这两个家族要显式给 `--model`（发布包的必需件与
+mude 相同）。vendor 附加依赖（`pip install -e './src[vendor]'`）只在要把厂商自己的
+torch 引擎当对拍基线时才会用到。
 
 另开一个 shell 检查：
 

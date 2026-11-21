@@ -2,6 +2,10 @@
 
 CI 与本地默认解释器都没有 torch，因此权重读取不能把 torch 拖进核心路径。
 格式按官方 spec：8 字节 little-endian header 长度 + JSON header + 连续数据区。
+
+两种存放形态：单文件（`mude` / `h2o` 的发布包）与分片（`d3` / `pplx` / `torchcast` 的发布包，
+`model.safetensors.index.json` 指出每个张量在哪个 `model-0000N-of-000M.safetensors` 里）。
+分片**不合并**：合并要原地多写一遍 9 GB，而读侧与单文件没有差别。
 """
 
 from __future__ import annotations
@@ -232,6 +236,74 @@ class SafeTensorFile:
     def close(self) -> None:
         self._mmap.close()
         self._handle.close()
+
+
+SHARD_INDEX = "model.safetensors.index.json"
+
+
+class ShardedTensorStore:
+    """按 `model.safetensors.index.json` 跨分片取数的只读容器。
+
+    `names()` 来自索引本身，不打开任何分片；`read` / `read_rows` 只打开命中的那一个分片，
+    之后沿用 `SafeTensorFile` 的惰性 mmap 切片。三份 4B 发布权重都是三到两个 5 GB 量级的分片，
+    整份打开也只是三份虚拟地址映射，但按需打开能让"只读语言塔"的装配一个预览分片都不碰。
+    """
+
+    def __init__(self, directory: Path | str) -> None:
+        self.dir = Path(directory)
+        self.index_path = self.dir / SHARD_INDEX
+        self._weight_map = self._load_index(self.index_path)
+        self._shards: dict[str, SafeTensorFile] = {}
+
+    @staticmethod
+    def _load_index(path: Path) -> dict[str, str]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise MissingTensorError("权重目录缺少分片索引", path=str(path)) from None
+        except (OSError, json.JSONDecodeError):
+            raise MissingTensorError("分片索引不是合法 JSON", path=str(path)) from None
+        weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise MissingTensorError("分片索引没有 weight_map", path=str(path))
+        return {str(name): str(file) for name, file in weight_map.items()}
+
+    def names(self) -> frozenset[str]:
+        return frozenset(self._weight_map)
+
+    def missing(self, expected: Iterable[str]) -> set[str]:
+        """返回 `expected` 中缺的键（用于一次性报全所有缺件）。"""
+        return set(expected) - set(self._weight_map)
+
+    def _shard(self, name: str) -> SafeTensorFile:
+        try:
+            file = self._weight_map[name]
+        except KeyError:
+            raise MissingTensorError(
+                "权重缺少张量", tensor=name, index=str(self.index_path)
+            ) from None
+        handle = self._shards.get(file)
+        if handle is None:
+            handle = SafeTensorFile(self.dir / file)
+            self._shards[file] = handle
+        return handle
+
+    def read(self, name: str) -> np.ndarray:
+        return self._shard(name).read(name)
+
+    def read_rows(self, name: str, rows: Sequence[int]) -> np.ndarray:
+        return self._shard(name).read_rows(name, rows)
+
+    def fingerprint(self) -> dict:
+        """这份权重容器的身份：索引连同它点到的每个分片（坏一个就换一份权重）。"""
+        shards = sorted(set(self._weight_map.values()))
+        paths = [self.index_path, *(self.dir / file for file in shards)]
+        return {"container": "sharded", "files": [file_identity(path) for path in paths]}
+
+    def close(self) -> None:
+        for handle in self._shards.values():
+            handle.close()
+        self._shards.clear()
 
 
 class TensorStore:

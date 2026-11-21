@@ -46,6 +46,27 @@ def make_code_checkpoint(
     return directory
 
 
+def write_sharded_checkpoint(
+    directory: Path, shards: dict[str, dict[str, np.ndarray]]
+) -> Path:
+    """按分片写一份检查点：每个分片一个 safetensors，再写 `model.safetensors.index.json`。
+
+    分片名由调用方给（`model-00001-of-00002.safetensors`）—— 真实发布包的名字里带序号与
+    总数，读取端对名字不该有任何假设，测试用同样的名字钉住这一点。
+    """
+    weight_map: dict[str, str] = {}
+    total = 0
+    for file, tensors in shards.items():
+        write_safetensors(directory / file, tensors)
+        weight_map.update({name: file for name in tensors})
+        total += sum(int(np.asarray(value).size) * 4 for value in tensors.values())
+    (directory / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map}),
+        encoding="utf-8",
+    )
+    return directory
+
+
 def write_safetensors(path: Path, tensors: dict[str, np.ndarray]) -> Path:
     """写一个只含 F32 张量的最小 safetensors 文件（与读取端对齐）。"""
     header: dict[str, dict[str, object]] = {}

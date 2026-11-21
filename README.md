@@ -30,8 +30,9 @@ questions and options, and returns a probability for every option.
   all 32 layers resident and needs about 4.5 GB.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
-- Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus about 4 GiB
-  of compiled artifacts. The weights are downloaded on first use.
+- Disk: about 4 GB of weights for mude, 9.1 GB for d3, 9.3 GB for h2o and
+  10.4 GB for torchcast (one model at a time), plus about 4 GiB of compiled
+  artifacts. The weights are downloaded on first use.
 
 ## Install
 
@@ -64,18 +65,14 @@ The first start downloads the weights and compiles the ANE programs, then prints
 `sysone serve: ready in ...s`; later starts report `compile 0.00s`. Running it
 again is safe.
 
-For mude use `--model mude`. Torchcast has no published package either: pass
-`--model torchcast --weights` pointing at a local int8 model directory. It runs on
-the same ANE chain as h2o and only supports the full-bidirectional mask, so it
-shares no prompt prefix between questions; the vendor extra
-(`pip install -e './src[vendor]'`) is only needed to run the vendor's own torch
-engine as a comparison baseline.
-
-d3-mini reads the same 255-code d3 table as mude on a 4B backbone, so it runs on
-the split chain and only supports the full-bidirectional mask — no shared prompt
-prefix, though batching still applies. Its package is not downloaded yet: pass
-`--model d3 --weights` pointing at a local model directory, and always give
-`--model` explicitly (its package carries the same required files as mude's).
+For mude use `--model mude`. d3 and torchcast download their sharded packages
+on first use as well: `--model d3` runs `vllm-sr/d3-mini` on the split chain and
+`--model torchcast` runs `torchcast-ai/torchcast-decision-4b` on the pooled
+chain. Both only support the full-bidirectional mask, so they share no prompt
+prefix between questions, though batching still applies. Give `--model`
+explicitly for those two (their packages carry the same required files as
+mude's). The vendor extra (`pip install -e './src[vendor]'`) is only needed to
+run the vendor's own torch engine as a comparison baseline.
 
 Check it from another shell:
 

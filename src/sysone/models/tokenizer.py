@@ -2,10 +2,10 @@
 
 出货路径只需要两件事（`models/families/mude.py` 里 `MudePrompter` 的鸭子类型）：把文本编成
 id，以及渲染 chat 模板。`transformers` 为这两件事要多装 ≈0.28 GB 的底座（`AutoTokenizer` 走到
-0.3635 GB，`tokenizers` 直连 `tokenizer.json` 是 0.0814 GB，票据 03 的实测）；模板本身就是
-`tokenizer_config.json` 里的 jinja 字符串，渲染环境照 transformers 的
-`_cached_compile_jinja_template` 复制——同一套过滤器与全局函数，否则模板渲染差一个空格就会
-静默改变 token。
+0.3635 GB，`tokenizers` 直连 `tokenizer.json` 是 0.0814 GB，票据 03 的实测）；模板取
+`tokenizer_config.json` 里的 jinja 字符串，或同目录的 `chat_template.jinja`，渲染环境照
+transformers 的 `_cached_compile_jinja_template` 复制——同一套过滤器与全局函数，否则模板
+渲染差一个空格就会静默改变 token。
 
 `transformers` 仍然留给 h2o / torchcast 两条 vendor 路径，它们要的是模型结构不是文本。
 """
@@ -46,12 +46,33 @@ def _environment():
     return environment
 
 
+def _template_text(directory: Path, config: dict) -> str:
+    """模板从哪来：`tokenizer_config.json` 的内嵌字符串，或同目录的 `chat_template.jinja`。
+
+    `pplx` 的发布包把模板放在单独的 `.jinja` 里（配置项是 `null`），transformers 也认这个
+    兄弟文件，所以这里按同样的顺序找 —— 否则一份完全合法的检查点会因为"模板不在配置里"被判
+    成坏配置。命名模板（dict/list）仍然不猜：挑哪一条当默认是 transformers 的约定。
+    """
+    template = config.get("chat_template")
+    if isinstance(template, str):
+        return template
+    sibling = directory / "chat_template.jinja"
+    if template is None and sibling.is_file():
+        return sibling.read_text(encoding="utf-8")
+    raise ConfigError(
+        "tokenizer_config.json 的 chat_template 不是单条字符串",
+        kind=type(template).__name__,
+        searched=str(sibling),
+    )
+
+
 class ChatTokenizer:
     """`tokenizer.json` + `tokenizer_config.json` 的聊天分词器（transformers 那层的替身）。
 
     鸭子类型只有两件事，与 `MudePrompter.__init__` 的说明一致：
     `__call__(text, add_special_tokens=False)["input_ids"]` 与
     `apply_chat_template(conversation, tokenize=False, add_generation_prompt=True, **模板变量)`。
+    模板取 `tokenizer_config.json` 的 `chat_template`，缺它时取同目录的 `chat_template.jinja`。
     """
 
     def __init__(self, backend: object, template: str) -> None:
@@ -69,13 +90,7 @@ class ChatTokenizer:
         if not config_path.exists():
             raise ConfigError("模型目录没有 tokenizer_config.json", path=str(config_path))
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        template = config.get("chat_template")
-        if not isinstance(template, str):
-            # 命名模板（dict/list 形式）只有 transformers 会挑默认，这里不猜。
-            raise ConfigError(
-                "tokenizer_config.json 的 chat_template 不是单条字符串",
-                kind=type(template).__name__,
-            )
+        template = _template_text(directory, config)
         from tokenizers import Tokenizer as Backend
 
         return cls(Backend.from_file(str(tokenizer_path)), template)

@@ -107,3 +107,36 @@ def test_apply_chat_template_rejects_tokenize(tmp_path: Path) -> None:
     tokenizer = ChatTokenizer.load(_model(tmp_path))
     with pytest.raises(ConfigError, match="只渲染文本"):
         tokenizer.apply_chat_template(CONVERSATION, tokenize=True)
+
+
+def test_a_sibling_chat_template_file_is_used_when_the_config_has_null(tmp_path: Path) -> None:
+    """`pplx` 的发布包把模板放在 `chat_template.jinja` 里，配置项是 `null`。
+
+    transformers 认这个兄弟文件，所以这里也按同一条顺序找：否则一份完全合法的检查点会被判成
+    坏配置，而它本来的模型文件都是齐的。
+    """
+    _model(tmp_path)
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": None}), encoding="utf-8"
+    )
+    (tmp_path / "chat_template.jinja").write_text(TEMPLATE, encoding="utf-8")
+    tokenizer = ChatTokenizer.load(tmp_path)
+    rendered = tokenizer.apply_chat_template(CONVERSATION, tokenize=False, add_generation_prompt=True)
+    assert rendered == "system= system prompt \nuser=请问 hello world?\n<<generate>>"
+
+
+def test_a_null_template_without_a_sibling_file_is_a_config_error(tmp_path: Path) -> None:
+    _model(tmp_path)
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": None}), encoding="utf-8"
+    )
+    with pytest.raises(ConfigError, match="chat_template"):
+        ChatTokenizer.load(tmp_path)
+
+
+def test_a_named_template_is_not_replaced_by_a_sibling_file(tmp_path: Path) -> None:
+    """命名模板（list）仍是坏配置：挑哪一条当默认是 transformers 的约定，`.jinja` 不顶替它。"""
+    _model(tmp_path, template=[{"name": "default", "template": TEMPLATE}])
+    (tmp_path / "chat_template.jinja").write_text(TEMPLATE, encoding="utf-8")
+    with pytest.raises(ConfigError, match="chat_template"):
+        ChatTokenizer.load(tmp_path)

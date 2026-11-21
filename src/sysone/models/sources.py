@@ -1,8 +1,13 @@
-"""两份发布权重从哪来：仓库、固定修订与引擎读的文件清单。
+"""四份发布权重从哪来：仓库、固定修订与引擎读的文件清单。
 
 这份清单原先只写在 README 的 `hf download` 命令里，现在它是唯一事实来源：首启自动下载
 按它取文件，`DownloadError` 按它拼出手动命令。修订必须钉死 —— follow branch 会换权重，
 而产物缓存只认权重文件的指纹，换了等于悄悄重编一遍。license 文件也在清单里，随包保留。
+
+按**引擎真正读的文件**列，不抄仓库全量：`d3` / `pplx` / `torchcast` 都把权重发成
+`model-0000N-of-000M.safetensors` 加 `model.safetensors.index.json`（首启直接读分片，
+不合并），仓库里的厂商参考脚本、示例图、README 与 `merges.txt`/`vocab.json`（`tokenizer.json`
+自带）都不在清单里。
 """
 
 from __future__ import annotations
@@ -76,6 +81,45 @@ SOURCES: dict[str, WeightsSource] = {
             "LICENSE",
         ),
         size_hint=9_300_000_000,
+    ),
+    "d3": WeightsSource(
+        family="d3",
+        repo_id="vllm-sr/d3-mini",
+        revision="df99bf4ca4418bc6908ee68e9b7479af1f3b8800",
+        directory="d3-mini",
+        files=(
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "readout.safetensors",
+            "decision_config.json",
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "LICENSE",
+            "NOTICE",
+        ),
+        size_hint=9_100_000_000,
+    ),
+    "torchcast": WeightsSource(
+        family="torchcast",
+        repo_id="torchcast-ai/torchcast-decision-4b",
+        revision="492bfb19662f3c6e601cc9c4bd2911ac95609ed4",
+        directory="torchcast-decision-4b",
+        files=(
+            "model.safetensors.index.json",
+            "model-00001-of-00003.safetensors",
+            "model-00002-of-00003.safetensors",
+            "model-00003-of-00003.safetensors",
+            "decision_config.json",
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "LICENSE",
+            "LICENSE-qwen-Apache-2.0",
+            "NOTICE",
+        ),
+        size_hint=10_400_000_000,
     ),
 }
 
