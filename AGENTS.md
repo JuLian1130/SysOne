@@ -19,7 +19,7 @@ issue 与 spec 以本地 markdown 形式存放于 `.scratch/`（不走 GitHub Is
 
 单上下文：领域词汇与设计决策写在模块 docstring 与根 `README.md`。公开仓库不依赖额外的 `GLOSSARY.md` 或 ADR 目录；需要追溯旧引擎时再看本地私有 `docs/`，它不参与构建或运行。
 
-根 README 是双语的：`README.md`（英文，主稿）与 `README.zh.md`（中文）必须在同一次改动里同步，新增段落先写英文再翻中文。`tests/unit/test_readme_parity.py` 对账两边的围栏代码块（逐字节）、标题层级、表格行数与形状、行内代码（参数名/环境变量/路径的出现次数）与链接；只改一份会被 CI 拦下。
+公开文档成对出现：`README.md`/`README.zh.md`（快速上手）与 `API.md`/`API.zh.md`（服务契约），英文是主稿、中文是翻译，必须在同一次改动里同步；新增段落先写英文再翻中文。`tests/unit/test_readme_parity.py` 按文档对账两边的围栏代码块（逐字节）、标题层级、表格行数与形状、行内代码（参数名/环境变量/路径/状态码的出现次数）与链接；只改一份会被 CI 拦下。
 
 ### Local scratch（本机临时产物）
 

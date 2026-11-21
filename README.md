@@ -23,8 +23,7 @@ sync.
 | `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) | ANE + Metal, code-row readout |
 
 `--backend reference` is the M0 semantic judge used by tests. It is not a
-production path and requires an explicit `--descriptor`. Non-macOS platforms
-cannot run the Apple backends; `reference` is the only path there.
+production path and requires an explicit `--descriptor`.
 
 Both released models support `choice` and `noul` questions. h2o additionally
 supports `score` through the vendor `format_answer`; mude's code-row readout
@@ -32,16 +31,13 @@ does not.
 
 ## Requirements
 
-- Apple Silicon (M1 or newer). The checked configuration is an M2 Pro with
-  16 GB of memory on macOS 15.7.2.
+- Apple Silicon (M1 or newer) on macOS 15 or newer.
+- 16 GB of memory or more; h2o's weights alone are about 9.3 GB.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
 - Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus several
   GiB of compiled artifacts (h2o is about 3.33 GiB). The weights are downloaded
   on first use.
-
-Versions are pinned: engine `0.1.0`; compiled artifact format version 3; model
-revisions are pinned in `src/sysone/models/sources.py`.
 
 ## Install
 
@@ -67,48 +63,20 @@ If you do not want to install the package, every command below also works as:
 PYTHONPATH=src python -m sysone.cli <command> ...
 ```
 
-## Build the native dylibs
+## Build the native libraries
 
-The three dylibs are build inputs, not checked-in binaries:
-
-- `libe8ane.dylib` — the ANE private-API host (`tools/native/e8_ane.m`);
-- `libe8mtl.dylib` — the Metal host (`tools/native/e8_mtl.m`);
-- `libe8image.dylib` — the ImageIO decoder used only by the vision path
-  (`tools/native/e8_image.m`).
+`serve` needs three small native libraries. They are built from the `.m` sources
+in `tools/native/`, not shipped in the repository. Run this once per checkout;
+the first `serve` will not start without it:
 
 ```sh
 tools/build_ane.sh
-ls .tmp/e8
 ```
 
-The output defaults to `.tmp/e8` (ignored by git). `SYS1_E8_DIR` overrides it.
-Do not use `/tmp`: macOS clears it on reboot, and a missing dylib makes the whole
-Apple path unavailable. `ANE_SRC` can point the script at another source
-directory; the repository source is `tools/native/`.
-
-The engine finds `.tmp/e8` on its own (`SYS1_E8_DIR` overrides it); if a dylib
-is missing, the startup error names the path and tells you to run the build
-script.
-
-## Weights
-
-`sysone serve` resolves the weight package itself. If `--weights` is omitted
-and the package is not cached, the first start downloads it from Hugging Face at
-a pinned revision. The download prints one line with the repository, revision,
-size and directory; later starts read the `source.json` marker and touch no
-network.
-
-- Default directory: `~/Library/Caches/sysone/weights/<repo directory>`
-  (`h2o-lightning-4b`, `mude-1.0`). `SYS1_WEIGHTS_DIR` overrides it.
-- `--offline` forbids the download. A missing package then fails with the exact
-  pinned `hf download` command; an air-gapped host copies a finished package
-  (including its `source.json`) under `SYS1_WEIGHTS_DIR`.
-- An explicit `--weights` is read-only: it never downloads, so a typo in a path
-  cannot start a multi-GB fetch.
-- The download list contains only the files the engine reads plus each
-  repository's license files; it is pinned in `src/sysone/models/sources.py`.
-- `HF_TOKEN` is honoured through `huggingface_hub`'s standard environment for
-  private mirrors.
+The script writes `libe8ane.dylib` (the ANE private-API host), `libe8mtl.dylib`
+(the Metal host) and `libe8image.dylib` (the ImageIO decoder used only by the
+vision path) into `.tmp/e8`. The engine finds that directory on its own;
+`SYS1_E8_DIR` overrides it. Do not use `/tmp`: macOS clears it on reboot.
 
 ## Start the service
 
@@ -127,6 +95,18 @@ until the ready line. For mude use `--model mude`. h2o also accepts the
 bidirectional `noncausal_full` mode, which requires the whole prompt to fit in
 one ANE bucket: long prompts need `--bucket 4096` (the default bucket is 1024),
 while the causal default has no such constraint.
+
+Check it from another shell:
+
+```sh
+curl -s http://127.0.0.1:8000/health
+curl -s -X POST http://127.0.0.1:8000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d @examples/request-service.json
+```
+
+The full contract — routes, authentication, status codes, request and response
+shapes, and per-model capabilities — is in [API.md](API.md).
 
 ### Options
 
@@ -170,115 +150,6 @@ Environment overrides: `SYS1_LOG_LEVEL` (default `info`), `SYS1_WEIGHTS_DIR`,
 `SYS1_ARTIFACTS_DIR`, `SYS1_E8_DIR`, and `DECISION_API_KEY`; the matching flags
 win over the variables.
 
-In another shell:
-
-```sh
-curl -s http://127.0.0.1:8000/health
-curl -s -X POST http://127.0.0.1:8000/v1/systemone \
-  -H 'Content-Type: application/json' \
-  -d @examples/request-service.json
-```
-
-## Requests
-
-`/v1/systemone` carries `state` plus a `questions` **object** keyed by question
-id (`examples/request-service.json`). Each question has `type`, `instructions`,
-and `criteria`:
-
-```json
-{
-  "state": {"battery": 8},
-  "questions": {
-    "q1": {
-      "type": "choice",
-      "instructions": "What now?",
-      "criteria": {"continue": "keep going", "divert": "go to a charger"}
-    }
-  }
-}
-```
-
-`criteria` for `choice` is an object of option keys (an optional description is
-the value); for `score` it is an ordered array of levels; for `noul` it is
-`{"true": …, "false": …}`. A request may carry up to 255 options per question.
-`state` and `instructions` may be strings or arbitrary JSON; non-strings are
-serialized as JSON into the prompt.
-
-## Service contract
-
-`sysone serve` exposes:
-
-| Route | Method | Auth | Purpose |
-|---|---|---|---|
-| `/health` | GET | none | readiness and model info |
-| `/metrics` | GET | none | admission, engine, startup, vision, batching counters |
-| `/v1/models` | GET | bearer when configured | model name, max input tokens, modalities, vision limits |
-| `/v1/systemone` | POST | bearer when configured | run one decision request |
-
-- Authentication is enabled by setting `DECISION_API_KEY` (not `SYS1_API_KEY`).
-  When set, `/v1/models` and `/v1/systemone` require
-  `Authorization: Bearer $DECISION_API_KEY`; `/health` and `/metrics` stay open.
-- While the engine loads, every route returns `503` with `Retry-After`. A load
-  failure also returns `503`, with the failure reason.
-- When the admission queue is full, `/v1/systemone` returns `429` with
-  `Retry-After` and closes the connection without reading the body.
-- Malformed requests return the same two `422` shapes as the reference protocol:
-  a string `detail`, or `{"invalid_questions": {id: reason}}` with every bad
-  question reported at once.
-- The response is:
-
-```json
-{
-  "model": "...",
-  "answers": {
-    "q1": {"type": "choice", "choice": "continue", "probabilities": {"continue": 0.7, "divert": 0.3}}
-  },
-  "usage": {"input_tokens": 123, "output_tokens": 0},
-  "attention_mode": "causal",
-  "attention_trained": true
-}
-```
-
-- `noul` answers carry `noul` (P(true)); `score` answers carry the expected
-  level in `score` and per-level `probabilities`.
-- `attention_mode` in the request body overrides the process default set by
-  `--attention-mode` for that request. The CLI request file accepts the same
-  field.
-- `images` accepts a list of `data:image/...;base64,` data URLs. Video is rejected.
-  When `--vision off` is set, image requests are rejected with `422`.
-
-## Capability matrix
-
-| | h2o | mude |
-|---|---|---|
-| Question kinds | `choice`, `noul`, `score` | `choice`, `noul` |
-| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) |
-| Readout | vendor pooled readout | fixed 255-row code table |
-| Max options per question | 255 | 255 |
-| Max input tokens | `--width` (default 16384) | `--width` (default 16384) |
-| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) |
-
-The first start also builds the vision tower's 26 programs, then releases the
-tower: text-only processes stay at 0 resident, and the first image request pays
-only the load. `--vision off` skips the tower and its programs. The third dylib
-(`libe8image.dylib`) is only needed when an image request is actually served.
-
-## Resources and tuning
-
-- Both caches live under the platform cache and honour `SYS1_WEIGHTS_DIR` /
-  `SYS1_ARTIFACTS_DIR`; deleting one forces a re-download or a recompile. The
-  first compile is minutes-level, later starts report `compile 0.00s`.
-- Keep `--quant` stable across starts: it selects the artifact set (`s<bucket>`
-  for `int8`, `s<bucket>-fp16` for `fp16`), so switching does not overwrite the
-  other set but does compile a second one.
-- `--bucket` and `--width` trade tile size against GPU memory. On a 16 GB
-  machine start with `--width 8192`; widen the bucket only when the prompts
-  need it. A prompt longer than `--width` is rejected with `422`.
-- `--W` trades memory for latency: the default `4` (one block) keeps the least
-  resident, `--W 0` keeps every layer loaded.
-- A geometry outside the measured whitelist still runs, but its numbers are
-  experimental.
-
 ## Troubleshooting
 
 - `NotReadyError: 找不到 libe8ane.dylib` — run `tools/build_ane.sh`; check
@@ -303,8 +174,6 @@ only the load. `--vision off` skips the tower and its programs. The third dylib
 - `429` — raise `--queue`/`--admit-timeout` or retry after `Retry-After`.
 - h2o fails at `Serve.open` — `serve_config.json` or `h2o_lightning_shim.py` is
   missing; delete the cached package and let the next start re-download it.
-- `--backend reference` requires `--descriptor`; it is the semantic-judge path,
-  not a model runtime.
 
 ## Repository layout
 

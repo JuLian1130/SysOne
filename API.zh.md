@@ -1,0 +1,91 @@
+[English](API.md) | 简体中文
+
+# SysOne 服务 API
+
+`sysone serve --model h2o` 在 `127.0.0.1:8000` 提供一个 HTTP 服务。本页是请求契约；
+安装与启动见 [README.zh.md](README.zh.md)。
+
+## 路由
+
+| 路由 | 方法 | 认证 | 用途 |
+|---|---|---|---|
+| `/health` | GET | 无 | 就绪状态与模型信息 |
+| `/metrics` | GET | 无 | 准入、引擎、启动、视觉、批处理计数 |
+| `/v1/models` | GET | 配置时需 bearer | 模型名、最大输入 token、模态、图像契约 |
+| `/v1/systemone` | POST | 配置时需 bearer | 跑一条决策请求 |
+
+`/health` 返回 `status`、`model`、`max_input_tokens`、`modalities` 与 `authentication`。
+模型带塔时，`/v1/models` 还会附上图像契约：`min_pixels`、`max_pixels`、`max_bytes`、
+`max_source_pixels`、`placement`、`patch_embedding`、`decoder` 与 `image_processor`。
+
+## 认证
+
+设置 `DECISION_API_KEY`（不是 `SYS1_API_KEY`）即启用。此后 `/v1/models` 与
+`/v1/systemone` 需要 `Authorization: Bearer $DECISION_API_KEY`；`/health` 与
+`/metrics` 保持开放。
+
+## 状态码
+
+- 引擎装载期间所有路由都回 `503` 并带 `Retry-After`。装载失败同样回 `503`，并附失败
+  原因。
+- 准入队列满时，`/v1/systemone` 回 `429` 与 `Retry-After`，并且不读请求体就断开连接。
+- 格式错误的请求返回与 reference 协议相同的两种 `422`：字符串 `detail`，或
+  `{"invalid_questions": {id: reason}}`（一次报出所有坏问题）。
+
+## 请求
+
+`/v1/systemone` 带 `state` 与一个按问题 id 索引的 `questions` **对象**
+（`examples/request-service.json`）。每个问题有 `type`、`instructions` 与 `criteria`：
+
+```json
+{
+  "state": {"battery": 8},
+  "questions": {
+    "q1": {
+      "type": "choice",
+      "instructions": "What now?",
+      "criteria": {"continue": "keep going", "divert": "go to a charger"}
+    }
+  }
+}
+```
+
+`criteria` 的形状按类型定：`choice` 是选项键的对象（值是可选的描述），`score` 是有序的
+等级数组，`noul` 是 `{"true": …, "false": …}`。一题最多 255 个选项。`state` 与
+`instructions` 可以是字符串或任意 JSON；非字符串会序列化成 JSON 进 prompt。
+
+`images` 接受一组 `data:image/...;base64,` data URL。视频会被拒绝。设置 `--vision off`
+时，带图的请求回 `422`。
+
+## 响应
+
+```json
+{
+  "model": "...",
+  "answers": {
+    "q1": {"type": "choice", "choice": "continue", "probabilities": {"continue": 0.7, "divert": 0.3}}
+  },
+  "usage": {"input_tokens": 123, "output_tokens": 0},
+  "attention_mode": "causal",
+  "attention_trained": true
+}
+```
+
+- `noul` 的答案带 `noul`（P(true)）；`score` 的答案在 `score` 里带期望等级，并带逐等级
+  `probabilities`。
+- 请求体里的 `attention_mode` 只对该请求覆盖 `--attention-mode` 设的进程默认值。
+
+## 各模型能力
+
+| | h2o | mude |
+|---|---|---|
+| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul` |
+| 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) |
+| 读出 | 厂商 pooled 读出 | 固定 255 行码表 |
+| 每题最多选项 | 255 | 255 |
+| 最大输入 token | `--width` (default 16384) | `--width` (default 16384) |
+| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
+
+首次启动还会把视觉塔的 26 份产物编好，然后归还塔：纯文本进程保持 0 常驻，第一次带图
+请求只付装载。`--vision off` 跳过塔及其产物。第三份 dylib（`libe8image.dylib`）只在真的
+服务带图请求时才需要。
