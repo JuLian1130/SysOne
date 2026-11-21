@@ -186,12 +186,37 @@ def test_noul_without_criteria_falls_back_to_the_fixed_texts() -> None:
         assert texts == mude._NOUL_TEXTS
 
 
-def test_option_plan_refuses_a_kind_the_code_table_cannot_answer() -> None:
-    """码表读出没有 score 的档位模板：这是**坏请求**（400），不是我们的配置坏了（500）。"""
+def test_option_plan_reads_score_levels_in_order() -> None:
+    """score 在题面上就是一道"一个档位一行"的 choice，行里不带序号前缀。
+
+    厂商 `normalize_question` 的改写法：criteria 的有序档位原样成为选项文本，标签是
+    `"0".."n-1"`，于是"码序 = 档位序"，答案由概率折成期望档位 `Σ i·p_i`。协议层给的那段
+    `"0: 差"` 里的序号是给答面拼标签用的，题面里不能留。
+    """
+    question = Question(text="多正面？", options=("0: 差", "1: 中", "2: 好"), kind="score")
+    texts, labels, indexes = mude.option_plan(question)
+    assert texts == ("差", "中", "好")
+    assert labels == ("0", "1", "2")
+    assert indexes == (0, 1, 2)
+
+
+def test_option_plan_refuses_a_scale_the_vendor_would_refuse() -> None:
+    """档位数与重复档位按厂商 `SCORE_LEVELS` / `normalize_question` 的判据挡掉。"""
+    for options in (
+        ("0: 只有一档",),
+        tuple(f"{index}: 档{index}" for index in range(11)),
+        ("0: 一样", "1: 一样"),
+    ):
+        with pytest.raises(ConfigError):
+            mude.option_plan(Question(text="打分", options=options, kind="score"))
+
+
+def test_option_plan_refuses_a_kind_outside_the_wire_format() -> None:
+    """线格式只有 choice / noul / score：直接构造 `Question` 的调用方拿到 400，而不是被当 choice。"""
     with pytest.raises(UnsupportedKindError) as info:
-        mude.option_plan(Question(text="打分", kind="score"))
+        mude.option_plan(Question(text="排个序", kind="ranking"))
     assert info.value.status == 400
-    assert info.value.context == {"kind": "score", "supported": ["choice", "noul"]}
+    assert info.value.context == {"kind": "ranking", "supported": ["choice", "noul", "score"]}
     with pytest.raises(ConfigError):
         mude.option_plan(Question(text="选一个"))
 
@@ -311,6 +336,22 @@ def test_noul_question_reports_yes_no_in_engine_order() -> None:
     assert answer.probs == (0.75, 0.25)
     assert answer.value == "yes"
     assert chain.calls[-1][1] == 2  # 两道选项: No / Yes
+
+
+def test_a_score_question_reads_its_scale_through_the_same_code_table() -> None:
+    """score 不新开一条读出：档位按 0..n-1 占前几行码，标签就是档位序号。"""
+    chain = FakeChain(shares=(0.1, 0.2, 0.7))
+    engine = _engine(chain)
+    engine.start()
+    request = make_request(mode=MaskMode.PREFIX_NONCAUSAL, questions=1)
+    question = Question(text="item 0", options=("0: 差", "1: 中", "2: 好"), kind="score")
+    request = type(request)(state=request.state, questions=(question,))
+    result = engine.run(request)
+    answer = result.answers[0]
+    assert answer.labels == ("0", "1", "2")
+    assert answer.probs == pytest.approx((0.1, 0.2, 0.7))
+    assert answer.value == "2"
+    assert chain.calls[-1][1] == 3  # 三个档位 ⇒ 三个候选
 
 
 def test_causal_reaches_the_chain_as_a_triangular_mask() -> None:

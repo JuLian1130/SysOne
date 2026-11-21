@@ -21,6 +21,9 @@ from . import qwen35
 # `d3_runtime.py` 的 MAX_OPTIONS；readout 表是 [255, hidden]。
 CODE_ROWS = 255
 
+# `d3_runtime.SCORE_LEVELS`：score 的档位数只在这个区间里，区间外的请求厂商自己会拒。
+SCORE_LEVELS = (2, 10)
+
 # 这份 checkpoint 的 norm 权重是零中心存的，真值是 `w + 1`（docs/ANE/README.md §10.22）。
 # 不补 +1 时第 0 层的 cos 只有 0.53，看上去像引擎结构错了。
 NORM_OFFSET = 1.0
@@ -120,13 +123,28 @@ def option_plan(question: Question) -> tuple[tuple[str, ...], tuple[str, ...], t
             given.get(key) or fallback for key, fallback in zip(_NOUL_KEYS, _NOUL_TEXTS)
         )
         return texts, ("yes", "no"), (1, 0)
+    if question.kind == "score":
+        # 厂商 `normalize_question` 的 score 分支：有序档位改写成一道 choice —— 一个档位一行、
+        # 行里只有档位文本（协议层那个 `"0: "` 序号前缀是给答面拼标签用的，不进题面），
+        # 标签是 `"0".."n-1"`、顺序即档位高低，答案由概率折成期望档位 `Σ i·p_i`。
+        levels = tuple(question_spec(question)["criteria"])
+        low, high = SCORE_LEVELS
+        if not low <= len(levels) <= high:
+            raise ConfigError(
+                "score 的档位数超出这个模型的范围",
+                levels=len(levels),
+                range=list(SCORE_LEVELS),
+            )
+        if not all(levels) or len(set(levels)) != len(levels):
+            raise ConfigError("score 的档位必须互不相同且非空", levels=list(levels))
+        labels = tuple(str(index) for index in range(len(levels)))
+        return levels, labels, tuple(range(len(levels)))
     if question.kind != "choice":
-        # 码表读出没有 score 的档位模板（`d3_format` 不给 score）：硬按 choice 读会拿
-        # 两套不同的题面比概率。明确拒绝，让客户端知道这不是它重试能解决的。
+        # 线格式只有这三种题型（协议层已经挡过一道）；走到这里说明是直接构造 `Question` 的调用方。
         raise UnsupportedKindError(
             "mude 的码表读出答不了这种题型",
             kind=question.kind,
-            supported=["choice", "noul"],
+            supported=["choice", "noul", "score"],
         )
     if not question.options:
         raise ConfigError("choice 题缺少选项")
