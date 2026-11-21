@@ -1,7 +1,7 @@
 """环境变量与本机临时产物落点：唯一一处读环境的模块（注册表 + 类型校验）。
 
-登记的只有真正有消费者的三项：日志级别（`logging`）、服务的 bearer key（`service/app`）、
-产物落点（`cli`）。其余调参项都走 `EngineConfig`，不在这里登记。
+登记的只有真正有消费者的四项：日志级别（`logging`）、服务的 bearer key（`service/app`）、
+产物落点与首启下载的权重落点（`cli`）。其余调参项都走 `EngineConfig`，不在这里登记。
 
 `scratch_root()` 不是环境变量，但同属"东西从哪来"这个问题，所以也放在这里。
 """
@@ -37,6 +37,12 @@ REGISTRY: tuple[EnvSpec, ...] = (
         "str",
         "",
         "编译产物的落点（默认平台缓存目录）；`--artifacts` 优先于它",
+    ),
+    EnvSpec(
+        "SYS1_WEIGHTS_DIR",
+        "str",
+        "",
+        "首启自动下载权重的落点（默认平台缓存目录）；`--weights` 是显式目录，不经过它",
     ),
 )
 

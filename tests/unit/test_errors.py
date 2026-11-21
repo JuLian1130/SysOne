@@ -16,6 +16,7 @@ from sysone import errors
         (errors.NotReadyError, "not_ready", 503),
         (errors.RequestTooLongError, "request_too_long", 422),
         (errors.UnsupportedMediaError, "unsupported_media", 422),
+        (errors.DownloadError, "download", 503),
     ],
 )
 def test_code_and_status(cls, code: str, status: int) -> None:

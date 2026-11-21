@@ -226,5 +226,8 @@ __marimo__/
 # 本机临时产物：dylib、Metal 几何头、测试依赖、探针输出。可随时 rm -rf 重算，不入库
 /.tmp/
 
+# 自带权重（`hf download … --local-dir models/…`）：4–9 GB，只属于本机
+/models/
+
 # macOS
 .DS_Store

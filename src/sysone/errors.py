@@ -29,6 +29,13 @@ class ConfigError(SysOneError):
     code = "config"
 
 
+class DownloadError(SysOneError):
+    """权重缺失且下载失败/被离线禁止：可重试的启动期错误（服务回 503）。"""
+
+    code = "download"
+    status = 503
+
+
 class UnknownModelError(SysOneError):
     """`--model` 未知，或家族未注册。"""
 

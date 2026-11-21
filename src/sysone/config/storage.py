@@ -9,6 +9,7 @@ from pathlib import Path
 # 变量名跟着消费者走，`sysone.env.REGISTRY` 里再写一份字面量（与 `DECISION_API_KEY` 同一种
 # 写法：注册表管解析与默认值，消费者管语义）。
 ARTIFACTS_VARIABLE = "SYS1_ARTIFACTS_DIR"
+WEIGHTS_VARIABLE = "SYS1_WEIGHTS_DIR"
 
 
 def default_artifacts_dir() -> Path:
@@ -26,6 +27,17 @@ def default_artifacts_dir() -> Path:
     return Path.home() / ".cache" / "sysone" / "artifacts"
 
 
+def default_weights_dir() -> Path:
+    """首启自动下载权重的默认落点：平台缓存目录，与产物目录同一套规矩。
+
+    不落仓库下的 `models/`：服务的工作目录不固定，同一台机器上多份 checkout 还会各下
+    一份 9 GB；缓存目录与 artifacts 同源，删掉只意味着下次重下。`SYS1_WEIGHTS_DIR` 可覆盖。
+    """
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "sysone" / "weights"
+    return Path.home() / ".cache" / "sysone" / "weights"
+
+
 @dataclass(frozen=True)
 class StorageConfig:
     """权重与编译产物的位置。
@@ -41,6 +53,10 @@ class StorageConfig:
     def resolved_artifacts_dir(self) -> Path:
         """产物落点：构造时给的就用，没给换成平台缓存目录。"""
         return default_artifacts_dir() if self.artifacts_dir is None else Path(self.artifacts_dir)
+
+    def resolved_weights_dir(self) -> Path:
+        """自动下载的权重落点：构造时给的就用，没给换成平台缓存目录。"""
+        return default_weights_dir() if self.weights_dir is None else Path(self.weights_dir)
 
     def validate(self) -> None:
         if self.artifacts_budget < 0:

@@ -58,3 +58,20 @@ def test_artifacts_dir_keeps_what_the_caller_gave() -> None:
     from sysone.config import StorageConfig
 
     assert StorageConfig(artifacts_dir=Path("/var/art")).resolved_artifacts_dir() == Path("/var/art")
+
+
+def test_weights_dir_defaults_to_a_persistent_platform_cache() -> None:
+    from sysone.config import StorageConfig
+    from sysone.config.storage import default_weights_dir
+
+    resolved = StorageConfig().resolved_weights_dir()
+    assert resolved == default_weights_dir()
+    assert resolved.is_absolute()
+    assert resolved != Path(tempfile.gettempdir())
+    assert "sysone" in resolved.parts
+
+
+def test_weights_dir_keeps_what_the_caller_gave() -> None:
+    from sysone.config import StorageConfig
+
+    assert StorageConfig(weights_dir=Path("/var/weights")).resolved_weights_dir() == Path("/var/weights")

@@ -9,7 +9,12 @@ import sys
 from pathlib import Path
 
 from .config import EngineConfig, ModelSelection, SchedulerConfig, ServiceConfig, StorageConfig
-from .config.storage import ARTIFACTS_VARIABLE, default_artifacts_dir
+from .config.storage import (
+    ARTIFACTS_VARIABLE,
+    WEIGHTS_VARIABLE,
+    default_artifacts_dir,
+    default_weights_dir,
+)
 from .devices.apple import ApplePlatform, measured
 from .devices.reference import CharEncoder, ReferencePlatform, ReferenceRunner
 from .domain.attention import MaskMode
@@ -73,6 +78,11 @@ def _resolve_backend(args: argparse.Namespace) -> str:
     if args.backend is not None:
         return args.backend
     if args.model is None:
+        if args.weights is None:
+            raise ConfigError(
+                "需要 --model 或 --backend",
+                hint="省略 --weights 时没有权重包可认家族；先给 --model mude / h2o",
+            )
         args.model = _infer_family(args.weights)
     strategy = family(args.model).strategy
     if strategy not in STRATEGY_BACKENDS:
@@ -87,7 +97,7 @@ def _resolve_backend(args: argparse.Namespace) -> str:
 
 
 def _model_flags() -> argparse.ArgumentParser:
-    """`run` 与 `serve` 共用的模型/后端选择（`add_help=False` 让它们挂在子命令下）。"""
+    """`run` / `serve` / `compile` 共用的模型/后端选择（`add_help=False` 让它们挂在子命令下）。"""
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--backend",
@@ -102,7 +112,14 @@ def _model_flags() -> argparse.ArgumentParser:
         help="家族（默认按后端取：split → mude、pooled → h2o；也可由权重包身份推断）",
     )
     common.add_argument("--descriptor", type=Path, default=None, help="descriptor JSON；reference 路径必填")
-    common.add_argument("--weights", type=Path, required=True, help="模型目录或 safetensors")
+    common.add_argument(
+        "--weights", type=Path, default=None,
+        help="模型目录或 safetensors；省略时按发布来源首启下载（需网络，--offline 可关）",
+    )
+    common.add_argument(
+        "--offline", action="store_true",
+        help="不从网络下载权重；本地没有时报错并给出手动 `hf download` 命令",
+    )
     common.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
     common.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
     common.add_argument("--bucket", type=int, default=0,
@@ -147,6 +164,38 @@ def _artifacts_dir(explicit: Path | None = None) -> Path:
         return Path(explicit)
     configured = str(read_env()[ARTIFACTS_VARIABLE])
     return Path(configured) if configured else default_artifacts_dir()
+
+
+def _weights_dir() -> Path:
+    """自动下载的权重落点：`SYS1_WEIGHTS_DIR` > 平台缓存目录。
+
+    显式 `--weights` 是一个完整路径，不经过这里：它表达"用这一份"，而不是"下到哪"。
+    """
+    configured = str(read_env()[WEIGHTS_VARIABLE])
+    return Path(configured) if configured else default_weights_dir()
+
+
+def _resolve_weights(
+    explicit: Path | None, family_name: str, *, offline: bool, root: Path
+) -> Path:
+    """显式 `--weights` 只读；省略时才按发布来源下载到 `root`。
+
+    显式路径不存在时**不**退化成下载：拼错一个目录名不该触发多 GB 的网络请求，也不该
+    悄悄写到用户没指定的位置。
+    """
+    if explicit is not None:
+        path = Path(explicit)
+        if not path.exists():
+            raise ConfigError(
+                "权重路径不存在",
+                path=str(path),
+                hint="去掉 --weights 让引擎按发布来源自动下载；或给一个已有的模型目录",
+            )
+        return path
+    from .models.sources import source_for
+    from .weights.fetch import ensure_weights
+
+    return ensure_weights(source_for(family_name), root, offline=offline)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -415,8 +464,12 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
     """按后端装配引擎：参考后端（M0 语义裁判）或 mude/h2o 的 Apple 链。"""
     backend = _resolve_backend(args)
     artifacts = _artifacts_dir(args.artifacts)
+    weights_root = _weights_dir()
     if backend in STRATEGY_BACKENDS:
         name = args.model or _DEFAULT_FAMILY[backend]
+        weights = _resolve_weights(
+            args.weights, name, offline=bool(args.offline), root=weights_root
+        )
         width = int(args.width or _SPLIT_WIDTH)
         # 形状与执行器都由注册表装配（`engine.strategies.assembly`）：CLI 不认识任何家族名，
         # 也不认识哪条链该配哪套题面 —— 那是家族自己声明的策略。
@@ -424,15 +477,15 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
             "bucket": args.bucket or None, "width": width,
             "resident": args.resident or None,
         }
-        assembled = assemble(args.weights, name, backend=backend,
+        assembled = assemble(weights, name, backend=backend,
                              artifacts_dir=artifacts, vision=(args.vision != "off"),
                              vision_idle=float(args.vision_idle),
                              vision_bucket=args.vision_bucket, **options)
         descriptor = assembled.descriptor
         config = EngineConfig(
-            model=ModelSelection(name=args.weights.name, dir=args.weights),
+            model=ModelSelection(name=weights.name, dir=weights),
             scheduler=SchedulerConfig(attention_mode=mode, max_len=width),
-            storage=StorageConfig(artifacts_dir=artifacts),
+            storage=StorageConfig(artifacts_dir=artifacts, weights_dir=weights_root),
             service=ServiceConfig(debug_timings=bool(args.debug_timings)),
         )
         config.validate()
@@ -443,6 +496,11 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
             runner=assembled.runner,
             encoder=CharEncoder(vocab=descriptor.vocab),
             config=config,
+        )
+    if args.weights is None:
+        raise ConfigError(
+            "reference 后端需要 --weights",
+            hint="reference 只做语义裁判，不读发布来源、也不下载权重",
         )
     if args.descriptor is None:
         raise ConfigError("reference 后端需要 --descriptor",

@@ -11,7 +11,7 @@ version = "0.1.0"
 description = "SysOne：本地决策推理引擎（System-1 速度的边缘 AI）"
 requires-python = ">=3.11"
 # 文本侧（分词 + 聊天模板）由 tokenizers / jinja2 直接提供：出货路径不 import transformers。
-dependencies = ["numpy>=1.24", "tokenizers>=0.20", "jinja2>=3.1"]
+dependencies = ["numpy>=1.24", "tokenizers>=0.20", "jinja2>=3.1", "huggingface_hub>=1.0"]
 
 [project.optional-dependencies]
 # Apple（ANE / Metal）运行时与厂商代码桥，M1/M2 起启用。

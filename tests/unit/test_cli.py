@@ -240,3 +240,71 @@ def test_doctor_reports_artifacts_alongside_geometry(tmp_path: Path, capsys) -> 
     payload = json.loads(capsys.readouterr().out)
     assert payload["artifacts"]["layers"]["total"] == 2
     assert payload["geometry"]["family"] == "mude"
+
+
+# ---- 首启下载：显式 --weights 只读，省略才按发布来源下载 --------------------------------
+
+
+def test_weights_flag_is_optional_for_model_commands() -> None:
+    from sysone.cli import _build_parser
+
+    args = _build_parser().parse_args(["compile", "--model", "mude", "--offline"])
+    assert args.weights is None
+    assert args.offline is True
+
+
+def test_weights_dir_precedence(tmp_path: Path, monkeypatch) -> None:
+    from sysone.cli import _weights_dir
+    from sysone.config.storage import default_weights_dir
+
+    monkeypatch.delenv("SYS1_WEIGHTS_DIR", raising=False)
+    assert _weights_dir() == default_weights_dir()
+
+    monkeypatch.setenv("SYS1_WEIGHTS_DIR", str(tmp_path / "env"))
+    assert _weights_dir() == tmp_path / "env"
+
+
+def test_explicit_missing_weights_is_a_config_error_and_never_downloads(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    from sysone.weights import fetch
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("explicit --weights must not download")
+
+    monkeypatch.setattr(fetch, "ensure_weights", never)
+    code = main(["compile", "--model", "mude", "--weights", str(tmp_path / "absent")])
+    assert code == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["code"] == "config"
+    assert payload["context"]["path"].endswith("absent")
+
+
+def test_offline_without_local_weights_names_the_manual_command(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    monkeypatch.setenv("SYS1_WEIGHTS_DIR", str(tmp_path / "weights"))
+    code = main(["compile", "--model", "mude", "--offline", "--artifacts", str(tmp_path / "art")])
+    assert code == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["code"] == "download"
+    assert "hf download qybaihe/mude-1.0" in payload["context"]["command"]
+    assert payload["context"]["revision"] == "0b6a5c4ea9ca2267707a28ff568737f54ae219c5"
+
+
+def test_omitted_weights_resolves_the_published_source(tmp_path: Path, monkeypatch) -> None:
+    import sysone.weights.fetch as fetch
+    from sysone.cli import _resolve_weights
+
+    seen: dict[str, object] = {}
+
+    def fake(source, root, *, offline=False):
+        seen.update(source=source, root=Path(root), offline=offline)
+        return FIXTURES / "mude"
+
+    monkeypatch.setattr(fetch, "ensure_weights", fake)
+    resolved = _resolve_weights(None, "mude", offline=False, root=tmp_path)
+    assert resolved == FIXTURES / "mude"
+    assert seen["source"].repo_id == "qybaihe/mude-1.0"
+    assert seen["root"] == tmp_path
+    assert seen["offline"] is False

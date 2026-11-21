@@ -32,12 +32,13 @@ does not.
   16 GB of memory on macOS 15.7.2.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
-- Disk: about 4 GB of model files for mude, about 9.3 GB for h2o, plus several
-  GiB of compiled artifacts (h2o is about 3.33 GiB).
+- Disk: about 4 GB of weights for mude, about 9.3 GB for h2o, plus several
+  GiB of compiled artifacts (h2o is about 3.33 GiB). The weights are downloaded
+  on first use.
 
 Versions are pinned: engine `0.1.0`; compiled artifact format version 3 (shown by
-`sysone doctor --platform apple` as `artifact_version`); model revisions are listed
-in the download section below.
+`sysone doctor --platform apple` as `artifact_version`); model revisions are
+pinned in `src/sysone/models/sources.py`.
 
 ## Install
 
@@ -49,10 +50,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e ./src
-pip install huggingface_hub        # provides the `hf` download command
 ```
 
-`pip install -e ./src` is the supported install. A non-editable wheel is not
+`pip install -e ./src` is the supported install. It pulls `huggingface_hub`, which
+is also what the first run uses to fetch the weights. A non-editable wheel is not
 supported today: the Metal kernel sources live in `src/sysone/devices/apple/shaders/`,
 and `env.scratch_root()` is anchored at the source tree. Both expect the checkout
 to stay in place.
@@ -91,7 +92,26 @@ sysone doctor --platform apple
 The report includes the loaded `libe8ane.dylib` path, ANE program count, memory
 figures, and the available dtypes and quantizations.
 
-## Download the models
+## Weights
+
+`sysone run`, `serve` and `compile` resolve the weight package themselves. If
+`--weights` is omitted and the package is not cached, the first command
+downloads it from Hugging Face at a pinned revision, then compiles the ANE
+artifacts. The download prints one line with the repository, revision, size and
+directory; later starts read the `source.json` marker and touch no network.
+
+- Default directory: `~/Library/Caches/sysone/weights/<repo directory>`
+  (`mude-1.0`, `h2o-lightning-4b`). `SYS1_WEIGHTS_DIR` overrides it.
+- `--offline` forbids the download. A missing package then fails with the exact
+  `hf download` command to run by hand.
+- An explicit `--weights` is read-only: it never downloads, so a typo in a path
+  cannot start a multi-GB fetch.
+- The download list contains only the files the engine reads plus each
+  repository's license files; it is pinned in `src/sysone/models/sources.py`.
+- `HF_TOKEN` is honoured through `huggingface_hub`'s standard environment for
+  private mirrors.
+
+### Manual download (optional)
 
 Both revisions are pinned; do not follow the branch. Download only the files
 the engine reads, plus each repository's license files.
@@ -120,6 +140,9 @@ hf download h2oai/h2o-lightning-4b \
   --local-dir models/h2o
 ```
 
+Then pass `--weights models/mude-1.0` or `--weights models/h2o`: an explicit
+path is read-only and never triggers a download.
+
 Notes:
 
 - Do **not** use `qybaihe/mude-1.0-mlx-8bit`. Its MLX q8 layout is not readable by
@@ -138,21 +161,21 @@ Notes:
 ## Run mude (`split`)
 
 ```sh
-sysone inspect --model mude --weights models/mude-1.0
-sysone compile --model mude --weights models/mude-1.0
-sysone run --weights models/mude-1.0 --input examples/request-run.json
+sysone compile --model mude
+sysone run --model mude --input examples/request-run.json
 ```
 
-`--backend` and `--model` are optional here: the family is inferred from the
-weight package (`decision_config.json` marks mude), and the backend is inferred
-from the family (`mude → split`). `sysone compile` takes the same load path as
-`serve` and writes the compiled artifacts, so the first `serve` does not pay the
-compile cost.
+The first command in a fresh cache downloads the weights and builds the
+artifacts (see [Weights](#weights)); `sysone compile` is optional, but it keeps
+a later `serve` from paying that cost at startup. `--backend` and `--model` are
+optional when `--weights` is given: the family is inferred from the weight
+package (`decision_config.json` marks mude), and the backend is inferred from
+the family (`mude → split`).
 
 Serve it:
 
 ```sh
-sysone serve --weights models/mude-1.0 --port 8000
+sysone serve --model mude --port 8000
 ```
 
 In another shell:
@@ -167,17 +190,16 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 ## Run h2o (`pooled`)
 
 ```sh
-sysone inspect --model h2o --weights models/h2o
-sysone compile --model h2o --weights models/h2o --attention-mode causal
-sysone run --weights models/h2o --model h2o \
-  --input examples/request-run.json --attention-mode causal
-sysone serve --model h2o --weights models/h2o --attention-mode causal
+sysone compile --model h2o --attention-mode causal
+sysone run --model h2o --input examples/request-run.json --attention-mode causal
+sysone serve --model h2o --port 8000 --attention-mode causal
 ```
 
-The h2o family already defaults to causal attention; the explicit flag documents
-the path. For the bidirectional `noncausal_full` mode the whole prompt must fit
-in one ANE bucket, so long prompts need `--bucket 4096` (the default bucket is
-1024). The causal default does not have that constraint.
+The first command downloads the weights if they are not cached. The h2o family
+already defaults to causal attention; the explicit flag documents the path. For
+the bidirectional `noncausal_full` mode the whole prompt must fit in one ANE
+bucket, so long prompts need `--bucket 4096` (the default bucket is 1024). The
+causal default does not have that constraint.
 
 ## Requests
 
@@ -278,6 +300,9 @@ Text-only requests never build the vision tower. The third dylib
 
 ## Resources and tuning
 
+- Default weights directory: `~/Library/Caches/sysone/weights`. Override with
+  `SYS1_WEIGHTS_DIR`; `--weights` points at a package directly and never
+  downloads. Deleting the directory forces a re-download.
 - Default artifacts directory: `~/Library/Caches/sysone/artifacts`. Override with
   `--artifacts` or `SYS1_ARTIFACTS_DIR`. Deleting it forces a recompile.
 - `sysone compile` pre-builds the artifacts. The first compile is minutes-level;
@@ -296,17 +321,22 @@ Text-only requests never build the vision tower. The third dylib
 
 - `NotReadyError: 找不到 libe8ane.dylib` — run `tools/build_ane.sh`; check
   `SYS1_E8_DIR`. If `clang` is missing, run `xcode-select --install`.
-- `ModuleNotFoundError: tokenizers` (or `jinja2`/`numpy`) — reinstall the
-  package in the active venv: `pip install -e ./src`.
+- `ModuleNotFoundError: tokenizers` (or `jinja2`/`numpy`/`huggingface_hub`) —
+  reinstall the package in the active venv: `pip install -e ./src`.
+- A `download` error with `--offline` — drop `--offline` to let the first run
+  fetch the weights, run the printed `hf download …` command by hand, or point
+  `SYS1_WEIGHTS_DIR` at a pre-seeded directory.
 - `422` with `prompt 超过链的缓冲宽度` — raise `--width` (and `--bucket` if
   needed), or shorten the prompt.
 - Out-of-memory or a wired-memory warning — lower `--width`, and check that no
   other large model is resident.
-- `503` from the service — the engine is still loading, or loading failed; read
-  the process log and `/metrics`.
+- `503` from the service — the engine is still loading (the first start also
+  downloads the weights and compiles), or loading failed; read the process log
+  and `/metrics`.
 - `429` — raise `--queue`/`--admit-timeout` or retry after `Retry-After`.
 - h2o fails at `Serve.open` — `serve_config.json` or `h2o_lightning_shim.py` is
-  missing; re-run the download command above.
+  missing; delete the cached package (next start re-downloads it) or re-run the
+  manual download above.
 - `--backend reference` requires `--descriptor`; it is the semantic-judge path,
   not a model runtime.
 
