@@ -139,7 +139,7 @@ def test_compile_refuses_the_reference_backend(capsys) -> None:
     payload = json.loads(capsys.readouterr().err)
     assert payload["code"] == "config"
     assert payload["context"]["backend"] == "reference"
-    assert payload["context"]["available"] == ["split", "pooled"]
+    assert payload["context"]["available"] == ["split", "pooled", "vendor"]
 
 
 # ---- 后端默认值：不给 --backend 时按家族/包身份推断 ------------------------------------
@@ -151,6 +151,33 @@ def test_backend_follows_the_model_family() -> None:
     assert _resolve_backend(args) == "split"
     args = SimpleNamespace(backend=None, model="h2o", weights=FIXTURES / "h2o", descriptor=None)
     assert _resolve_backend(args) == "pooled"
+    args = SimpleNamespace(backend=None, model="torchcast", weights=FIXTURES / "torchcast",
+                           descriptor=None)
+    assert _resolve_backend(args) == "vendor"
+
+
+def test_the_vendor_path_refuses_the_knobs_of_our_chain(capsys) -> None:
+    """torchcast 的前向不在我们的链上：显式给的链形状参数要报错，不能静默丢掉。
+
+    `--W` 的默认值就是 4，所以"给了"只能按"与默认值不同"来认 —— 这里给 0（全装）。
+    """
+    code = main(["run", "--model", "torchcast", "--weights", str(FIXTURES / "torchcast"),
+                 "--W", "0", "--input", "unused.json"])
+    assert code == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["code"] == "config"
+    assert payload["context"]["backend"] == "vendor"
+    assert payload["context"]["refused"] == ["--W"]
+
+
+def test_a_backend_that_contradicts_the_family_is_refused(capsys) -> None:
+    """`--backend split --model torchcast` 报错并说出两边，不按一条没为它验证过的路跑。"""
+    code = main(["run", "--backend", "split", "--model", "torchcast",
+                 "--weights", str(FIXTURES / "torchcast"), "--input", "unused.json"])
+    assert code == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["context"]["backend"] == "split"
+    assert payload["context"]["strategy"] == "vendor"
 
 
 def test_backend_is_inferred_from_the_weights_package(tmp_path: Path) -> None:

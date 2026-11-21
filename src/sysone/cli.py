@@ -43,18 +43,19 @@ _SPLIT_WIDTH = SchedulerConfig().max_len
 # h2o 同口径（票据 15 §25）：待命 3406 → 426 MiB（8×），142 token 上窗口慢 2.2×，长 prompt 上
 # 这笔 0.41 s 的固定开销摊薄（按 16k 外推 ≈ +3%）。
 _RESIDENT_W = 4
-# 后端不给 `--model` 时的默认家族。mude 维持原样；pooled 只有 h2o。
-_DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o"}
+# 后端不给 `--model` 时的默认家族。mude 维持原样；pooled 只有 h2o，vendor 只有 torchcast。
+_DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o", "vendor": "torchcast"}
 # 视觉塔的空闲卸载窗口（票据 07 §6 未定项 2 的默认值）。60 s 是"连续几张图算同一批"的量级：
 # 装一次 0.6–2 s、卸一次同样，窗口短于这个数就等于每张图都付两遍。
 _VISION_IDLE = 60.0
-# run / serve 只列有 CLI 装配入口的家族：`torchcast` 只有 vendor 策略，`assemble` 会报
-# "装配不出来"，不能在公开选项里许诺它。`inspect` / `doctor` 仍列全部家族（它们只看配置）。
+# run / serve 只列有 CLI 装配入口的家族。`inspect` / `doctor` 仍列全部家族（它们只看配置）。
 _CLI_FAMILIES = tuple(name for name in families() if family(name).strategy in STRATEGY_BACKENDS)
 
 # 没有 --model 时按包身份认家族：mude 的读出依赖 `decision_config.json`，h2o 的 pooled 路径
 # 依赖厂商 `serve_config.json`。这不是按权重形状猜家族 —— 猜错不会崩，只会拿错模板算出
 # 看似正常的答案；两个标记文件是发布包的必需件，认它们比认形状或目录名可靠。
+# torchcast 的目录也带 `decision_config.json`（两份厂商题面格式同名），所以它的标记件认不出
+# 唯一家族，必须显式 `--model torchcast`。
 _FAMILY_MARKERS = {"mude": "decision_config.json", "h2o": "serve_config.json"}
 
 
@@ -68,7 +69,7 @@ def _infer_family(weights: Path) -> str:
         "需要 --model 或 --backend",
         weights=str(weights),
         available=list(_CLI_FAMILIES),
-        hint="mude 加 --model mude，h2o 加 --model h2o；"
+        hint="mude 加 --model mude，h2o 加 --model h2o，torchcast 加 --model torchcast；"
              "reference 后端用 --backend reference --descriptor",
     )
 
@@ -91,7 +92,7 @@ def _resolve_backend(args: argparse.Namespace) -> str:
             family=args.model,
             strategy=strategy,
             available=list(_CLI_FAMILIES),
-            hint="给 --backend split（mude）或 pooled（h2o）",
+            hint="给 --backend split（mude）、pooled（h2o）或 vendor（torchcast）",
         )
     return strategy
 
@@ -103,9 +104,9 @@ def _model_flags() -> argparse.ArgumentParser:
         "--backend",
         default=None,
         choices=("reference",) + STRATEGY_BACKENDS,
-        help="执行路径：不给时按 --model 的家族推断（mude → split、h2o → pooled，"
-             "没给 --model 时按权重包身份认）；reference（M0 语义裁判，只做全注意力层）"
-             "必须显式给，且只配合 --descriptor",
+        help="执行路径：不给时按 --model 的家族推断（mude → split、h2o → pooled、"
+             "torchcast → vendor，没给 --model 时按权重包身份认）；reference（M0 语义裁判，"
+             "只做全注意力层）必须显式给，且只配合 --descriptor",
     )
     common.add_argument(
         "--model", default=None, choices=_CLI_FAMILIES,
@@ -161,6 +162,30 @@ def _model_flags() -> argparse.ArgumentParser:
              "= 959/902/781/794/849 ms，768² 上 512 最好（427 vs 1024 的 492）。必须是 4 的倍数",
     )
     return common
+
+
+def _chain_knobs_given(args: argparse.Namespace) -> list[str]:
+    """用户**显式**给过的链形状参数；与默认值相同的一律当作没给。
+
+    `assemble` 只看"值是不是 None"，认不出默认值与显式值；vendor 路径又不接这些旋钮，
+    所以这一层负责把"默认值"和"用户真给了"分开，好让后者按既有的规矩报错。
+    """
+    given: list[str] = []
+    if args.bucket:
+        given.append("--bucket")
+    if args.width:
+        given.append("--width")
+    if args.resident != _RESIDENT_W:
+        given.append("--W")
+    if args.quant != "int8":
+        given.append("--quant")
+    if args.vision != "auto":
+        given.append("--vision")
+    if args.vision_idle != _VISION_IDLE:
+        given.append("--vision-idle")
+    if args.vision_bucket is not None:
+        given.append("--vision-bucket")
+    return given
 
 
 def _artifacts_dir(explicit: Path | None = None) -> Path:
@@ -480,15 +505,33 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
         width = int(args.width or _SPLIT_WIDTH)
         # 形状与执行器都由注册表装配（`engine.strategies.assembly`）：CLI 不认识任何家族名，
         # 也不认识哪条链该配哪套题面 —— 那是家族自己声明的策略。
-        options: dict[str, int | None] = {
-            "bucket": args.bucket or None, "width": width,
-            "resident": args.resident or None,
-        }
-        assembled = assemble(weights, name, backend=backend,
-                             artifacts_dir=artifacts, quant=args.quant,
-                             vision=(args.vision != "off"),
-                             vision_idle=float(args.vision_idle),
-                             vision_bucket=args.vision_bucket, **options)
+        #
+        # 链形状参数（桶宽、缓冲宽、待命窗口、视觉旋钮、ANE 量化档）只对 split / pooled 有意义：
+        # vendor 的前向、缓冲与模板都在厂商引擎里。显式给了就报错 —— 与 `assemble` 的拒绝同一条
+        # 规矩（静默丢一个旋钮会让"我设了它"和"它没生效"同时成立），只是这里要先分清默认值与
+        # 用户真给的。
+        if backend == "vendor":
+            refused = _chain_knobs_given(args)
+            if refused:
+                raise ConfigError(
+                    "这条后端不认链形状参数",
+                    backend=backend,
+                    refused=refused,
+                    hint="torchcast 的前向与缓冲不在我们的链上：去掉这些参数",
+                )
+            options: dict[str, object] = {}
+        else:
+            options = {
+                "bucket": args.bucket or None, "width": width,
+                "resident": args.resident or None,
+                "vision": (args.vision != "off"),
+                "vision_idle": float(args.vision_idle),
+                "vision_bucket": args.vision_bucket,
+            }
+        assembled = assemble(
+            weights, name, backend=backend, artifacts_dir=artifacts,
+            quant=None if backend == "vendor" else args.quant, **options,
+        )
         descriptor = assembled.descriptor
         config = EngineConfig(
             model=ModelSelection(name=weights.name, dir=weights),

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import pytest
-from helpers import make_mude_checkpoint
+from helpers import FIXTURES, make_mude_checkpoint
 
 from sysone.engine.strategies import assembly
 from sysone.errors import ConfigError
@@ -86,22 +86,35 @@ def test_a_backend_that_contradicts_the_family_is_refused(tmp_path, builders):
     assert pooled.calls == []
 
 
-def test_a_strategy_without_a_builder_names_the_missing_step(tmp_path, builders):
-    """torchcast 声明 `vendor`，今天装配不出来 —— 报错要说出缺的是哪一步。
+def test_a_vendor_family_assembles_through_its_bridge(tmp_path, monkeypatch):
+    """torchcast 声明 `vendor`：工厂收到权重目录与产物落点，链形状参数一个都不到它手里。
 
-    缺的**不是**执行器（`VendorRunner` 在库里，桥也在），而是"用哪个桥、怎么构造"：
-    注册表只声明了策略名。所以文案既不能说自己没有执行器，也不能建议一个 `--backend`
-    里根本没有的值 —— 那会把人指到一条不存在的路上。
+    这里换掉工厂，是为守住"装配"这一层：真正的桥在模块级 import torch，只有真跑
+    vendor 路径时才该付这笔导入（`test_import_light.py` 钉着核心面不带 torch）。
     """
+    calls: list[dict] = []
+
+    def builder(model_dir, *, scratch_dir=None):
+        calls.append({"dir": str(model_dir), "scratch_dir": scratch_dir})
+        return "runner:vendor"
+
+    monkeypatch.setitem(assembly._BUILDERS, "vendor", builder)
+    assembled = assembly.assemble(
+        FIXTURES / "torchcast", "torchcast", backend="vendor", artifacts_dir=tmp_path / "art"
+    )
+    assert assembled.runner == "runner:vendor"
+    assert assembled.strategy == "vendor"
+    assert assembled.descriptor.model_id == "torchcast"
+    assert calls == [{"dir": str(FIXTURES / "torchcast"), "scratch_dir": tmp_path / "art"}]
+
+
+def test_a_vendor_family_refuses_chain_knobs(tmp_path, monkeypatch):
+    """vendor 的前向与缓冲在厂商引擎里：链形状参数一个也不认，给了要报错。"""
+    monkeypatch.setitem(assembly._BUILDERS, "vendor", lambda *a, **k: "runner:vendor")
     with pytest.raises(ConfigError) as caught:
-        assembly.assemble(tmp_path, "torchcast", backend="split")
-    context = caught.value.context
-    assert context["strategy"] == "vendor"
-    assert context["ready"] == ["pooled", "split"]
-    assert "VendorRunner" in context["hint"]
-    # 真的没有这条路：`--backend` 的 choices 里没有 vendor，文案也不许把它写成一条可选的路
-    assert "vendor" not in assembly.BACKENDS
-    assert "--backend vendor" not in context["hint"]
+        assembly.assemble(FIXTURES / "torchcast", "torchcast", backend="vendor", resident=4)
+    assert caught.value.context["refused"] == ["resident"]
+    assert caught.value.context["accepted"] == []
 
 
 def test_both_strategies_take_the_standby_window(tmp_path, builders):
@@ -109,6 +122,17 @@ def test_both_strategies_take_the_standby_window(tmp_path, builders):
     _split, pooled = builders
     assembly.assemble(make_mude_checkpoint(tmp_path), "h2o", backend="pooled", resident=4)
     assert pooled.calls[-1]["resident"] == 4
+
+
+def test_a_backend_that_does_not_match_the_family_names_both_sides(tmp_path, builders):
+    """`--backend split --model torchcast` 报错并说出两边，而不是按 split 跑一条没验证过的路。"""
+    with pytest.raises(ConfigError) as caught:
+        assembly.assemble(FIXTURES / "torchcast", "torchcast", backend="split")
+    context = caught.value.context
+    assert context["backend"] == "split"
+    assert context["strategy"] == "vendor"
+    assert context["available"] == ["split", "pooled", "vendor"]
+    assert context["hint"].endswith("用 --backend vendor")
 
 
 def test_an_option_the_strategy_does_not_take_is_refused(tmp_path, builders, monkeypatch):

@@ -5,7 +5,8 @@
 1. **形状**：`parse_config(model_dir)` → `ModelDescriptor`（引擎的 `SchedulerConfig` 与
    内存预算都吃它）；
 2. **谁来做前向**：家族声明 `strategy`，这里查"策略 → 执行器工厂"。`split` 是 mude 的
-   码表读出（整链 ANE + Metal 注意力），`pooled` 是 h2o 的标签行读出。
+   码表读出（整链 ANE + Metal 注意力），`pooled` 是 h2o 的标签行读出，`vendor` 是
+   torchcast 的厂商引擎（它的模板、前向与读出，我们只提供权重）。
 
 不在这里做"猜家族"：`--model` 显式给，猜错家族不会崩，只会拿错模板算出看似正常的答案。
 后端与家族声明的策略不符时**报错并说出两边**，而不是悄悄按后端跑 —— 那样
@@ -24,20 +25,22 @@ from ...models.descriptor import ModelDescriptor
 from ...models.registry import family
 from .pooled import h2o_runner
 from .split import mude_runner
+from .vendor import torchcast_runner
 
 # 可选的 `--backend`（`reference` 不走这里：它是 M0 的语义裁判，不读家族的权重）。
-BACKENDS = ("split", "pooled")
+BACKENDS = ("split", "pooled", "vendor")
 # ANE 权重的存储形态：int8（默认，per-channel + fp16 scale）或 fp16。计算始终 fp16 ——
 # ANE 没有 int8 MAC，int8 只省权重字节与 DMA。
 QUANT_MODES = ("int8", "fp16")
 
-# 策略名 → 工厂。`bucket` / `width` 是链的形状（两种策略都有）。
+# 策略名 → 工厂。`bucket` / `width` 是链的形状（两条链策略都有）。
 _BUILDERS: dict[str, Callable[..., object]] = {
     "split": mude_runner,
     "pooled": h2o_runner,
+    "vendor": torchcast_runner,
 }
 
-# 每条策略**认**哪些参数（`resident` 是 Metal 流水线的待命窗口，两条策略都有 Metal 形态）。
+# 每条策略**认**哪些参数（`resident` 是 Metal 流水线的待命窗口，两条链策略都有 Metal 形态）。
 # 给了不认的参数要报错 —— 静默丢掉一个用户显式给的旋钮，会让"我设了窗口"和"它没生效"
 # 同时成立。
 _OPTIONS: dict[str, frozenset[str]] = {
@@ -45,18 +48,13 @@ _OPTIONS: dict[str, frozenset[str]] = {
                         "vision_bucket"}),
     "pooled": frozenset({"bucket", "width", "resident", "quant", "vision", "vision_idle",
                          "vision_bucket"}),
+    # vendor 的前向、缓冲与模板都在厂商引擎里：桶宽、待命窗口、视觉塔一个也不接。
+    "vendor": frozenset(),
 }
 
-# 有执行器、但装配不出来的策略：缺的不是执行器，是「用哪个桥、怎么构造」这一步 —— 注册表
-# 只声明了策略名。报错必须说清缺的那一步：旧文案写「vendor 那条走厂商桥」，读的人会去找
-# 一个 `--backend` 里根本没有的值。
-_UNASSEMBLED = {
-    "vendor": (
-        "vendor 的执行器是 VendorRunner，它要一个厂商桥实例（H2OBridge / TorchcastBridge），"
-        "而注册表没声明用哪个桥、给什么参数，所以装配不出来；这条没有 --backend 入口，"
-        "只能在库里把 VendorRunner(<桥>) 直接交给 Engine"
-    ),
-}
+# 三条策略各有执行器，所以"装配不出来"只剩一种来源：家族声明了一个这里没有工厂的策略名。
+# 那时报错要说清缺的是哪一步（工厂），而不是说"没有执行器" —— 执行器可能存在，缺的是
+# 「用哪个桥、怎么构造」。
 
 
 @dataclass(frozen=True)
@@ -98,9 +96,8 @@ def assemble(
     里带 `s`），不同列宽的塔各有各的产物目录，不会互相认领。
     """
     entry = family(name)
-    # 先问"这个家族的策略装配得起来吗"，再问"你选的这个后端对不对"：反过来的话，一个只有
-    # `vendor` 执行器的家族（torchcast 是这种）会先撞上"后端不符"，然后建议一个 `--backend`
-    # 根本选不出来的值。
+    # 先问"这个家族的策略装配得起来吗"，再问"你选的这个后端对不对"：反过来的话，一个策略
+    # 还没有工厂的家族会先撞上"后端不符"，然后建议一个 `--backend` 里选不出来的值。
     builder = _BUILDERS.get(entry.strategy)
     if builder is None:
         raise ConfigError(
@@ -108,10 +105,8 @@ def assemble(
             family=name,
             strategy=entry.strategy,
             ready=sorted(_BUILDERS),
-            hint=_UNASSEMBLED.get(
-                entry.strategy,
-                "由 --backend 直接选的是 split（码表读出）与 pooled（标签行读出）",
-            ),
+            hint="由 --backend 直接选的是 split（码表读出）、pooled（标签行读出）"
+                 "与 vendor（厂商自带读出）",
         )
     if backend != entry.strategy:
         raise ConfigError(

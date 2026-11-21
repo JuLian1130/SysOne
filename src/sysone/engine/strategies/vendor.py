@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest
@@ -85,3 +86,28 @@ class VendorRunner(DecisionRunner):
     def shutdown(self) -> None:
         self._loaded = False
         self._bridge.close()
+
+
+def torchcast_runner(model_dir: str | Path, *, scratch_dir: str | Path | None = None) -> VendorRunner:
+    """装一条 torchcast 的 vendor 路径：装载、题面与读出全交给厂商包。
+
+    桥在模块级 import `torch`，所以这里才把它带进来 —— 核心面不依赖 torch（
+    `tests/unit/test_import_light.py` 盯着这条线），只有真要走 vendor 路径时才付这笔导入。
+
+    `scratch_dir` 只是 `assemble` 的统一签名：这条路径不编 ANE program、不落产物，
+    `artifact_bytes()` 恒为 0 —— 前向在厂商引擎里，用不上我们的产物缓存。
+
+    没装 `vendor` 附加依赖时报一条配置错误而不是裸 `ImportError`：`pip install -e ./src`
+    默认不带 torch，而这条路必须要有它。
+    """
+    try:
+        from ...models.vendors.torchcast_bridge import TorchcastBridge
+    except ImportError as exc:
+        raise ConfigError(
+            "vendor 路径需要 torch 与 transformers",
+            backend="vendor",
+            reason=str(exc),
+            hint="pip install -e './src[vendor]'",
+        ) from exc
+
+    return VendorRunner(TorchcastBridge(model_dir))
