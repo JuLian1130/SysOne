@@ -307,6 +307,12 @@ Text-only requests never build the vision tower. The third dylib
   `--artifacts` or `SYS1_ARTIFACTS_DIR`. Deleting it forces a recompile.
 - `sysone compile` pre-builds the artifacts. The first compile is minutes-level;
   later starts hit the cache and the compile phase is about 0 s.
+- `--quant {int8,fp16}` selects the ANE weight storage (default `int8`):
+  per-output-channel codes with fp16 scales, or plain fp16. Compute stays fp16
+  either way (ANE has no int8 MAC). The two artifact sets live side by side,
+  `s<bucket>` for int8 and `s<bucket>-fp16` for fp16, so switching does not
+  overwrite the other mode. `sysone doctor --artifacts` takes the same flag; a
+  mismatch in the flag reports the other mode's layers as outstanding.
 - `--bucket` is the ANE program column width (default 1024); `--width` is the
   GPU buffer width and the max input tokens (default 16384); `--W` is the
   resident window in layers (default 4 = one block).

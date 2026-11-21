@@ -22,11 +22,11 @@ class FakeBuilder:
         self.calls: list[dict] = []
 
     def __call__(self, model_dir, *, bucket=None, width=None, resident=None, scratch_dir=None,
-                 vision=None, vision_idle=None, vision_bucket=None):
+                 quantize=None, vision=None, vision_idle=None, vision_bucket=None):
         self.calls.append(
             {"dir": str(model_dir), "bucket": bucket, "width": width,
-             "resident": resident, "scratch_dir": scratch_dir, "vision": vision,
-             "vision_idle": vision_idle, "vision_bucket": vision_bucket}
+             "resident": resident, "scratch_dir": scratch_dir, "quantize": quantize,
+             "vision": vision, "vision_idle": vision_idle, "vision_bucket": vision_bucket}
         )
         return f"runner:{self.label}"
 
@@ -58,8 +58,8 @@ def test_assemble_builds_the_runner_the_family_declares(tmp_path, builders):
     # 形状来自家族的 `parse_config`，不是从命令行拼的
     assert assembled.descriptor.model_id == root.name
     assert split.calls == [{"dir": str(root), "bucket": 1024, "width": 2048,
-                            "resident": 4, "scratch_dir": None, "vision": None,
-                            "vision_idle": None, "vision_bucket": None}]
+                            "resident": 4, "scratch_dir": None, "quantize": None,
+                            "vision": None, "vision_idle": None, "vision_bucket": None}]
     assert pooled.calls == []
 
 
@@ -138,3 +138,23 @@ def test_视觉的三个旋钮都到达执行器(tmp_path, builders):
                       vision_idle=30.0, vision_bucket=512)
     call = split.calls[-1]
     assert (call["vision"], call["vision_idle"], call["vision_bucket"]) == (True, 30.0, 512)
+
+
+def test_quant_mode_is_translated_to_the_executor_switch(tmp_path, builders):
+    """装配层收档位名字，执行器只认布尔：`fp16` 必须落到 `quantize=False`。"""
+    split, _ = builders
+    root = make_mude_checkpoint(tmp_path)
+
+    assembly.assemble(root, "mude", backend="split", quant="fp16")
+    assert split.calls[-1]["quantize"] is False
+
+    assembly.assemble(root, "mude", backend="split", quant="int8")
+    assert split.calls[-1]["quantize"] is True
+
+
+def test_an_unknown_quant_mode_is_refused_before_the_executor_is_called(tmp_path, builders):
+    _split, _pooled = builders
+    with pytest.raises(ConfigError) as caught:
+        assembly.assemble(tmp_path, "mude", backend="split", quant="int4")
+    assert caught.value.context["available"] == ["int8", "fp16"]
+    assert builders[0].calls == []

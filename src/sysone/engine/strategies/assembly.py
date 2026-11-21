@@ -27,6 +27,9 @@ from .split import mude_runner
 
 # 可选的 `--backend`（`reference` 不走这里：它是 M0 的语义裁判，不读家族的权重）。
 BACKENDS = ("split", "pooled")
+# ANE 权重的存储形态：int8（默认，per-channel + fp16 scale）或 fp16。计算始终 fp16 ——
+# ANE 没有 int8 MAC，int8 只省权重字节与 DMA。
+QUANT_MODES = ("int8", "fp16")
 
 # 策略名 → 工厂。`bucket` / `width` 是链的形状（两种策略都有）。
 _BUILDERS: dict[str, Callable[..., object]] = {
@@ -38,9 +41,9 @@ _BUILDERS: dict[str, Callable[..., object]] = {
 # 给了不认的参数要报错 —— 静默丢掉一个用户显式给的旋钮，会让"我设了窗口"和"它没生效"
 # 同时成立。
 _OPTIONS: dict[str, frozenset[str]] = {
-    "split": frozenset({"bucket", "width", "resident", "vision", "vision_idle",
+    "split": frozenset({"bucket", "width", "resident", "quant", "vision", "vision_idle",
                         "vision_bucket"}),
-    "pooled": frozenset({"bucket", "width", "resident", "vision", "vision_idle",
+    "pooled": frozenset({"bucket", "width", "resident", "quant", "vision", "vision_idle",
                          "vision_bucket"}),
 }
 
@@ -73,6 +76,7 @@ def assemble(
     bucket: int | None = None,
     width: int | None = None,
     resident: int | None = None,
+    quant: str | None = None,
     vision: bool | None = None,
     vision_idle: float | None = None,
     vision_bucket: int | None = None,
@@ -82,6 +86,10 @@ def assemble(
 
     `artifacts_dir` 是编译产物的落点（部署概念）；执行器那一层叫它 `scratch_dir`，因为对链
     来说那只是一处"把 MIL/blob 放哪"的目录 —— 只有 CLI 与配置层知道它应当持久。
+
+    `quant` 是 ANE 权重的存储形态（`int8` / `fp16`）；装配层把它翻译成执行器认的布尔
+    `quantize`，因为设备层只关心"现量化还是用容器自带的码"，不认识档位名字。产物目录也按
+    它分家（`s<s>` 对 `s<s>-fp16`），两档不会互相顶掉 sidecar。
 
     `vision` / `vision_idle` / `vision_bucket` 是视觉那条路的三个旋钮（`False` = 纯文本服务；
     `vision_idle` 是塔的空闲卸载秒数；`vision_bucket` 是塔自己的列宽，`None` = 跟随链的桶）。
@@ -115,7 +123,7 @@ def assemble(
             hint=f"{name} 的答案是按 {entry.strategy} 读出的，用 --backend {entry.strategy}",
         )
     given: dict[str, object] = {
-        "bucket": bucket, "width": width, "resident": resident,
+        "bucket": bucket, "width": width, "resident": resident, "quant": quant,
         "vision": vision, "vision_idle": vision_idle, "vision_bucket": vision_bucket,
     }
     accepted = _OPTIONS[entry.strategy]
@@ -127,12 +135,18 @@ def assemble(
             refused=refused,
             accepted=sorted(accepted),
         )
+    if quant is not None and quant not in QUANT_MODES:
+        raise ConfigError("未知的量化档", quant=quant, available=list(QUANT_MODES))
     root = Path(model_dir)
     descriptor = entry.parse_config(root)
+    # `quant` 是装配层的名字，执行器只认 `quantize: bool`：别把两套名字同时递给工厂，
+    # 加一个参数就会在 `mude_runner` 的签名上撞成 TypeError。
     options = {key: value for key, value in given.items()
-               if key in accepted and value is not None}
+               if key in accepted and key != "quant" and value is not None}
+    if quant is not None:
+        options["quantize"] = quant == "int8"
     runner = builder(root, **options, scratch_dir=artifacts_dir)
     return Assembly(descriptor=descriptor, runner=runner, strategy=entry.strategy)
 
 
-__all__ = ["BACKENDS", "Assembly", "assemble"]
+__all__ = ["BACKENDS", "QUANT_MODES", "Assembly", "assemble"]

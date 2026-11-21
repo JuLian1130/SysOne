@@ -251,6 +251,7 @@ def test_weights_flag_is_optional_for_model_commands() -> None:
     args = _build_parser().parse_args(["compile", "--model", "mude", "--offline"])
     assert args.weights is None
     assert args.offline is True
+    assert args.quant == "int8"
 
 
 def test_weights_dir_precedence(tmp_path: Path, monkeypatch) -> None:
@@ -308,3 +309,19 @@ def test_omitted_weights_resolves_the_published_source(tmp_path: Path, monkeypat
     assert seen["source"].repo_id == "qybaihe/mude-1.0"
     assert seen["root"] == tmp_path
     assert seen["offline"] is False
+
+
+def test_quant_modes_get_separate_artifact_directories(tmp_path: Path) -> None:
+    """两档共用目录会让每切一次就互相顶掉 sidecar；doctor 与装载必须同一条路径规则。"""
+    from helpers import make_mude_checkpoint
+    from sysone.cli import _artifact_report
+
+    root = make_mude_checkpoint(tmp_path / "model")
+    int8 = _artifact_report("mude", root, bucket=256, artifacts=tmp_path / "art", quant="int8")
+    fp16 = _artifact_report("mude", root, bucket=256, artifacts=tmp_path / "art", quant="fp16")
+
+    assert int8["quant"] == "int8"
+    assert fp16["quant"] == "fp16"
+    assert str(int8["directory"]).endswith("s256")
+    assert str(fp16["directory"]).endswith("s256-fp16")
+    assert int8["directory"] != fp16["directory"]

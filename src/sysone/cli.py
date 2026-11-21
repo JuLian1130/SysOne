@@ -22,7 +22,7 @@ from .domain.decision import DecisionRequest, Question
 from .domain.work import CompilationTimes
 from .engine.engine import Engine
 from .engine.strategies.assembly import BACKENDS as STRATEGY_BACKENDS
-from .engine.strategies.assembly import assemble
+from .engine.strategies.assembly import QUANT_MODES, assemble
 from .env import read as read_env
 from .errors import ConfigError, SysOneError
 from .models import families as _family_modules  # noqa: F401  导入即注册
@@ -119,6 +119,11 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument(
         "--offline", action="store_true",
         help="不从网络下载权重；本地没有时报错并给出手动 `hf download` 命令",
+    )
+    common.add_argument(
+        "--quant", default="int8", choices=QUANT_MODES,
+        help="ANE 权重的存储形态（默认 int8：per-channel 码 + fp16 标度；fp16 则整块 16 bit）。"
+             "计算始终 fp16 —— ANE 没有 int8 MAC",
     )
     common.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
     common.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
@@ -240,6 +245,10 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--bucket", type=int, default=0,
         help="配合 --artifacts 的桶宽（默认 1024；产物按桶宽分家，装错桶就全不命中）",
+    )
+    doctor.add_argument(
+        "--quant", default="int8", choices=QUANT_MODES,
+        help="配合 --artifacts 的量化档；它必须与装载时给的一致，否则全部不命中",
     )
     return parser
 
@@ -368,7 +377,8 @@ def _geometry_report(model: str, weights: Path | None) -> dict[str, object]:
 
 
 def _artifact_report(
-    model: str | None, weights: Path | None, *, bucket: int, artifacts: Path | None
+    model: str | None, weights: Path | None, *, bucket: int,
+    artifacts: Path | None, quant: str = "int8",
 ) -> dict[str, object]:
     """这份权重的编译产物能不能被复用：逐层判据与装载完全相同。
 
@@ -392,15 +402,18 @@ def _artifact_report(
             family=model, strategy=entry.strategy,
             hint="vendor 策略走厂商桥，不产生产物",
         )
+    if quant not in QUANT_MODES:
+        raise ConfigError("未知的量化档", quant=quant, available=list(QUANT_MODES))
     s = int(bucket or S_NATIVE)
     plan = entry.weight_plan(Path(weights))
     # 落点与 serve 同一个解析（`--artifacts` > 环境变量 > 平台缓存目录）：口径不同的话，
     # doctor 说"全命中"、起服务照样重编，这个报告就没有意义了。
-    state = artifact_state(weights, weights=plan, s=s,
+    state = artifact_state(weights, weights=plan, s=s, quantize=quant == "int8",
                           artifacts_dir=_artifacts_dir(artifacts))
     report: dict[str, object] = {
         "family": plan.descriptor.family,
         "s": s,
+        "quant": quant,
         "directory": str(state.directory),
         "layers": {"reusable": state.hits, "total": state.total},
     }
@@ -478,7 +491,8 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
             "resident": args.resident or None,
         }
         assembled = assemble(weights, name, backend=backend,
-                             artifacts_dir=artifacts, vision=(args.vision != "off"),
+                             artifacts_dir=artifacts, quant=args.quant,
+                             vision=(args.vision != "off"),
                              vision_idle=float(args.vision_idle),
                              vision_bucket=args.vision_bucket, **options)
         descriptor = assembled.descriptor
@@ -607,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
                 payload["geometry"] = geometry
                 payload["artifacts"] = _artifact_report(
                     args.model, args.weights,
-                    bucket=int(args.bucket), artifacts=args.artifacts,
+                    bucket=int(args.bucket), artifacts=args.artifacts, quant=args.quant,
                 )
             _print(payload)
             return 0

@@ -66,3 +66,30 @@ def test_chain_probabilities_and_repeat(tmp_path: Path) -> None:
         assert np.array_equal(chain.forward(tokens, options=3), probabilities)
     finally:
         chain.close()
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
+def test_quant_modes_keep_separate_artifact_directories(tmp_path: Path) -> None:
+    """int8 与 fp16 两档各占一个目录：切档不该顶掉另一档的产物。"""
+    plan = mude.weight_plan(MUDE_DIR)
+    int8 = artifact_state(MUDE_DIR, weights=plan, s=256, artifacts_dir=tmp_path / "programs")
+    fp16 = artifact_state(MUDE_DIR, weights=plan, s=256, artifacts_dir=tmp_path / "programs",
+                          quantize=False)
+    assert int8.directory.name == "s256"
+    assert fp16.directory.name == "s256-fp16"
+    assert int8.directory != fp16.directory
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
+def test_fp16_chain_loads_and_runs(tmp_path: Path) -> None:
+    """fp16 档走的是 `ane_layer_weights` + `build_blob(quantize=False)`，与 int8 不同的那条路。"""
+    chain = SplitChain.load(MUDE_DIR, weights=mude.weight_plan(MUDE_DIR), s=256,
+                            scratch_dir=tmp_path / "programs", quantize=False)
+    try:
+        probabilities = chain.forward([1, 2, 3, 4], options=3)
+        assert probabilities.shape == (3,)
+        assert np.all(probabilities >= 0.0)
+        assert float(probabilities.sum()) == pytest.approx(1.0, abs=1e-5)
+        assert chain.compile_s > 0.0
+    finally:
+        chain.close()
