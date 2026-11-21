@@ -134,7 +134,7 @@ def _model_flags() -> argparse.ArgumentParser:
     common.add_argument(
         "--W", type=int, default=_RESIDENT_W, dest="resident",
         help=f"待命常驻的层数（默认 {_RESIDENT_W} = 一个块；0 = 全部常驻）。"
-             "实测代价：h2o 32 层在 142 token 上窗口比全装慢 2.2×（票据 15 §25），"
+             "实测代价：h2o 32 层在 142 token 上窗口比全装慢 2.2×，"
              "长 prompt 上这笔固定开销摊薄",
     )
     common.add_argument(
@@ -144,7 +144,7 @@ def _model_flags() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--vision", default="auto", choices=("auto", "off"),
-        help="auto（默认）：模型有塔就收图，第一次带图请求才建塔（0 常驻）；"
+        help="auto（默认）：模型有塔就收图；启动时把缺失的塔产物编好，编完归还（0 常驻）；"
              "off：纯文本服务，不建塔、不读塔权重，收图时 422 并说明原因",
     )
     common.add_argument(

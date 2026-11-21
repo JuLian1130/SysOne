@@ -124,6 +124,48 @@ until the ready line. For h2o use `--model h2o`. The bidirectional
 long prompts need `--bucket 4096` (the default bucket is 1024); the causal
 default has no such constraint.
 
+### Options
+
+`sysone serve` takes the shared model flags plus the HTTP ones. Defaults are
+what a first run needs; every flag is optional.
+
+| Flag | Default / values | Meaning |
+|---|---|---|
+| `--model {mude,h2o}` | from `--backend` or `--weights` | model family |
+| `--backend {split,pooled,reference}` | from `--model` | execution path; `reference` is the test-only semantic judge |
+| `--weights PATH` | auto-download | explicit package; read-only, never downloads |
+| `--offline` | off | never touch the network |
+| `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`prefix_noncausal` for mude, `causal` for h2o) | mask; a request can override it |
+| `--bucket N` | `1024` | ANE program column width |
+| `--width N` | `16384` | GPU buffer width, also the max input tokens |
+| `--W N` | `4` | resident layers; `0` keeps all of them |
+| `--artifacts PATH` | platform cache | compiled artifact root |
+| `--descriptor PATH` | — | semantic-judge descriptor (`--backend reference` only) |
+| `--debug-timings` | off | add per-stage timings to each answer |
+
+Vision (only for models with a tower):
+
+| Flag | Default / values | Meaning |
+|---|---|---|
+| `--vision {auto,off}` | `auto` | `off` serves text only; image requests get `422` |
+| `--vision-idle S` | `60` | seconds before the tower is unloaded; `0` unloads after every request |
+| `--vision-bucket N` | chain bucket | tower tile width; must be a multiple of 4 |
+
+HTTP:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--host HOST` | `127.0.0.1` | bind address |
+| `--port N` | `8000` | bind port; `0` picks a free one |
+| `--queue N` | `8` | admission waiting slots |
+| `--admit-timeout S` | `120` | seconds a request may wait before `429` |
+| `--name NAME` | model id | `model` field in responses |
+
+Environment overrides: `SYS1_LOG_LEVEL` (default `info`), `SYS1_WEIGHTS_DIR`,
+`SYS1_ARTIFACTS_DIR`, `SYS1_E8_DIR`, and `DECISION_API_KEY`; the matching flags
+win over the variables.
+
 In another shell:
 
 ```sh
@@ -219,22 +261,17 @@ only the load. `--vision off` skips the tower and its programs. The third dylib
 
 ## Resources and tuning
 
-- Default weights directory: `~/Library/Caches/sysone/weights`. Override with
-  `SYS1_WEIGHTS_DIR`; `--weights` points at a package directly and never
-  downloads. Deleting the directory forces a re-download.
-- Default artifacts directory: `~/Library/Caches/sysone/artifacts`. Override with
-  `--artifacts` or `SYS1_ARTIFACTS_DIR`. Deleting it forces a recompile (the
-  first compile is minutes-level; later starts report `compile 0.00s`).
-- `--quant {int8,fp16}` selects the ANE weight storage (default `int8`):
-  per-output-channel codes with fp16 scales, or plain fp16. Compute stays fp16
-  either way (ANE has no int8 MAC). The two artifact sets live side by side,
-  `s<bucket>` for int8 and `s<bucket>-fp16` for fp16, so switching does not
-  overwrite the other mode.
-- `--bucket` is the ANE program column width (default 1024); `--width` is the
-  GPU buffer width and the max input tokens (default 16384); `--W` is the
-  resident window in layers (default 4 = one block).
-- On a 16 GB machine, lower `--width` (for example `--width 8192`) to shrink the
-  GPU-side buffers. A prompt longer than `--width` is rejected with `422`.
+- Both caches live under the platform cache and honour `SYS1_WEIGHTS_DIR` /
+  `SYS1_ARTIFACTS_DIR`; deleting one forces a re-download or a recompile. The
+  first compile is minutes-level, later starts report `compile 0.00s`.
+- Keep `--quant` stable across starts: it selects the artifact set (`s<bucket>`
+  for `int8`, `s<bucket>-fp16` for `fp16`), so switching does not overwrite the
+  other set but does compile a second one.
+- `--bucket` and `--width` trade tile size against GPU memory. On a 16 GB
+  machine start with `--width 8192`; widen the bucket only when the prompts
+  need it. A prompt longer than `--width` is rejected with `422`.
+- `--W` trades memory for latency: the default `4` (one block) keeps the least
+  resident, `--W 0` keeps every layer loaded.
 - A geometry outside the measured whitelist still runs, but its numbers are
   experimental.
 
