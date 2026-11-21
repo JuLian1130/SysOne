@@ -52,21 +52,23 @@ def builders(monkeypatch):
 
 
 def test_families_declare_how_their_answers_are_read():
-    """声明是**家族**给的：mude 固定码表、h2o 标签行、torchcast 走厂商桥。"""
+    """声明是**家族**给的：mude 固定码表、h2o 与 torchcast 都走池化读出。"""
     assert family("mude").strategy == "split"
     assert family("h2o").strategy == "pooled"
-    assert family("torchcast").strategy == "vendor"
+    assert family("torchcast").strategy == "pooled"
 
 
 def test_each_family_brings_the_pieces_of_its_own_readout():
     """策略只是共享实现，题面与读出是每家的配方 —— 新模型能接进来靠的就是这一层。
 
-    三个配方类型各不相同（码表 / 答面 / 桥），因为它们各自需要的东西本来就不一样；共同点
-    只有一个：都由家族给，不写在策略里。
+    两条 pooled 家族各带各的答面（h2o 一个、torchcast 一个），所以"同一个策略"不等于"同一套
+    题面与判答"；配方类型按策略分（码表 / 答面 / 桥），共同点是都由家族给，不写在策略里。
     """
     assert isinstance(family("mude").recipe, SplitRecipe)
     assert isinstance(family("h2o").recipe, PooledRecipe)
-    assert isinstance(family("torchcast").recipe, VendorRecipe)
+    assert isinstance(family("torchcast").recipe, PooledRecipe)
+    assert family("torchcast").recipe is not family("h2o").recipe
+    assert family("torchcast").recipe.serve is not family("h2o").recipe.serve
 
 
 def test_the_family_recipe_and_weight_plan_reach_the_factory(tmp_path, builders):
@@ -164,8 +166,22 @@ def test_a_backend_that_contradicts_the_family_is_refused(tmp_path, builders):
     assert pooled.calls == []
 
 
-def test_a_vendor_family_assembles_through_its_bridge(tmp_path, monkeypatch):
-    """torchcast 声明 `vendor`：工厂收到权重目录与产物落点，链形状参数一个都不到它手里。
+@pytest.fixture()
+def vendor_family(monkeypatch):
+    """一条只声明 `vendor` 的样例家族：厂商直通这条路今天没有出货家族，但它是注册表里可选的
+    一条路 —— torchcast 的桥留着作对拍基线，这里用它把"厂商路线"本身钉住。"""
+    monkeypatch.setitem(registry._REGISTRY, "bare-vendor", Family(
+        name="bare-vendor",
+        parse_config=lambda path: family("torchcast").parse_config(FIXTURES / "torchcast"),
+        build_layer_plan=lambda descriptor, config: None,
+        strategy="vendor",
+        recipe=VendorRecipe(bridge=lambda path: object()),
+    ))
+    return "bare-vendor"
+
+
+def test_a_vendor_family_assembles_through_its_bridge(tmp_path, monkeypatch, vendor_family):
+    """声明 `vendor` 的家族：工厂收到权重目录与产物落点，链形状参数一个都不到它手里。
 
     这里换掉工厂，是为守住"装配"这一层：真正的桥在模块级 import torch，只有真跑
     vendor 路径时才该付这笔导入（`test_import_light.py` 钉着核心面不带 torch）。
@@ -178,7 +194,7 @@ def test_a_vendor_family_assembles_through_its_bridge(tmp_path, monkeypatch):
 
     monkeypatch.setitem(assembly._BUILDERS, "vendor", builder)
     assembled = assembly.assemble(
-        FIXTURES / "torchcast", "torchcast", backend="vendor", artifacts_dir=tmp_path / "art"
+        FIXTURES / "torchcast", vendor_family, backend="vendor", artifacts_dir=tmp_path / "art"
     )
     assert assembled.runner == "runner:vendor"
     assert assembled.strategy == "vendor"
@@ -186,11 +202,11 @@ def test_a_vendor_family_assembles_through_its_bridge(tmp_path, monkeypatch):
     assert calls == [{"dir": str(FIXTURES / "torchcast"), "scratch_dir": tmp_path / "art"}]
 
 
-def test_a_vendor_family_refuses_chain_knobs(tmp_path, monkeypatch):
+def test_a_vendor_family_refuses_chain_knobs(tmp_path, monkeypatch, vendor_family):
     """vendor 的前向与缓冲在厂商引擎里：链形状参数一个也不认，给了要报错。"""
     monkeypatch.setitem(assembly._BUILDERS, "vendor", lambda *a, **k: "runner:vendor")
     with pytest.raises(ConfigError) as caught:
-        assembly.assemble(FIXTURES / "torchcast", "torchcast", backend="vendor", resident=4)
+        assembly.assemble(FIXTURES / "torchcast", vendor_family, backend="vendor", resident=4)
     assert caught.value.context["refused"] == ["resident"]
     assert caught.value.context["accepted"] == []
 
@@ -208,9 +224,9 @@ def test_a_backend_that_does_not_match_the_family_names_both_sides(tmp_path, bui
         assembly.assemble(FIXTURES / "torchcast", "torchcast", backend="split")
     context = caught.value.context
     assert context["backend"] == "split"
-    assert context["strategy"] == "vendor"
+    assert context["strategy"] == "pooled"
     assert context["available"] == ["split", "pooled", "vendor"]
-    assert context["hint"].endswith("用 --backend vendor")
+    assert context["hint"].endswith("用 --backend pooled")
 
 
 def test_an_option_the_strategy_does_not_take_is_refused(tmp_path, builders, monkeypatch):

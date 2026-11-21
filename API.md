@@ -93,14 +93,14 @@ rejected. When `--vision off` is set, image requests are rejected with `422`.
 
 ## Per-model capabilities
 
-| | h2o | mude |
-|---|---|---|
-| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` (2–10 levels) |
-| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) |
-| Readout | vendor pooled readout | fixed 255-row code table |
-| Max options per question | 255 | 255 (10 for a `score`) |
-| Max input tokens | `--width` (default 16384) | `--width` (default 16384) |
-| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) |
+| | h2o | mude | torchcast |
+|---|---|---|---|
+| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` (2–10 levels) | `choice`, `noul`, `score` (2–10 levels) |
+| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) | `noncausal_full` only |
+| Readout | vendor pooled readout | fixed 255-row code table | 26 `lm_head` letter rows |
+| Max options per question | 255 | 255 (10 for a `score`) | 26 (10 for a `score`) |
+| Max input tokens | `--width` (default 16384) | `--width` (default 16384) | `--width` (default 16384) |
+| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | not in this assembly |
 
 The first start also builds the vision tower's 26 programs, then releases the
 tower: text-only processes stay at 0 resident, and the first image request pays

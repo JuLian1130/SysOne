@@ -43,8 +43,9 @@ def test_a_family_must_declare_its_readout_strategy() -> None:
 def test_executor_families_declare_a_weight_plan() -> None:
     """设备层要的那四项从注册表就能拿到：查产物（`sysone doctor`）不必先装配执行器。
 
-    `vendor` 不经过设备链，所以它可以没有 —— 这也是这个字段可选的理由。
+    三家居于设备链上（mude 走码表、h2o 与 torchcast 走池化读出），所以三家都有；这个字段仍然
+    可选，`vendor` 策略不建设备链，接进来的家族可以不给。
     """
     assert family("mude").weight_plan is not None
     assert family("h2o").weight_plan is not None
-    assert family("torchcast").weight_plan is None
+    assert family("torchcast").weight_plan is not None

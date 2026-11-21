@@ -8,7 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 from helpers import FIXTURES, make_request, make_tiny
-from sysone.cli import _artifacts_dir, _geometry_report, _platform_report, _resolve_backend, main
+from sysone.cli import (
+    _artifacts_dir,
+    _geometry_report,
+    _infer_family,
+    _platform_report,
+    _resolve_backend,
+    main,
+)
 from sysone.devices.apple import platform as apple_platform
 from sysone.errors import ConfigError
 
@@ -153,15 +160,53 @@ def test_backend_follows_the_model_family() -> None:
     assert _resolve_backend(args) == "pooled"
     args = SimpleNamespace(backend=None, model="torchcast", weights=FIXTURES / "torchcast",
                            descriptor=None)
-    assert _resolve_backend(args) == "vendor"
+    assert _resolve_backend(args) == "pooled"
 
 
-def test_the_vendor_path_refuses_the_knobs_of_our_chain(capsys) -> None:
-    """torchcast 的前向不在我们的链上：显式给的链形状参数要报错，不能静默丢掉。
+def test_package_markers_name_one_family_or_none(tmp_path: Path) -> None:
+    """没给 --model 时按发布包的必需件认家族；命中两个就要求显式指定，不猜。
+
+    torchcast 的目录同时带 `decision_config.json`（与 mude 同名）与厂商包目录，所以它落进
+    "认不出唯一家族"那一支 —— 猜成 mude 会拿 mude 的码表读出一份看起来正常的答案。
+    """
+    def package(name: str, *files: str) -> Path:
+        directory = tmp_path / name
+        directory.mkdir()
+        for file in files:
+            (directory / file).write_text("{}", encoding="utf-8")
+        return directory
+
+    # mude 与 torchcast 都带 `decision_config.json`：单看它两家都命中，所以各自还要一份标志件
+    assert _infer_family(package("mude", "decision_config.json", "readout.safetensors")) == "mude"
+    assert _infer_family(package("h2o", "serve_config.json")) == "h2o"
+    assert _infer_family(package("tc", "decision_config.json", "int8_manifest.json")) == "torchcast"
+
+    # 两份标记件都像、又都不全（只有 mude 与 torchcast 共有的那个文件）：不猜
+    with pytest.raises(ConfigError) as caught:
+        _infer_family(package("bare", "decision_config.json"))
+    assert "torchcast" in caught.value.context["hint"]
+
+
+def test_the_vendor_path_refuses_the_knobs_of_our_chain(monkeypatch, capsys) -> None:
+    """厂商后端的前向不在我们的链上：显式给的链形状参数要报错，不能静默丢掉。
 
     `--W` 的默认值就是 4，所以"给了"只能按"与默认值不同"来认 —— 这里给 0（全装）。
+    用一条样例家族而不是 torchcast：它已经改走 pooled，厂商路线本身仍是注册表里可选的一条。
     """
-    code = main(["run", "--model", "torchcast", "--weights", str(FIXTURES / "torchcast"),
+    from sysone import cli
+    from sysone.models.recipe import VendorRecipe
+    from sysone.models.registry import Family, family
+    from sysone.models import registry
+
+    monkeypatch.setitem(registry._REGISTRY, "bare-vendor", Family(
+        name="bare-vendor",
+        parse_config=family("torchcast").parse_config,
+        build_layer_plan=lambda descriptor, config: None,
+        strategy="vendor",
+        recipe=VendorRecipe(bridge=lambda path: object()),
+    ))
+    monkeypatch.setattr(cli, "_CLI_FAMILIES", (*cli._CLI_FAMILIES, "bare-vendor"))
+    code = main(["run", "--model", "bare-vendor", "--weights", str(FIXTURES / "torchcast"),
                  "--W", "0", "--input", "unused.json"])
     assert code == 2
     payload = json.loads(capsys.readouterr().err)
@@ -177,7 +222,7 @@ def test_a_backend_that_contradicts_the_family_is_refused(capsys) -> None:
     assert code == 2
     payload = json.loads(capsys.readouterr().err)
     assert payload["context"]["backend"] == "split"
-    assert payload["context"]["strategy"] == "vendor"
+    assert payload["context"]["strategy"] == "pooled"
 
 
 def test_batch_flag_folds_into_the_scheduler_config() -> None:
@@ -196,8 +241,9 @@ def test_batch_flag_folds_into_the_scheduler_config() -> None:
 
 
 def test_backend_is_inferred_from_the_weights_package(tmp_path: Path) -> None:
-    """没给 --model 时按必需件认家族：mude 带 decision_config.json，h2o 带 serve_config.json。"""
+    """没给 --model 时按必需件认家族：mude 带 `decision_config.json` 与它的码表。"""
     (tmp_path / "decision_config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "readout.safetensors").write_text("{}", encoding="utf-8")
     args = SimpleNamespace(backend=None, model=None, weights=tmp_path, descriptor=None)
     assert _resolve_backend(args) == "split"
     assert args.model == "mude"

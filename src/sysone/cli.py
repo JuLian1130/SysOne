@@ -43,26 +43,36 @@ _SPLIT_WIDTH = SchedulerConfig().max_len
 # h2o 同口径（票据 15 §25）：待命 3406 → 426 MiB（8×），142 token 上窗口慢 2.2×，长 prompt 上
 # 这笔 0.41 s 的固定开销摊薄（按 16k 外推 ≈ +3%）。
 _RESIDENT_W = 4
-# 后端不给 `--model` 时的默认家族。mude 维持原样；pooled 只有 h2o，vendor 只有 torchcast。
-_DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o", "vendor": "torchcast"}
+# 后端不给 `--model` 时的默认家族。mude 维持原样；pooled 默认 h2o（torchcast 也在这条路上，
+# 但它的目录带两个厂商标记件、认不出唯一家族，所以一直要显式 `--model`）。`vendor` 今天没有
+# 出货家族 —— 这条路仍在注册表里，取它就要显式给家族。
+_DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o"}
 # 视觉塔的空闲卸载窗口（票据 07 §6 未定项 2 的默认值）。60 s 是"连续几张图算同一批"的量级：
 # 装一次 0.6–2 s、卸一次同样，窗口短于这个数就等于每张图都付两遍。
 _VISION_IDLE = 60.0
 # run / serve 只列有 CLI 装配入口的家族。`inspect` / `doctor` 仍列全部家族（它们只看配置）。
 _CLI_FAMILIES = tuple(name for name in families() if family(name).strategy in STRATEGY_BACKENDS)
 
-# 没有 --model 时按包身份认家族：mude 的读出依赖 `decision_config.json`，h2o 的 pooled 路径
-# 依赖厂商 `serve_config.json`。这不是按权重形状猜家族 —— 猜错不会崩，只会拿错模板算出
-# 看似正常的答案；两个标记文件是发布包的必需件，认它们比认形状或目录名可靠。
-# torchcast 的目录也带 `decision_config.json`（两份厂商题面格式同名），所以它的标记件认不出
-# 唯一家族，必须显式 `--model torchcast`。
-_FAMILY_MARKERS = {"mude": "decision_config.json", "h2o": "serve_config.json"}
+# 没有 --model 时按包身份认家族：每个家族列它那份发布包里**必需**的一组文件，全在才算命中。
+# 这不是按权重形状猜家族 —— 猜错不会崩，只会拿错模板算出看似正常的答案；认发布包的必需件比
+# 认形状或目录名可靠。
+#
+# 必须逐个列成一组：mude 与 torchcast 都带 `decision_config.json`（两份厂商题面格式同名），
+# 单看它两家都命中。mude 多一份码表 `readout.safetensors`，torchcast 多一份 int8 清单而没有
+# 码表，于是各命中各的。torchcast 的厂商包 `torchcast_decision/` **不**是标记件：改走 pooled
+# 之后出货路径不读它，把它当标记会把"没带厂商包"的目录推到别的家族上。
+_FAMILY_MARKERS = {
+    "mude": ("decision_config.json", "readout.safetensors"),
+    "h2o": ("serve_config.json",),
+    "torchcast": ("decision_config.json", "int8_manifest.json"),
+}
 
 
 def _infer_family(weights: Path) -> str:
     """从模型目录的必需件推断家族；推断不出来就要求显式 `--model`。"""
     if weights.is_dir():
-        found = [name for name, marker in _FAMILY_MARKERS.items() if (weights / marker).is_file()]
+        found = [name for name, markers in _FAMILY_MARKERS.items()
+                 if all((weights / marker).is_file() for marker in markers)]
         if len(found) == 1:
             return found[0]
     raise ConfigError(
@@ -92,7 +102,7 @@ def _resolve_backend(args: argparse.Namespace) -> str:
             family=args.model,
             strategy=strategy,
             available=list(_CLI_FAMILIES),
-            hint="给 --backend split（mude）、pooled（h2o）或 vendor（torchcast）",
+            hint="给 --backend split（mude）或 pooled（h2o / torchcast）",
         )
     return strategy
 
@@ -104,9 +114,9 @@ def _model_flags() -> argparse.ArgumentParser:
         "--backend",
         default=None,
         choices=("reference",) + STRATEGY_BACKENDS,
-        help="执行路径：不给时按 --model 的家族推断（mude → split、h2o → pooled、"
-             "torchcast → vendor，没给 --model 时按权重包身份认）；reference（M0 语义裁判，"
-             "只做全注意力层）必须显式给，且只配合 --descriptor",
+        help="执行路径：不给时按 --model 的家族推断（mude → split、h2o 与 torchcast → pooled，"
+             "没给 --model 时按权重包身份认）；reference（M0 语义裁判，只做全注意力层）必须"
+             "显式给，且只配合 --descriptor",
     )
     common.add_argument(
         "--model", default=None, choices=_CLI_FAMILIES,
@@ -515,7 +525,13 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
     artifacts = _artifacts_dir(args.artifacts)
     weights_root = _weights_dir()
     if backend in STRATEGY_BACKENDS:
-        name = args.model or _DEFAULT_FAMILY[backend]
+        name = args.model or _DEFAULT_FAMILY.get(backend)
+        if name is None:
+            raise ConfigError(
+                "这个后端没有默认家族",
+                backend=backend,
+                hint="torchcast 已改走 pooled；厂商直通不再有出货家族",
+            )
         weights = _resolve_weights(
             args.weights, name, offline=bool(args.offline), root=weights_root
         )
@@ -534,7 +550,7 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
                     "这条后端不认链形状参数",
                     backend=backend,
                     refused=refused,
-                    hint="torchcast 的前向与缓冲不在我们的链上：去掉这些参数",
+                    hint="厂商后端的前向与缓冲在厂商引擎里：去掉这些参数",
                 )
             options: dict[str, object] = {}
         else:

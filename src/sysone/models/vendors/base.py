@@ -1,8 +1,12 @@
-"""厂商桥的公共契约。
+"""厂商侧的两份公共契约：厂商桥，与答面。
 
-厂商桥只负责两件事：把「题面 + 选项」渲染成它自己训练时的线格式，以及在
-它自己的前向与读出代码上跑一次。权重装载、注意力模式和预算由我们给，
-其余一律交给厂商代码，这样对拍时只可能是权重或模式不同，不会是模板不同。
+厂商桥（`VendorBridge`）只负责两件事：把「题面 + 选项」渲染成它自己训练时的线格式，以及在
+它自己的前向与读出代码上跑一次。权重装载、注意力模式和预算由我们给，其余一律交给厂商代码，
+这样对拍时只可能是权重或模式不同，不会是模板不同。
+
+答面（`AnswerSurface`）把同一件事拆成两半：`prepare` 渲染题面并记下这一题判答案要用的量，
+`answer` 吃一个 logits 向量判答案。前向归谁不影响它 —— 厂商桥在自己的 torch 模型上跑，
+`pooled` 策略在我们的 ANE 链上跑，两条路共用同一份答面，所以判词差异不可能是答面造成的。
 """
 
 from __future__ import annotations
@@ -46,6 +50,45 @@ class VendorBridge(Protocol):
 
     def close(self) -> None:
         """释放权重。"""
+
+
+@dataclass(frozen=True)
+class Prepared:
+    """一道题在答面上的全部事实：喂给前向的 token，与判答案要用的东西。
+
+    `label_ids[k]` 对应 `labels[k]`、`names[k]`，也对应 `answer()` 收到的 `logits[k]` ——
+    三处顺序都是厂商题面给的顺序，不许重排。
+    """
+
+    ids: tuple[int, ...]
+    label_ids: tuple[int, ...]
+    labels: tuple[str, ...]
+    names: tuple[str, ...]
+    descs: tuple[str, ...]
+    kind: str
+    temperature: float
+    threshold: float | None
+
+
+class AnswerSurface(Protocol):
+    """答面：题面怎么渲染、答案怎么判。
+
+    `serve(model_dir, tokenizer)` 交出一个实现它的对象；`pooled` 策略只认这两个方法与它，所以
+    它不认识任何具体家族 —— 换一家接进来，改的是那一家自己的适配文件。
+
+    `supports_images` 是"这份答面会不会把图块渲染进题面"。`False` 时装配**不建视觉塔**：给一个
+    收不了图的模型编 26 份塔产物，是每次启动几秒与一块常驻（票据 21）。
+    """
+
+    supports_images: bool
+
+    def prepare(self, state: str, spec: dict, *, images: int = 0) -> Prepared:
+        """题面 → 整条 prompt 的 token 与回答槽上的读出位置。"""
+
+    def answer(
+        self, prepared: Prepared, logits: Sequence[float]
+    ) -> tuple[str, tuple[str, ...], tuple[float, ...], float]:
+        """回答槽上的 logits（未除温度）→ (值, 标签, 概率, 置信度)。"""
 
 
 # 协议层把选项拼成 `"<key>: <描述>"`（`service/protocol._wire_question`），而厂商的线格式要的是

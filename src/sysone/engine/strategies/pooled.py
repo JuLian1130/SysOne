@@ -1,4 +1,8 @@
-"""pooled 策略：整链 hidden 走我们的 ANE 链，读出与答面格式交回厂商的 `Serve`。
+"""pooled 策略：整链 hidden 走我们的 ANE 链，读出与答面格式交回厂商的答面。
+
+两家居于这条路上：h2o（tied，读出取 `embed_tokens` 的标签行）与 torchcast（untied，读出取
+`lm_head` 的字母行）。差别全在"读出张量叫什么、题面怎么渲染、答案怎么判"，由家族的
+`weight_plan` 与 `PooledRecipe` 给；这条策略只认 `AnswerSurface` 那两件事。
 
 与 split 策略的差别不在"谁做前向"，而在**读出形态**：
 
@@ -32,8 +36,7 @@ from ...domain.work import CompilationTimes
 from ...errors import ConfigError, NotReadyError, UnsupportedModeError
 from ...models.layer_plan import WeightPlan
 from ...models.recipe import PooledRecipe
-from ...models.vendors.base import question_spec
-from ...models.vendors.h2o_serve import Prepared, Serve
+from ...models.vendors.base import AnswerSurface, Prepared, question_spec
 from .decision import MIN_SLOT, DecisionRunner, Encoded
 from .vision import VisionRunner
 
@@ -50,6 +53,9 @@ class PooledChain(Protocol):
     另外两条是**可选的**：`last_hidden_shared`（"前缀一遍、每题一条尾巴"）与
     `last_hidden_batched`（"多条独立序列并排一个 pass"）。有就走，没有就退回逐题 ——
     `ModelChain` 的协议不强制它们，替身链与 numpy 形态的链都可能没有。
+
+    `load_s` / `compile_s` 也是可选的：链自己量那两段（`SplitChain` 有），没有就按
+    "装载即全部、编译 0"报。
     """
 
     def last_hidden(self, tokens: Sequence[int], *, prefix: int = 0, causal: bool = False,
@@ -61,8 +67,9 @@ class PooledChain(Protocol):
 class PooledRunner(VisionRunner, DecisionRunner):
     """实现 `ModelRunner` 的 pooled 路径：一题一次整链前向 + 一次标签行读出。
 
-    `rows` 把"标签 token id"换成"词表里的那几行"（tied 模型上就是 `embed_tokens`），由调用
-    方注入：设备层不加一个只为这份 checkpoint 存在的读出方式，链也不需要认识 tokenizer。
+    `rows` 把"标签 token id"换成"读出张量里的那几行"（tied 模型上是 `embed_tokens`，解绑的是
+    `lm_head`），由调用方注入：设备层不加一个只为这份 checkpoint 存在的读出方式，链也不需要
+    认识 tokenizer。
 
     **它不自己编排**：一题整趟还是"state 前缀只算一遍"，由基类（`DecisionRunner`）按前缀、
     题数与能力位决定，这里只提供原语 —— `encode`（厂商答面渲染）、`forward`（末行 hidden）、
@@ -107,10 +114,11 @@ class PooledRunner(VisionRunner, DecisionRunner):
     def __init__(
         self,
         load_chain: Callable[[], PooledChain],
-        serve: Serve,
+        serve: AnswerSurface,
         rows: Callable[[Sequence[int]], np.ndarray],
         *,
         supported_modes: frozenset[MaskMode],
+        default_mode: MaskMode,
         max_len: int,
         image_token_id: int | None = None,
         load_tower: Callable[[object], object] | None = None,
@@ -127,6 +135,9 @@ class PooledRunner(VisionRunner, DecisionRunner):
         self._modes = frozenset(supported_modes)
         if not self._modes:
             raise ConfigError("pooled 策略需要 checkpoint 声明支持的读法", strategy="pooled")
+        # 预热要用**这份 checkpoint 的默认读法**：torchcast 只训练过全双向，用因果去热一块
+        # 它不认的 program 会白编一次、也可能在掩码边界上读出另一种结果。
+        self._default_mode = default_mode
         self._max_len = int(max_len)
         self._image_token = image_token_id
         # 视觉塔的工厂（`chain → VisionSlot`）：塔要复用链的权重容器与运行时，所以只能在
@@ -173,7 +184,7 @@ class PooledRunner(VisionRunner, DecisionRunner):
         started = time.perf_counter()
         answers, _, _ = self.answers_for(
             DecisionRequest(state=_WARMUP_STATE, questions=(_WARMUP_QUESTION,)),
-            MaskMode.CAUSAL,
+            self._default_mode,
         )
         probs = answers[0].probs
         if not probs or not all(math.isfinite(value) for value in probs):
@@ -184,9 +195,13 @@ class PooledRunner(VisionRunner, DecisionRunner):
                                 total=sum(probs))
         self.prepare_vision()
         self._warm_ok = True
+        # 装载与编译的拆分由链自己量：只有它知道哪几层是从头构建的。这里拿不到那两段时
+        # （替身链）才退回"装载即全部、编译 0"—— 但那会让冷启动的 `compile` 报成 0.00 s，
+        # 与"产物全命中"分不开，所以真链一律走前一条。
+        chain = self._chain
         return CompilationTimes(
-            load_s=self._load_s,
-            compile_s=0.0,
+            load_s=float(getattr(chain, "load_s", self._load_s)),
+            compile_s=float(getattr(chain, "compile_s", 0.0)),
             warmup_s=time.perf_counter() - started,
         )
 
@@ -355,6 +370,9 @@ def pooled_runner(
     `ffn` 是 9216、`hidden` 是 2560，两个 program 都比 2B 大，所以这两项由调用方说清楚，
     不在这里猜。
 
+    读出表名来自 `weights.descriptor.readout.weight`：h2o 没声明，退回 tied 的 `embed_tokens`；
+    torchcast 声明 `lm_head.weight`（在文本前缀之外，完整名，不拼前缀）。
+
     `metal=True` 默认开：h2o 的 `(2560, 9216)` 已经做过 numpy vs Metal 的逐位对拍
     （票据 15 §24：桶 256、64/128 token、两种读法，hidden relL2 1.3e-3、logits 3e-4 量级、
     argmax 全同），注意力与 GDN 走 GPU 快 3~10 倍。
@@ -384,12 +402,17 @@ def pooled_runner(
     warn_if_unmeasured(weights.descriptor, strategy="pooled")
     serve = recipe.serve(model_dir, tokenizer)
     store = open_checkpoint(Path(model_dir))
-    embed_name = f"{weights.prefix}.embed_tokens.weight"
-    if not weights.descriptor.tied_embeddings:
-        raise ConfigError(
-            "h2o 的读出权重来自词表（tied），这份 checkpoint 却不是 tied",
-            model=str(model_dir),
-        )
+    # 读出张量按 descriptor 取，不按"tied 就用词表"猜：torchcast 解绑了 `lm_head`，而且它在
+    # `model.language_model` 之外 —— 用前缀去拼 `lm_head` 会拼出一个不存在的张量名。
+    readout_name = weights.descriptor.readout.weight
+    if readout_name is None:
+        if not weights.descriptor.tied_embeddings:
+            raise ConfigError(
+                "这份 checkpoint 的读出不在词表上（untied），descriptor 却没声明读出张量",
+                model=str(model_dir),
+                hint="在 ReadoutPlan(weight=...) 里写出读出表的名字",
+            )
+        readout_name = f"{weights.prefix}.embed_tokens.weight"
     bucket_width = int(S_NATIVE if bucket is None else bucket)
     buffer_width = int(bucket_width if width is None else width)
 
@@ -407,7 +430,7 @@ def pooled_runner(
         )
 
     def rows(label_ids: Sequence[int]) -> np.ndarray:
-        return np.asarray(store.read_rows(embed_name, list(label_ids)), np.float32)
+        return np.asarray(store.read_rows(readout_name, list(label_ids)), np.float32)
 
     # 塔自己的列宽（`None` = 跟随链的桶）；4 的倍数是 merger 的 2×2 合并要求的。
     tower_s = bucket_width if vision_bucket is None else int(vision_bucket)
@@ -434,11 +457,17 @@ def pooled_runner(
         )
         return {"directory": str(state.directory), "reusable": state.hits, "total": state.total}
 
-    load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
+    # 答面收不了图时不建塔：编 26 份塔产物是每次启动几秒与一块常驻，而请求会在编码前就 422。
+    # `image_token_id=None` 让 `VisionRunner` 报出**真实**原因（"这个模型没有视觉塔"），
+    # 而不是"视觉被关掉了：给 --vision auto" —— 后者是错的建议。
+    images_ok = bool(getattr(serve, "supports_images", True))
+    load = (load_tower
+            if (images_ok and vision is not False and weights.descriptor.vision is not None)
+            else None)
     return PooledRunner(
         load_chain, serve, rows, supported_modes=weights.descriptor.supported_modes,
-        max_len=buffer_width,
-        image_token_id=weights.descriptor.image_token_id, load_tower=load,
+        default_mode=weights.descriptor.default_mode, max_len=buffer_width,
+        image_token_id=weights.descriptor.image_token_id if images_ok else None, load_tower=load,
         vision_state=tower_state if load is not None else None,
     )
 

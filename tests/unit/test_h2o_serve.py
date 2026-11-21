@@ -98,6 +98,12 @@ def serve(**kwargs) -> tuple[Serve, FakeTokenizer]:
 
 
 # ------------------------------------------------------------------ prepare
+def test_h2o_renders_image_blocks_so_the_assembly_builds_its_tower():
+    """`pooled` 的装配按这一位决定建不建塔：h2o 的图块由 `prepare` 自己拼进题面。"""
+    subject, _ = serve()
+    assert subject.supports_images is True
+
+
 def test_prepare_carries_prompt_labels_and_temperature():
     """题面、回答槽上的标签 token、每题型的温度 —— 都是厂商契约给的，不许在别处重算。"""
     subject, _ = serve()

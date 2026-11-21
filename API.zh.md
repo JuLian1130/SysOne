@@ -81,14 +81,14 @@
 
 ## 各模型能力
 
-| | h2o | mude |
-|---|---|---|
-| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score`（2–10 档） |
-| 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) |
-| 读出 | 厂商 pooled 读出 | 固定 255 行码表 |
-| 每题最多选项 | 255 | 255（`score` 为 10） |
-| 最大输入 token | `--width` (default 16384) | `--width` (default 16384) |
-| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
+| | h2o | mude | torchcast |
+|---|---|---|---|
+| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score`（2–10 档） | `choice`, `noul`, `score`（2–10 档） |
+| 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) | 只有 `noncausal_full` |
+| 读出 | 厂商 pooled 读出 | 固定 255 行码表 | 26 行 `lm_head` 字母 |
+| 每题最多选项 | 255 | 255（`score` 为 10） | 26（`score` 为 10） |
+| 最大输入 token | `--width` (default 16384) | `--width` (default 16384) | `--width` (default 16384) |
+| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 这条装配不做图 |
 
 首次启动还会把视觉塔的 26 份产物编好，然后归还塔：纯文本进程保持 0 常驻，第一次带图
 请求只付装载。`--vision off` 跳过塔及其产物。第三份 dylib（`libe8image.dylib`）只在真的

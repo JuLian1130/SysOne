@@ -17,7 +17,8 @@ from sysone.domain.decision import DecisionRequest, Question
 from sysone.engine.strategies.decision import shared_prefix
 from sysone.engine.strategies.pooled import PooledRunner
 from sysone.errors import ConfigError, NotReadyError, RequestTooLongError, UnsupportedModeError
-from sysone.models.vendors.h2o_serve import Prepared, Serve
+from sysone.models.vendors.base import Prepared
+from sysone.models.vendors.h2o_serve import Serve
 
 from test_h2o_serve import CONFIG, FakeContract, FakeShim, FakeTokenizer
 
@@ -97,7 +98,7 @@ def runner(*, last=(0.0, 0.0, 0.0, 1.0), max_len: int = 64, chain=None, serve_ov
         subject = serve_override
     runner = PooledRunner(lambda: chain, subject, rows_by_label,
                           supported_modes=frozenset({MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL}),
-                          max_len=max_len)
+                          default_mode=MaskMode.CAUSAL, max_len=max_len)
     if loaded:
         runner.load_weights()
     return runner
@@ -191,6 +192,30 @@ def test_restarted_warm_up_reports_bad_probabilities():
     subject = runner(serve_override=BrokenServe())
     with pytest.raises(NotReadyError):
         subject.compile_or_warm_up()
+
+
+def test_the_warm_up_reports_the_chain_s_own_load_and_compile():
+    """冷启动的两段由链量、经这条策略透出：硬写 `compile_s=0.0` 会让"首编"与"全命中"同形。
+
+    真链上首编几十秒、二次启动 0.00 s，`sysone compile` 与 `serve` 的就绪行都靠这两个数。
+    """
+
+    class MeasuredChain(FakeChain):
+        load_s = 1.25
+        compile_s = 41.5
+
+    subject = runner(chain=MeasuredChain())
+    times = subject.compile_or_warm_up()
+    assert times.load_s == pytest.approx(1.25)
+    assert times.compile_s == pytest.approx(41.5)
+
+
+def test_a_chain_that_does_not_measure_reports_the_load_it_saw():
+    """替身链没有那两段时退回"装载即全部、编译 0"，不假装量过。"""
+    subject = runner()
+    times = subject.compile_or_warm_up()
+    assert times.compile_s == 0.0
+    assert times.load_s >= 0.0
 
 
 def test_shutdown_closes_the_chain():

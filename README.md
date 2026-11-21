@@ -59,9 +59,12 @@ The first start downloads the weights and compiles the ANE programs, then prints
 `sysone serve: ready in ...s`; later starts report `compile 0.00s`. Running it
 again is safe.
 
-For mude use `--model mude`. Torchcast has no published package: install the vendor
-extra (`pip install -e './src[vendor]'`) and pass `--weights` pointing at a model
-directory that ships the vendor's `torchcast_decision/` package.
+For mude use `--model mude`. Torchcast has no published package either: pass
+`--model torchcast --weights` pointing at a local int8 model directory. It runs on
+the same ANE chain as h2o and only supports the full-bidirectional mask, so it
+shares no prompt prefix between questions; the vendor extra
+(`pip install -e './src[vendor]'`) is only needed to run the vendor's own torch
+engine as a comparison baseline.
 
 Check it from another shell:
 
@@ -82,11 +85,11 @@ optional.
 | Flag | Default / values | Meaning |
 |---|---|---|
 | `--model {h2o,mude,torchcast}` | from `--backend` or `--weights` | model family |
-| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o, `split` for mude, `vendor` for torchcast | execution path; `reference` is the test-only semantic judge |
+| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |
 | `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude) | mask; a request can override it |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `16384` | GPU buffer width, also the max input tokens |
 | `--W N` | `4` | resident layers; `0` keeps all of them |

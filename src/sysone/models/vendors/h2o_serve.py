@@ -17,19 +17,21 @@
 字母怎么落到 token 上、按题型换哪个温度、noul 的阈值与地板怎么算，全在厂商的
 `format_answer` 里（`h2o_lightning_shim.py:750`）。设备层只该回答"这串 token 过完整条链
 之后，某几行词表权重的点积是多少"，所以 `Serve.answer` 只吃一个 logits 向量。
+
+载体与接口（`Prepared` / `AnswerSurface`）在 `vendors/base.py`：`pooled` 策略按那份契约调
+答面，所以这里只剩 h2o 自己的实现。
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from ...errors import ConfigError, ReadoutError
 from ..tokenizer import ChatTokenizer
-from .base import wire_answer
+from .base import Prepared, wire_answer
 
 SHIM_FILE = "h2o_lightning_shim.py"
 SERVE_FILE = "serve_config.json"
@@ -37,24 +39,6 @@ SERVE_FILE = "serve_config.json"
 # 这三个 id；我们这里没有模板可走（`Serve` 只收一段文本），所以直接拼字符串 —— 分词器保证
 # 这三个是原子 token（实测 248053 / 248056 / 248054）。
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
-
-
-@dataclass(frozen=True)
-class Prepared:
-    """一道题在答面上的全部事实：喂给前向的 token，与判答案要用的东西。
-
-    `label_ids[k]` 对应 `labels[k]`、`names[k]`，也对应 `answer()` 收到的 `logits[k]` ——
-    三处顺序都是厂商 `question_prompt` 给的顺序，不许重排。
-    """
-
-    ids: tuple[int, ...]
-    label_ids: tuple[int, ...]
-    labels: tuple[str, ...]
-    names: tuple[str, ...]
-    descs: tuple[str, ...]
-    kind: str
-    temperature: float
-    threshold: float | None
 
 
 def _load_shim(model_dir: Path):
@@ -71,6 +55,9 @@ def _load_shim(model_dir: Path):
 
 class Serve:
     """厂商的答面。`config` / `shim` / `tokenizer` 都能注入，单测不需要真模型目录。"""
+
+    # 图块由 `prepare` 自己拼在 state 之前（`VISION_BLOCK`），所以装配要为它建塔。
+    supports_images = True
 
     def __init__(self, config: dict, shim: object, tokenizer: object) -> None:
         self._shim = shim
@@ -171,4 +158,4 @@ class Serve:
         return tuple(picked)
 
 
-__all__ = ["Prepared", "Serve"]
+__all__ = ["Serve"]

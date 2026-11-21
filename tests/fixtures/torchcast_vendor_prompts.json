@@ -1,0 +1,595 @@
+{
+ "generator": "torchcast_decision.render / .model（厂商包）",
+ "checkpoint": "torchcast4b-int8",
+ "prompt_format": "jev_render_v3",
+ "letter_token_ids": [
+  32,
+  33,
+  34,
+  35,
+  36,
+  37,
+  38,
+  39,
+  40,
+  41,
+  42,
+  43,
+  44,
+  45,
+  46,
+  47,
+  48,
+  49,
+  50,
+  51,
+  52,
+  53,
+  54,
+  55,
+  56,
+  57
+ ],
+ "noul_floor": 0.801,
+ "temperature_by_type": {
+  "choice": 0.9,
+  "noul": 0.9,
+  "score": 0.9
+ },
+ "cases": [
+  {
+   "name": "choice_with_descriptions",
+   "state": "ticket: Checkout returns 500 for every customer since 09:12.\nplan: \"enterprise\"",
+   "spec": {
+    "type": "choice",
+    "instructions": "Which team should take it?",
+    "criteria": {
+     "payments": "Payments team",
+     "web": null,
+     "support": "Customer support, 24/7"
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nticket: Checkout returns 500 for every customer since 09:12.\nplan: \"enterprise\"\n\nQuestion: Which team should take it?\nOptions:\nA) payments: Payments team\nB) web\nC) support: Customer support, 24/7",
+   "option_lines": [
+    "A) payments: Payments team",
+    "B) web",
+    "C) support: Customer support, 24/7"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "payments",
+    "web",
+    "support"
+   ]
+  },
+  {
+   "name": "choice_bare_labels_with_descriptions",
+   "state": "只这一句",
+   "spec": {
+    "type": "choice",
+    "instructions": "Pick one",
+    "criteria": {
+     "A": "Paris",
+     "B": "Lyon"
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\n只这一句\n\nQuestion: Pick one\nOptions:\nA) Paris\nB) Lyon",
+   "option_lines": [
+    "A) Paris",
+    "B) Lyon"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "A",
+    "B"
+   ]
+  },
+  {
+   "name": "choice_labels_only",
+   "state": "只这一句",
+   "spec": {
+    "type": "choice",
+    "instructions": "选一个",
+    "criteria": {
+     "甲": null,
+     "乙": null,
+     "丙": null
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\n只这一句\n\nQuestion: 选一个\nOptions:\nA) 甲\nB) 乙\nC) 丙",
+   "option_lines": [
+    "A) 甲",
+    "B) 乙",
+    "C) 丙"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "甲",
+    "乙",
+    "丙"
+   ]
+  },
+  {
+   "name": "choice_description_repeats_id",
+   "state": "",
+   "spec": {
+    "type": "choice",
+    "instructions": "Which?",
+    "criteria": {
+     "first": "first",
+     "second": "Second one"
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\n(none)\n\nQuestion: Which?\nOptions:\nA) first\nB) second: Second one",
+   "option_lines": [
+    "A) first",
+    "B) second: Second one"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "first",
+    "second"
+   ]
+  },
+  {
+   "name": "choice_list_form",
+   "state": "record",
+   "spec": {
+    "type": "choice",
+    "instructions": "Which?",
+    "criteria": [
+     "alpha",
+     "beta",
+     "alpha",
+     "gamma"
+    ]
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nrecord\n\nQuestion: Which?\nOptions:\nA) alpha\nB) beta\nC) gamma",
+   "option_lines": [
+    "A) alpha",
+    "B) beta",
+    "C) gamma"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "alpha",
+    "beta",
+    "gamma"
+   ]
+  },
+  {
+   "name": "noul_with_criteria",
+   "state": "record",
+   "spec": {
+    "type": "noul",
+    "instructions": "Does the policy cover water damage?",
+    "criteria": {
+     "true": "Covers it",
+     "false": "Does not cover it"
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nrecord\n\nQuestion: Does the policy cover water damage?\nOptions:\nA) yes: Covers it\nB) no: Does not cover it",
+   "option_lines": [
+    "A) yes: Covers it",
+    "B) no: Does not cover it"
+   ],
+   "kinds": "noul",
+   "ids": [
+    "true",
+    "false"
+   ]
+  },
+  {
+   "name": "noul_without_criteria",
+   "state": "record",
+   "spec": {
+    "type": "noul",
+    "instructions": "Covered?"
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nrecord\n\nQuestion: Covered?\nOptions:\nA) yes\nB) no",
+   "option_lines": [
+    "A) yes",
+    "B) no"
+   ],
+   "kinds": "noul",
+   "ids": [
+    "true",
+    "false"
+   ]
+  },
+  {
+   "name": "noul_bool_alias",
+   "state": "record",
+   "spec": {
+    "type": "bool",
+    "criteria": {
+     "true": "yes, it holds",
+     "false": null
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nrecord\n\nQuestion: Which answer fits the evidence?\nOptions:\nA) yes: yes, it holds\nB) no",
+   "option_lines": [
+    "A) yes: yes, it holds",
+    "B) no"
+   ],
+   "kinds": "noul",
+   "ids": [
+    "true",
+    "false"
+   ]
+  },
+  {
+   "name": "score_levels",
+   "state": "record",
+   "spec": {
+    "type": "score",
+    "instructions": "How severe is it?",
+    "criteria": [
+     "low",
+     "medium",
+     {
+      "label": "high",
+      "level": 2
+     }
+    ]
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nrecord\n\nQuestion: How severe is it?\nOptions:\nA) 0: low\nB) 1: medium\nC) 2: {\"label\": \"high\", \"level\": 2}",
+   "option_lines": [
+    "A) 0: low",
+    "B) 1: medium",
+    "C) 2: {\"label\": \"high\", \"level\": 2}"
+   ],
+   "kinds": "score",
+   "ids": [
+    "0",
+    "1",
+    "2"
+   ]
+  },
+  {
+   "name": "score_dict_levels",
+   "state": "record",
+   "spec": {
+    "type": "score",
+    "instructions": "How severe is it?",
+    "criteria": {
+     "0": "none",
+     "10": "total"
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nrecord\n\nQuestion: How severe is it?\nOptions:\nA) 0: none\nB) 1: total",
+   "option_lines": [
+    "A) 0: none",
+    "B) 1: total"
+   ],
+   "kinds": "score",
+   "ids": [
+    "0",
+    "1"
+   ]
+  },
+  {
+   "name": "dict_state_with_long_list",
+   "state": {
+    "claims": [
+     {
+      "id": 0,
+      "status": "closed"
+     },
+     {
+      "id": 1,
+      "status": "open"
+     },
+     {
+      "id": 2,
+      "status": "closed"
+     },
+     {
+      "id": 3,
+      "status": "open"
+     },
+     {
+      "id": 4,
+      "status": "closed"
+     },
+     {
+      "id": 5,
+      "status": "open"
+     },
+     {
+      "id": 6,
+      "status": "closed"
+     },
+     {
+      "id": 7,
+      "status": "open"
+     },
+     {
+      "id": 8,
+      "status": "closed"
+     }
+    ],
+    "policy": {
+     "id": "HM-3",
+     "term": "12 months"
+    }
+   },
+   "spec": {
+    "type": "choice",
+    "instructions": "Which claim is open?",
+    "criteria": {
+     "a": "the first",
+     "b": "the second"
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\n{\"claims\": [{\"_index\": 0, \"id\": 0, \"status\": \"closed\"}, {\"_index\": 1, \"id\": 1, \"status\": \"open\"}, {\"_index\": 2, \"id\": 2, \"status\": \"closed\"}, {\"_index\": 3, \"id\": 3, \"status\": \"open\"}, {\"_index\": 4, \"id\": 4, \"status\": \"closed\"}, {\"_index\": 5, \"id\": 5, \"status\": \"open\"}, {\"_index\": 6, \"id\": 6, \"status\": \"closed\"}, {\"_index\": 7, \"id\": 7, \"status\": \"open\"}, {\"_index\": 8, \"id\": 8, \"status\": \"closed\"}], \"policy\": {\"id\": \"HM-3\", \"term\": \"12 months\"}}\n\nQuestion: Which claim is open?\nOptions:\nA) the first\nB) the second",
+   "option_lines": [
+    "A) the first",
+    "B) the second"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "a",
+    "b"
+   ]
+  },
+  {
+   "name": "empty_state",
+   "state": "",
+   "spec": {
+    "type": "choice",
+    "instructions": "Which?",
+    "criteria": {
+     "x": "ex",
+     "y": null
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\n(none)\n\nQuestion: Which?\nOptions:\nA) x: ex\nB) y",
+   "option_lines": [
+    "A) x: ex",
+    "B) y"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "x",
+    "y"
+   ]
+  },
+  {
+   "name": "unicode_state",
+   "state": "保单: 水渍与霉变，第 4 页\n\"quoted\" \\ backslash",
+   "spec": {
+    "type": "choice",
+    "instructions": "保不保?",
+    "criteria": {
+     "yes": "保",
+     "no": null
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\n保单: 水渍与霉变，第 4 页\n\"quoted\" \\ backslash\n\nQuestion: 保不保?\nOptions:\nA) yes: 保\nB) no",
+   "option_lines": [
+    "A) yes: 保",
+    "B) no"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "yes",
+    "no"
+   ]
+  },
+  {
+   "name": "six_options",
+   "state": "record",
+   "spec": {
+    "type": "choice",
+    "instructions": "Which one?",
+    "criteria": {
+     "opt0": "option number 0",
+     "opt1": "option number 1",
+     "opt2": "option number 2",
+     "opt3": "option number 3",
+     "opt4": "option number 4",
+     "opt5": "option number 5"
+    }
+   },
+   "system": "Apply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.",
+   "user": "Evidence:\nrecord\n\nQuestion: Which one?\nOptions:\nA) option number 0\nB) option number 1\nC) option number 2\nD) option number 3\nE) option number 4\nF) option number 5",
+   "option_lines": [
+    "A) option number 0",
+    "B) option number 1",
+    "C) option number 2",
+    "D) option number 3",
+    "E) option number 4",
+    "F) option number 5"
+   ],
+   "kinds": "choice",
+   "ids": [
+    "opt0",
+    "opt1",
+    "opt2",
+    "opt3",
+    "opt4",
+    "opt5"
+   ]
+  }
+ ],
+ "answers": [
+  {
+   "name": "choice_with_descriptions",
+   "spec": {
+    "type": "choice",
+    "instructions": "Which team should take it?",
+    "criteria": {
+     "payments": "Payments team",
+     "web": null,
+     "support": "Customer support, 24/7"
+    }
+   },
+   "state": "ticket: Checkout returns 500 for every customer since 09:12.\nplan: \"enterprise\"",
+   "probabilities": [
+    0.62,
+    0.31,
+    0.07
+   ],
+   "answer": {
+    "type": "choice",
+    "choice": "payments",
+    "confidence": 0.42999999999999994,
+    "probabilities": {
+     "payments": 0.62,
+     "web": 0.31,
+     "support": 0.07
+    }
+   }
+  },
+  {
+   "name": "choice_labels_only",
+   "spec": {
+    "type": "choice",
+    "instructions": "选一个",
+    "criteria": {
+     "甲": null,
+     "乙": null,
+     "丙": null
+    }
+   },
+   "state": "只这一句",
+   "probabilities": [
+    0.2,
+    0.3,
+    0.5
+   ],
+   "answer": {
+    "type": "choice",
+    "choice": "丙",
+    "confidence": 0.25,
+    "probabilities": {
+     "甲": 0.2,
+     "乙": 0.3,
+     "丙": 0.5
+    }
+   }
+  },
+  {
+   "name": "noul_below_the_floor_moves_to_it",
+   "spec": {
+    "type": "noul",
+    "instructions": "Does the policy cover water damage?",
+    "criteria": {
+     "true": "Covers it",
+     "false": "Does not cover it"
+    }
+   },
+   "state": "record",
+   "probabilities": [
+    0.55,
+    0.45
+   ],
+   "answer": {
+    "type": "noul",
+    "noul": 0.801
+   }
+  },
+  {
+   "name": "noul_above_the_floor_is_kept",
+   "spec": {
+    "type": "noul",
+    "instructions": "Does the policy cover water damage?",
+    "criteria": {
+     "true": "Covers it",
+     "false": "Does not cover it"
+    }
+   },
+   "state": "record",
+   "probabilities": [
+    0.9,
+    0.1
+   ],
+   "answer": {
+    "type": "noul",
+    "noul": 0.9
+   }
+  },
+  {
+   "name": "score_levels",
+   "spec": {
+    "type": "score",
+    "instructions": "How severe is it?",
+    "criteria": [
+     "low",
+     "medium",
+     {
+      "label": "high",
+      "level": 2
+     }
+    ]
+   },
+   "state": "record",
+   "probabilities": [
+    0.1,
+    0.2,
+    0.7
+   ],
+   "answer": {
+    "type": "score",
+    "score": 1.5999999999999999,
+    "confidence": 0.3999999999999999,
+    "legend": {
+     "0": "low",
+     "1": "medium",
+     "2": {
+      "label": "high",
+      "level": 2
+     }
+    },
+    "probabilities": {
+     "0": 0.1,
+     "1": 0.2,
+     "2": 0.7
+    }
+   }
+  },
+  {
+   "name": "score_dict_levels",
+   "spec": {
+    "type": "score",
+    "instructions": "How severe is it?",
+    "criteria": {
+     "0": "none",
+     "10": "total"
+    }
+   },
+   "state": "record",
+   "probabilities": [
+    0.25,
+    0.75
+   ],
+   "answer": {
+    "type": "score",
+    "score": 0.75,
+    "confidence": 0.5,
+    "legend": {
+     "0": "none",
+     "1": "total"
+    },
+    "probabilities": {
+     "0": 0.25,
+     "1": 0.75
+    }
+   }
+  }
+ ]
+}

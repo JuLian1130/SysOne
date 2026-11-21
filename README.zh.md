@@ -53,9 +53,10 @@ sysone serve --model h2o
 首次启动会下载权重并编译 ANE program，完成后打印 `sysone serve: ready in ...s`；之后
 再启动报 `compile 0.00s`。随时可以重跑，不会重复做已完成的事。
 
-mude 用 `--model mude`。torchcast 没有发布包：先装 vendor 附加依赖
-（`pip install -e './src[vendor]'`），再用 `--weights` 指一个带厂商
-`torchcast_decision/` 包的模型目录。
+mude 用 `--model mude`。torchcast 也没有发布包：用
+`--model torchcast --weights` 指一份本地 int8 模型目录即可。它与 h2o 走同一条 ANE 链，只
+支持全双向掩码，所以题与题之间不共享前缀；vendor 附加依赖
+（`pip install -e './src[vendor]'`）只在要把厂商自己的 torch 引擎当对拍基线时才会用到。
 
 另开一个 shell 检查：
 
@@ -75,11 +76,11 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 | 参数 | 默认 / 取值 | 含义 |
 |---|---|---|
 | `--model {h2o,mude,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
-| `--backend {split,pooled,vendor,reference}` | h2o 用 `pooled`、mude 用 `split`、torchcast 用 `vendor` | 执行路径；`reference` 是只用于测试的语义裁判 |
+| `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
 | `--weights PATH` | 自动下载 | 显式包；只读，永不下网 |
 | `--offline` | 关 | 不碰网络 |
 | `--quant {int8,fp16}` | `int8` | ANE 权重存储形态；计算始终 fp16 |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`） | 掩码；请求可覆盖 |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast `noncausal_full`） | 掩码；请求可覆盖 |
 | `--bucket N` | `1024` | ANE program 列宽 |
 | `--width N` | `16384` | GPU 缓冲宽度，也是最大输入 token 数 |
 | `--W N` | `4` | 常驻层数；`0` = 全部常驻 |
