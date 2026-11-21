@@ -13,6 +13,17 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
   GPU 上，两边重叠而不是轮流；同一个模型因此比纯 GPU 路径至少快 2.5 倍。
 - **内存不跟着模型涨。** h2o 的权重在磁盘上是 9.3 GB，跑起来只占约 0.6 GB：ANE 上只
   驻留待命的层窗口，传统推理引擎则把整份权重常驻。
+- **同一个模型，八分之一的时间。** 111 道题的基准上，h2o 用 `noncausal_full` 答完是
+  136 秒；同一台机器的 MPS 上、同一份 int8 权重，厂商自己的 torch 引擎要 1137 秒 ——
+  每题 1.2 秒对 10.2 秒。
+
+```
+111 questions, one per request, noncausal_full, h2o 4B int8
+loading excluded; one block ≈ 28 s
+
+SysOne   ANE + Metal   136.03  █████
+vendor   torch, MPS   1137.30  █████████████████████████████████████████
+```
 
 ## 环境要求
 
