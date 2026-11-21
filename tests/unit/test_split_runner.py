@@ -158,22 +158,32 @@ def test_option_plan_noul_reverses_the_prompt_order() -> None:
     assert indexes == (1, 0)
 
 
-def test_noul_criteria_do_not_change_the_code_table_prompt() -> None:
-    """noul 的判据描述随线格式进来了，但**码表读出不看它**：题面必须逐字不变。
+def test_noul_criteria_reach_the_code_table_prompt() -> None:
+    """请求给了判据，题面就用它 —— 厂商 `d3_format._noul_options` 就是这么渲染的。
 
-    这是"改协议层不许动出货路径"的那条线：划线格式时 38 道 noul 题都会多出两行判据，
-    要是 mude 跟着变，那个改动就不是只影响厂商答面了。
+    这一段曾经被刻意忽略（"改协议层不许动出货路径"），但厂商的题面本来就吃判据：不读的时候
+    带判据的 noul 题题面**全都**不一样（票据 15 §34 那 38 道真题），等于在一套厂商从没见过的
+    题面上读概率。判据顺序也照厂商：false 在前。
     """
-    bare = Question(text="要看这个文件吗？", kind="noul")
     carried = Question(
         text="要看这个文件吗？",
         options=("true: 已经送达", "false: 尚未送达"),
         kind="noul",
     )
-    assert mude.option_plan(carried) == mude.option_plan(bare)
-    assert mude.render_messages("状态", carried, mude._NOUL_TEXTS, CODES) == (
-        mude.render_messages("状态", bare, mude._NOUL_TEXTS, CODES)
-    )
+    texts, labels, indexes = mude.option_plan(carried)
+    assert texts == ("尚未送达", "已经送达")
+    assert labels == ("yes", "no")
+    assert indexes == (1, 0)
+    body = mude.render_messages("状态", carried, texts, CODES)[1]["content"]
+    assert "K000: 尚未送达\nK001: 已经送达\n" in body
+
+
+def test_noul_without_criteria_falls_back_to_the_fixed_texts() -> None:
+    """没给判据、或判据给了空串时，题面就是厂商那两句缺省的话。"""
+    empty = Question(text="要看这个文件吗？", options=("true: ",), kind="noul")
+    for question in (Question(text="要看这个文件吗？", kind="noul"), empty):
+        texts, _, _ = mude.option_plan(question)
+        assert texts == mude._NOUL_TEXTS
 
 
 def test_option_plan_refuses_a_kind_the_code_table_cannot_answer() -> None:

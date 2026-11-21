@@ -15,6 +15,7 @@ from ...weights.checkpoint import stored_quant
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan, WeightPlan
 from ..registry import register_family
+from ..vendors.base import question_spec
 from . import qwen35
 
 # `d3_runtime.py` 的 MAX_OPTIONS；readout 表是 [255, hidden]。
@@ -76,7 +77,9 @@ PREFIX_SENTINEL = "\u0001\u0002mude-prefix\u0002\u0001"
 _EMPTY_STATE = "(empty)"
 _DEFAULT_INSTRUCTIONS = "Choose the best matching option."
 _CLOSING_LINE = "Reply with only the code of the best option."
-# noul 题渲染成厂商那两句固定的判据，顺序是 false 在前。
+# noul 的判据缺省（厂商 `d3_format.NOUL_DESCRIPTIONS`）：请求没给判据时题面就写这两句。
+# 键的顺序是 false 在前，与厂商 `_NOUL_KEYS` 一致。
+_NOUL_KEYS = ("false", "true")
 _NOUL_TEXTS = ("No / false", "Yes / true")
 
 
@@ -106,10 +109,17 @@ def option_plan(question: Question) -> tuple[tuple[str, ...], tuple[str, ...], t
     沿用既有的 ("yes", "no")，所以序号反着放。
 
     `question.options` 是选项行冒号后面的那一段——线格式里它是 `key`（描述缺省）或
-    `key: description`，由协议层拼好再进来；这里只负责加码前缀，不再拆 key。
+    `key: description`，由协议层拼好再进来；`question_spec` 按第一个 `": "` 拆回厂商线格式
+    的那两个字段，因为厂商的 `_noul_options` 是**按键取**判据的，不看行的次序。
     """
     if question.kind == "noul":
-        return _NOUL_TEXTS, ("yes", "no"), (1, 0)
+        # 厂商 `_noul_options`：给了判据就用它，没给（或给了空串）才落回那两句固定的话；
+        # 顺序永远是 false 在前。判据描述会原样进题面，丢一次就与厂商逐字不同。
+        given = question_spec(question)["criteria"]
+        texts = tuple(
+            given.get(key) or fallback for key, fallback in zip(_NOUL_KEYS, _NOUL_TEXTS)
+        )
+        return texts, ("yes", "no"), (1, 0)
     if question.kind != "choice":
         # 码表读出没有 score 的档位模板（`d3_format` 不给 score）：硬按 choice 读会拿
         # 两套不同的题面比概率。明确拒绝，让客户端知道这不是它重试能解决的。
