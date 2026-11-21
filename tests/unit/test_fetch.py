@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,14 +23,18 @@ SOURCE = WeightsSource(
 
 
 class Recorder:
-    """假下载器：按文件清单写小文件，记录调用次数。"""
+    """假下载器：按文件清单写小文件，记录调用次数与最近一次收到的清单和落点。"""
 
     def __init__(self, *, fail: bool = False) -> None:
         self.calls = 0
         self.fail = fail
+        self.files: tuple[str, ...] = ()
+        self.destination: Path | None = None
 
     def __call__(self, source: WeightsSource, destination: Path) -> None:
         self.calls += 1
+        self.files = tuple(source.files)
+        self.destination = destination
         if self.fail:
             raise OSError("network down")
         destination.mkdir(parents=True, exist_ok=True)
@@ -94,6 +99,51 @@ def test_revision_change_forces_a_download(tmp_path: Path) -> None:
     assert fresh.calls == 1
     marker = json.loads((target / MARKER_NAME).read_text(encoding="utf-8"))
     assert marker["revision"] == "rev-b"
+
+
+def test_a_file_added_to_the_manifest_is_fetched_into_the_existing_directory(
+    tmp_path: Path,
+) -> None:
+    """清单只是多出文件时（补两个厂商参考文件）只下那几份，不整份重下。"""
+    target = ensure_weights(SOURCE, tmp_path, download=Recorder())
+
+    grown = replace(SOURCE, files=(*SOURCE.files, "d3_format.py"))
+    additions = Recorder()
+    assert ensure_weights(grown, tmp_path, download=additions) == target
+
+    assert additions.calls == 1
+    assert additions.files == ("d3_format.py",)  # 只下新的那一份
+    assert additions.destination == target  # 就地补，不落到新的 partial
+    assert (target / "d3_format.py").is_file()
+    marker = json.loads((target / MARKER_NAME).read_text(encoding="utf-8"))
+    assert set(marker["files"]) == set(grown.files)
+
+
+def test_a_damaged_or_removed_entry_still_redownloads_everything(tmp_path: Path) -> None:
+    """已记录的文件坏了、或清单少了条目，就不是"只增"，整份重下。"""
+    target = ensure_weights(SOURCE, tmp_path, download=Recorder())
+    (target / "model.safetensors").write_text("longer than before", encoding="utf-8")
+    grown = replace(SOURCE, files=(*SOURCE.files, "d3_format.py"))
+
+    damaged = Recorder()
+    ensure_weights(grown, tmp_path, download=damaged)
+    assert damaged.destination is not None
+    assert damaged.destination.name.endswith(".partial")
+
+    # 清单少了条目：旧目录里多出来的那个文件不在清单里，旧目录不再可信
+    shrunk = Recorder()
+    ensure_weights(replace(SOURCE, files=("config.json",)), tmp_path, download=shrunk)
+    assert shrunk.destination is not None
+    assert shrunk.destination.name.endswith(".partial")
+
+
+def test_offline_never_takes_the_additions_path(tmp_path: Path) -> None:
+    """离线 + 只缺新增的那几份：按离线报错，不借口"只补几份"去联网。"""
+    ensure_weights(SOURCE, tmp_path, download=Recorder())
+    grown = replace(SOURCE, files=(*SOURCE.files, "d3_format.py"))
+
+    with pytest.raises(DownloadError):
+        ensure_weights(grown, tmp_path, offline=True, download=_never)
 
 
 def test_offline_without_weights_says_how_to_download_them(tmp_path: Path) -> None:

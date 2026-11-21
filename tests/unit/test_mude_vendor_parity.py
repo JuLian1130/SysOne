@@ -1,14 +1,15 @@
 """mude 的题面与答面逐字节等于厂商那次渲染 —— 金标由厂商模块生成一次。
 
-`d3_format.py` / `d3_runtime.py` 随 checkpoint 发布，既不在仓库里也不在下载清单里，所以这里不
-import 它们：`tests/fixtures/mude_vendor_prompts.json` 是把它们跑一次存下来的结果。每个用例带
-三样东西 —— 请求里的那道题、厂商 `d3_format.messages()` 渲染出的整段轮次、以及把一组概率喂给
-`d3_runtime.product_answer()` 得到的答面 —— 这里用出货路径（协议层 → `option_plan` →
-`render_messages` / `_answer_object`）重算并逐字节比。
+`d3_format.py` / `d3_runtime.py` 是随 checkpoint 发布的厂商文件（在下载清单里，但推理路径不读
+它们），所以这里不 import：`tests/fixtures/mude_vendor_prompts.json` 是把它们跑一次存下来的
+结果。每个用例带三样东西 —— 请求里的那道题、厂商 `d3_format.messages()` 渲染出的整段轮次、
+以及把一组概率喂给 `d3_runtime.product_answer()` 得到的答面 —— 这里用出货路径（协议层 →
+`option_plan` → `render_messages` / `_answer_object`）重算并逐字节比。
 
 以前的对账是自指的：金标用**我们自己的**渲染器生成，只能证明"我们的渲染没变过"，证明不了
 "等于厂商"，所以题面丢判据、score 被拒、置信度另算这三件事一条都没红。换 checkpoint（码表变
-了）或厂商改题面/答面时，重跑一次厂商模块重新生成那份 fixture（见它的 `source` 字段）。
+了）或厂商改题面/答面时，用权重目录里那两个文件重跑一次、重新生成那份 fixture（见它的
+`source` 字段）。
 """
 
 from __future__ import annotations

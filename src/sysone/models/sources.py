@@ -44,6 +44,11 @@ SOURCES: dict[str, WeightsSource] = {
             "tokenizer.json",
             "tokenizer_config.json",
             "chat_template.jinja",
+            # 厂商自己的题面/答面定义。推理路径不跑它们，但
+            # `tests/fixtures/mude_vendor_prompts.json` 是用这两个文件生成的 —— 随权重一起
+            # 下，换 checkpoint 后"重新生成 fixture"才不用另找来源（合计不到 100 KB）。
+            "d3_runtime.py",
+            "d3_format.py",
             "LICENSE",
             "NOTICE",
             "LICENSES/Apache-2.0.txt",

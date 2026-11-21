@@ -4,6 +4,10 @@
 算内容哈希 —— 9 GB 读一遍正是"第二次启动"要省掉的那一段，而修订已经固定，文件由
 Hugging Face 的 etag 保证。
 
+清单**只会多出文件**（例如补两个厂商参考文件）。那种情况走"只补缺的那几份"，补进现有
+目录再重写 marker：为两个 100 KB 的文件整份重下 4 GB，是改一行清单不该有的代价。修订换了、
+已记录的文件坏了、或者清单少了条目，仍然整份重下 —— 那几种情况下目录里的东西不再可信。
+
 下载走 `snapshot_download`（与 `hf download` 同一条路径），先落临时目录，写完
 marker 再换入正式目录；换入前的中间态也有恢复路径，崩溃不会把一份旧权重变成半份新权重。
 """
@@ -16,6 +20,7 @@ import shutil
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from ..errors import DownloadError
@@ -43,7 +48,8 @@ def ensure_weights(
     """返回 `<root>/<source.directory>`；本地齐全就直接用，否则下载。
 
     `download` 只为测试注入：生产路径用 `_snapshot`。`offline=True` 时缺权重直接抛
-    `DownloadError`，并把可复制的 `hf download` 命令写进 context。
+    `DownloadError`，并把可复制的 `hf download` 命令写进 context。清单里只是多出几项时
+    只补那几项，不整份重下。
     """
     weights_root = Path(root)
     target = weights_root / source.directory
@@ -65,6 +71,11 @@ def ensure_weights(
                 command=manual_command(source, target),
                 hint=MANUAL_HINT,
             )
+        # 清单只是多出文件（例如补两个厂商参考文件）：补进现有目录，不整份重下。
+        awaited = _additions(target, source)
+        if awaited:
+            _fetch_additions(source, awaited, target, download)
+            return target
         partial = _partial(target)
         shutil.rmtree(partial, ignore_errors=True)
         print(
@@ -113,6 +124,76 @@ def manual_command(source: WeightsSource, target: Path) -> str:
         f"hf download {source.repo_id} --revision {source.revision} "
         f"{files} --local-dir {target}"
     )
+
+
+def _additions(target: Path, source: WeightsSource) -> tuple[str, ...]:
+    """清单里只是多出文件时，返回要补的那几个；其他任何不一致都返回空元组。
+
+    判据与 `_complete` 同源：仓库与修订对上、已记录的文件都还在且字节数没变、并且清单是
+    已记录集合的**超集**（只增不减）。这样"给清单补两个厂商参考文件"不用把 4 GB 重下一遍；
+    修订换了、文件坏了、清单删了条目都仍然整份重下 —— 那时目录里的旧文件不再可信。
+    """
+    marker = _read_marker(target)
+    if marker is None:
+        return ()
+    if marker.get("repo_id") != source.repo_id or marker.get("revision") != source.revision:
+        return ()
+    recorded = marker.get("files")
+    if not isinstance(recorded, dict):
+        return ()
+    if not set(recorded) <= set(source.files):
+        return ()
+    awaited = tuple(name for name in source.files if name not in recorded)
+    if not awaited:
+        return ()
+    for name, expected in recorded.items():
+        try:
+            if (target / name).stat().st_size != int(expected):
+                return ()
+        except (OSError, TypeError, ValueError):
+            return ()
+    return awaited
+
+
+def _fetch_additions(
+    source: WeightsSource, awaited: tuple[str, ...], target: Path,
+    download: Downloader | None,
+) -> None:
+    """把缺的那几个文件补进现有目录，再按全量清单重写 marker。
+
+    失败不清理目录里已有的文件：marker 还是旧的，下一次启动会原样再算出同一份 `awaited`，
+    幂等重试 —— 比整份下载那条"删掉 partial 重来"的路更适合就地补文件。
+    """
+    print(f"weights: adding {len(awaited)} file(s) to {target}", file=sys.stderr)
+    only = replace(source, files=awaited)
+    try:
+        (download or _snapshot)(only, target)
+    except DownloadError:
+        raise
+    except Exception as exc:  # 与整份下载同一套归错
+        raise DownloadError(
+            "权重补下载失败",
+            repo_id=source.repo_id,
+            revision=source.revision,
+            directory=str(target),
+            files=list(awaited),
+            error=f"{type(exc).__name__}: {exc}",
+            command=manual_command(source, target),
+            hint=MANUAL_HINT,
+        ) from exc
+    missing = [name for name in awaited if not (target / name).is_file()]
+    if missing:
+        raise DownloadError(
+            "补下载结束后仍缺少文件",
+            repo_id=source.repo_id,
+            revision=source.revision,
+            directory=str(target),
+            missing=missing,
+            command=manual_command(source, target),
+            hint=MANUAL_HINT,
+        )
+    _write_marker(target, source)
+    print(f"weights: ready {target}", file=sys.stderr)
 
 
 def _snapshot(source: WeightsSource, destination: Path) -> None:
