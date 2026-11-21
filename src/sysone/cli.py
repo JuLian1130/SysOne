@@ -127,6 +127,11 @@ def _model_flags() -> argparse.ArgumentParser:
              "计算始终 fp16 —— ANE 没有 int8 MAC",
     )
     common.add_argument("--attention-mode", default=None, help="causal / noncausal_full / prefix_noncausal")
+    common.add_argument(
+        "--batch", type=int, default=None, metavar="N",
+        help="一个 pass 最多装几条请求（默认取 scheduler.batch=4；0/1 = 不攒批）。"
+             "它只是策略上限：形状放不放得下由执行器判，装不下静默退回逐条",
+    )
     common.add_argument("--debug-timings", action="store_true", help="返回分阶段耗时")
     common.add_argument("--bucket", type=int, default=0,
                         help="split / pooled：ANE program 的列宽（默认 1024）")
@@ -492,6 +497,18 @@ def _vision_report(
     return report
 
 
+def _scheduler(
+    args: argparse.Namespace, mode: MaskMode | None, *, max_len: int | None = None
+) -> SchedulerConfig:
+    """把 CLI 的调度旋钮折成 `SchedulerConfig`：默认值仍只有 dataclass 那一个来源。"""
+    default = SchedulerConfig()
+    return SchedulerConfig(
+        attention_mode=mode,
+        max_len=default.max_len if max_len is None else int(max_len),
+        batch=default.batch if args.batch is None else int(args.batch),
+    )
+
+
 def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
     """按后端装配引擎：参考后端（M0 语义裁判）或 mude/h2o 的 Apple 链。"""
     backend = _resolve_backend(args)
@@ -535,7 +552,7 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
         descriptor = assembled.descriptor
         config = EngineConfig(
             model=ModelSelection(name=weights.name, dir=weights),
-            scheduler=SchedulerConfig(attention_mode=mode, max_len=width),
+            scheduler=_scheduler(args, mode, max_len=width),
             storage=StorageConfig(artifacts_dir=artifacts, weights_dir=weights_root),
             service=ServiceConfig(debug_timings=bool(args.debug_timings)),
         )
@@ -559,7 +576,7 @@ def _build_engine(args: argparse.Namespace, mode: MaskMode | None) -> Engine:
     descriptor = ModelDescriptor.from_mapping(_load_json(args.descriptor))
     config = EngineConfig(
         model=ModelSelection(name=args.weights.name, dir=args.weights),
-        scheduler=SchedulerConfig(attention_mode=mode),
+        scheduler=_scheduler(args, mode),
         service=ServiceConfig(debug_timings=bool(args.debug_timings)),
     )
     config.validate()

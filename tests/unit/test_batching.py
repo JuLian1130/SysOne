@@ -138,6 +138,27 @@ def test_the_runner_ceiling_caps_the_configured_batch() -> None:
     assert engine.batch_limit == 2
 
 
+def test_the_batch_route_still_checks_the_models_supported_modes() -> None:
+    """批那条路不经过 `answers_for` 的读法门，但引擎自己按描述符挡一次。
+
+    h2o 只训练/声明了 causal 与 noncausal_full；把 `prefix_noncausal` 塞进批必须当场拒绝，
+    而不是算出一个"看起来正常"的答案（`PooledRunner.answers_for` 的那道门不在批入口上）。
+    """
+    from sysone.config import EngineConfig, ModelSelection
+    from sysone.errors import UnsupportedModeError
+
+    engine = Engine.__new__(Engine)
+    engine._runner = _FakeRunner()                  # noqa: SLF001
+    engine._config = EngineConfig(model=ModelSelection(name="m", dir="."))  # noqa: SLF001
+    engine._descriptor = type("D", (), {            # noqa: SLF001
+        "supported_modes": frozenset({MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL}),
+        "trained_modes": frozenset({MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL}),
+        "default_mode": MaskMode.CAUSAL, "family": "h2o", "quant": "int8", "model_id": "h",
+    })()
+    with pytest.raises(UnsupportedModeError):
+        engine.batch([_request("a", mode=MaskMode.PREFIX_NONCAUSAL)])
+
+
 # ---------------------------------------------------------------- 攒批器
 
 

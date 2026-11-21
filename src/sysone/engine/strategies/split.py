@@ -15,7 +15,7 @@ from typing import Callable, Protocol, Sequence
 from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest, Question
 from ...domain.work import CompilationTimes
-from .decision import DecisionRunner, Encoded
+from .decision import MIN_SLOT, DecisionRunner, Encoded
 from .vision import VisionRunner
 from ...errors import (
     ConfigError,
@@ -23,11 +23,6 @@ from ...errors import (
     ReadoutError,
 )
 from ...models.families.mude import confidence as mude_confidence
-
-# 块对角的一条序列至少占一槽，而槽宽是注意力 query 块（`devices/apple/pipeline.py` 的
-# `AT_BM` = 128）的整数倍 —— 所以一趟缓冲最多并排 `width // 128` 条序列。那个数不 import：
-# 这个模块在没有 Metal 的环境里也要能 import（设备层的 import 都在 `mude_runner` 里）。
-_MIN_SLOT = 128
 
 # 预热用的题：真正的冷启动失败（program 没装上、面没绑好）在第一题就会炸，
 # 这一题让它在 `Engine.start()` 里就炸，而不是让第一道真实请求撞上。
@@ -95,7 +90,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
 
     @property
     def batch_limit(self) -> int:
-        """一个 pass 最多装几条请求：缓冲宽度 ÷ 最短槽宽（`_MIN_SLOT`）。
+        """一个 pass 最多装几条请求：缓冲宽度 ÷ 最短槽宽（`MIN_SLOT`）。
 
         这是**形状**上限 —— `run_batched` 一条序列至少占一槽、槽宽按 128 向上取整，所以条数
         不会超过 `width // 128`；它不保证这一批真能合上（每条还要 ≤ 桶宽、打包区要装得下），
@@ -103,7 +98,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
         """
         if not (self.supports_shared or self.supports_batch):
             return 1
-        return max(1, self._max_len // _MIN_SLOT)
+        return max(1, self._max_len // MIN_SLOT)
 
     def __init__(
         self,

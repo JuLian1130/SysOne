@@ -329,15 +329,21 @@ def test_batch_capability_follows_the_chain_primitive():
     assert runner(chain=FloatBatchedChain()).supports_batch is False
 
 
-def test_the_batch_primitive_does_not_turn_batching_on():
-    """原语到位 ≠ 默认开：`batch_limit` 仍是 1，引擎据此不攒批、也不把单条送进批路。
+def test_batch_limit_reports_the_shape_cap_only_with_the_primitive():
+    """形状上限 = 缓冲宽 ÷ 128，与 mude 同一个算法；没有原语时给 1，别让引擎白攒一趟必退的批。
 
-    真要对 h2o 开合批，改的是这个上限（且先补"垫列钳位之后连跑 N 遍"的形状矩阵回归），
-    不是 `supports_batch`。
+    真正开不开、一次几条，由服务层的 `--batch` 与这里取小（`Engine.batch_limit`，见
+    `tests/unit/test_batching.py`）：`--batch 1` 就是关掉。
     """
-    subject = runner(chain=BatchedChain(), max_len=16384)
-    assert subject.batch_limit == 1
-    assert subject.decision_stats()["supports_batch"] is True
+    wide = runner(chain=BatchedChain(), max_len=16384)
+    assert wide.batch_limit == 128
+    assert wide.decision_stats()["supports_batch"] is True
+
+    narrow = runner(chain=BatchedChain(), max_len=1024)
+    assert narrow.batch_limit == 8, "形状上限随缓冲宽走"
+
+    assert runner().batch_limit == 1, "没有块对角原语的链报 1"
+    assert runner(chain=FloatBatchedChain(), max_len=16384).batch_limit == 1, "numpy 形态也报 1"
 
 
 def test_two_independent_requests_share_one_pass():
@@ -381,12 +387,50 @@ def test_a_chain_without_the_batch_primitive_goes_serial():
     assert subject.decisions.batch_fallback == 1 and subject.decisions.batch_hit == 0
 
 
-def test_a_shared_prefix_wins_over_block_diagonal():
-    """两条请求 state 相同：共享前缀那条更便宜，不该按块对角排。"""
+def test_identical_requests_go_block_diagonal_while_the_boundary_is_undeclared():
+    """两条**完全相同**的请求也不再走跨请求共享：h2o 给不出前缀边界，LCP 证明不了那段是 state。
+
+    mude 声明 int 边界，所以它的同 state 跨请求仍然共享
+    （`test_decision_runner.py::test_a_batch_with_one_prefix_shares_it_across_requests`）。h2o 上
+    少掉的那点机会（两条逐字节相同、且在同一个攒批窗口里到达）本来就是已判定的非目标。
+    """
     chain = BatchedChain()
     subject = runner(chain=chain, max_len=16384)
     same = make_request(questions=1, state="same record")
     subject.answers_batch((same, same), MaskMode.CAUSAL)
+    assert chain.shared_calls == []
+    assert len(chain.batched_calls) == 1
+
+
+def test_a_template_prefix_does_not_hijack_a_cross_request_batch():
+    """两条不同 state 的请求只有开头相同（模板/共同词）：跨请求不能因此走共享尾巴相。
+
+    h2o 的 `prefix_len` 恒为 `None`，`shared_prefix` 只能退到 LCP；聊天模板让每条 prompt 的开头
+    都一样，但那几十个 token 不是 state。放它过去，每条多请求批都会抢在块对角之前走共享尾巴相
+    （尾巴超桶时就是逐条串行），还把 `batch_hit` 记成命中。跨请求只认**声明**的边界。
+    """
+    from sysone.engine.strategies.decision import shared_prefix
+
+    chain = BatchedChain()
+    subject = runner(chain=chain, max_len=16384)
+    first = make_request(questions=1, state="record alpha")
+    second = make_request(questions=1, state="record omega")
+    encoded = [subject.encode(first.state, q) for q in first.questions]
+    encoded += [subject.encode(second.state, q) for q in second.questions]
+    assert shared_prefix(encoded) is not None, "构造：这两条 prompt 确实有公共开头"
+
+    subject.answers_batch((first, second), MaskMode.CAUSAL)
+    assert chain.shared_calls == [], "跨请求不该拿 LCP 抢共享那条"
+    assert len(chain.batched_calls) == 1, "应该去试块对角"
+
+
+def test_a_folded_single_request_still_shares_inside_the_batch_route():
+    """引擎把单条折进批入口时，请求内的共享不能丢 —— 那条前缀按构造就是 state。
+
+    这条钉住 Stage 3 的 3.26×：`batch_limit > 1` 之后 h2o 的每条请求都从 `answers_batch` 进来。
+    """
+    chain = BatchedChain()
+    subject = runner(chain=chain, max_len=16384)
+    subject.answers_batch((two_question_request(),), MaskMode.CAUSAL)
+    assert len(chain.shared_calls) == 1, "单条多题仍要走共享前缀"
     assert chain.batched_calls == []
-    assert chain.shared_calls, "同前缀应该走共享那条"
-    assert subject.decisions.batch_hit == 1

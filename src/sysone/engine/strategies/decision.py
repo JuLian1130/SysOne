@@ -44,6 +44,11 @@ from ...domain.decision import Answer, DecisionRequest, Question
 from ...errors import ConfigError, RequestTooLongError, UnsupportedMediaError
 from ...models.vision import merge
 
+# 块对角的一条序列至少占一槽，而槽宽是注意力 query 块（`devices/apple/pipeline.py` 的
+# `AT_BM` = 128）的整数倍 —— 所以一趟缓冲最多并排 `width // 128` 条序列。这个数不 import
+# 设备层：策略模块在没有 Metal 的环境里也要能 import。两个 runner 的 `batch_limit` 都用它。
+MIN_SLOT = 128
+
 
 @dataclass(frozen=True)
 class Encoded:
@@ -251,7 +256,15 @@ class DecisionRunner:
             encoded.extend(own)
             kinds.extend(question.kind for question in request.questions)
             spans.append((first, len(encoded)))
-        shared = shared_prefix(encoded) if use_prefix else None
+        # 跨请求共享要求模型**声明**前缀边界（`prefix_len` 是 int）。LCP 兜底分不清"同一个
+        # state"与"同一段聊天模板"：实测 h2o 两条不同请求的 LCP 只有 38–39 个 token（占 prompt
+        # 5%），而请求内部是 95%。放它过去会让每条多请求批都抢在块对角前面走共享尾巴相 ——
+        # 那条相在尾巴超桶时是逐条串行，等于白跑一遍前缀，还把 `batch_hit` 记成命中。
+        # 请求内部（`len(requests) == 1`，所有题共用一个 state）仍接受 LCP：那里的前缀按构造
+        # 就是 state。mude 声明 int，两条路都不受影响。
+        declared = all(item.prefix_len is not None for item in encoded)
+        sharing = use_prefix and (declared or len(requests) == 1)
+        shared = shared_prefix(encoded) if sharing else None
         answers: list[Answer] | None = None
         if shared is not None and len(encoded) > 1 and self.supports_shared:
             self.decisions.batch_hit += 1

@@ -32,7 +32,7 @@ from ...domain.work import CompilationTimes
 from ...errors import ConfigError, NotReadyError, UnsupportedModeError
 from ...models.vendors.base import question_spec
 from ...models.vendors.h2o_serve import Prepared, Serve
-from .decision import DecisionRunner, Encoded
+from .decision import MIN_SLOT, DecisionRunner, Encoded
 from .vision import VisionRunner
 
 # h2o 训练过两种读法、也只声明了两种：整段因果，或整段双向（没有 prefix 语义）。
@@ -66,10 +66,9 @@ class PooledRunner(VisionRunner, DecisionRunner):
     题数与能力位决定，这里只提供原语 —— `encode`（厂商答面渲染）、`forward`（末行 hidden）、
     `forward_shared`（前缀一遍 + 每条尾巴的末行）、`answer`（标签行 × hidden 交回厂商）。
 
-    跨请求合批的**原语**已接（`forward_batched` → `last_hidden_batched`），但**策略默认关闭**：
-    `batch_limit` 仍是基类的 1，所以引擎既不攒批、也不把单条送进批路。理由与形状无关的那一半
-    才是结构性的（每条序列 ≤ 桶宽，见 `Pipeline.run_batched`）；收益那一半取决于真实输入分布在
-    不在可打包长度带上，样本语料给不出结论（`docs/sysone/decision-runner.md` Stage 4）。
+    跨请求合批与 mude 走**同一套编排与同两条上限**：`batch_limit` 报形状上限（缓冲宽 ÷ 128），
+    策略上限是服务层的 `--batch`（默认 4），两边取小。合不合得上仍由设备层判 —— 每条序列要
+    ≤ 桶宽、槽宽要整除桶宽、打包区要装得下，装不下就静默退回逐条（`Pipeline._slot_layout`）。
     """
 
     @property
@@ -80,12 +79,28 @@ class PooledRunner(VisionRunner, DecisionRunner):
         的落脚点（`can_share_prefix` 为假）。声明了却调不到是一条 500；退回串行只是一次没有
         收益的前向。声明也不等于每次都走：装不下、带图、单条都按原样退回逐题。
 
-        **这一位不决定默认开关**：`batch_limit` 仍是基类的 1。真要对 h2o 开合批，改的是那个上限
-        （以及先补齐"V 侧钳位之后连跑 N 遍"的形状矩阵回归），不是这里。
+        这一位只回答"有没有原语"；**开不开、一次装几条**由 `batch_limit`（形状上限）与服务层
+        `--batch`（策略上限）共同决定，两边由 `Engine.batch_limit` 取小。
         """
         chain = self._chain
         return (callable(getattr(chain, "last_hidden_batched", None))
                 and bool(getattr(chain, "can_share_prefix", False)))
+
+    @property
+    def batch_limit(self) -> int:
+        """一个 pass 最多装几条请求：缓冲宽度 ÷ 最短槽宽（`MIN_SLOT`）。
+
+        与 `SplitRunner` 同一个算法，是**形状**上限：`run_batched` 一条序列至少占一槽、槽宽按
+        128 向上取整，所以条数不会超过 `width // 128`。它不保证这一批真能合上 —— 每条还要
+        ≤ 桶宽、槽宽要整除桶宽，那由 `forward_batched` 判（判据不在这里抄第二份）。
+
+        真正的**策略**上限是服务层的 `--batch`（`SchedulerConfig.batch`），两边由
+        `Engine.batch_limit` 取小；`--batch 1` 就是关掉。链没有块对角原语时这里给 1，别让引擎
+        白攒一趟必退回的批。
+        """
+        if not self.supports_batch:
+            return 1
+        return max(1, self._max_len // MIN_SLOT)
 
     def __init__(
         self,

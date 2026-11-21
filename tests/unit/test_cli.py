@@ -180,6 +180,21 @@ def test_a_backend_that_contradicts_the_family_is_refused(capsys) -> None:
     assert payload["context"]["strategy"] == "vendor"
 
 
+def test_batch_flag_folds_into_the_scheduler_config() -> None:
+    """`--batch` 只是覆盖 `SchedulerConfig.batch` 的默认值，默认值仍只有 dataclass 一个来源。"""
+    from sysone.cli import _build_parser, _scheduler
+
+    def scheduler(*argv: str):
+        args = _build_parser().parse_args(["run", "--input", "x", *argv])
+        return _scheduler(args, None, max_len=4096)
+
+    assert scheduler().batch == 4, "不给就是 scheduler 的默认值"
+    assert scheduler().max_len == 4096
+    assert scheduler("--batch", "2").batch == 2
+    assert scheduler("--batch", "1").batch == 1, "1 = 不攒批"
+    assert scheduler("--batch", "0").batch == 0, "0 也当不攒批（引擎会再取 max(1, …)）"
+
+
 def test_backend_is_inferred_from_the_weights_package(tmp_path: Path) -> None:
     """没给 --model 时按必需件认家族：mude 带 decision_config.json，h2o 带 serve_config.json。"""
     (tmp_path / "decision_config.json").write_text("{}", encoding="utf-8")

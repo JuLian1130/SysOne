@@ -83,6 +83,7 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 | `--bucket N` | `1024` | ANE program 列宽 |
 | `--width N` | `16384` | GPU 缓冲宽度，也是最大输入 token 数 |
 | `--W N` | `4` | 常驻层数；`0` = 全部常驻 |
+| `--batch N` | `4` | 一个 pass 最多装几条请求；`1` 表示不攒批 |
 | `--artifacts PATH` | 平台缓存 | 编译产物落点 |
 | `--descriptor PATH` | — | 语义裁判的 descriptor（只配 `--backend reference`） |
 | `--debug-timings` | 关 | 每个回包加分阶段耗时 |

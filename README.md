@@ -90,6 +90,7 @@ optional.
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `16384` | GPU buffer width, also the max input tokens |
 | `--W N` | `4` | resident layers; `0` keeps all of them |
+| `--batch N` | `4` | requests packed into one pass; `1` turns batching off |
 | `--artifacts PATH` | platform cache | compiled artifact root |
 | `--descriptor PATH` | — | semantic-judge descriptor (`--backend reference` only) |
 | `--debug-timings` | off | add per-stage timings to each answer |
