@@ -19,8 +19,10 @@ Both models answer `choice`, `noul` and `score` questions.
 ## Requirements
 
 - Apple Silicon (M1 or newer) on macOS 14 or newer.
-- 8 GB of memory or more; the weights are read from disk on demand, not
-  loaded whole.
+- 8 GB of memory or more. The weights are memory-mapped, and only the resident
+  layer window (`--W`, four layers by default) is held on the ANE: a running h2o
+  service sits at about 0.6 GB. `--W 0` keeps all 32 layers resident and needs
+  about 4.5 GB.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
 - Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus about 4 GiB

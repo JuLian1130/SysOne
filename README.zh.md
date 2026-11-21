@@ -19,7 +19,8 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
 ## 环境要求
 
 - Apple Silicon（M1 或更新），macOS 14 或更新。
-- 8 GB 或更多内存；权重按需从磁盘读，不会整体载入。
+- 8 GB 或更多内存。权重按需 mmap，ANE 上只驻留待命的层窗口（`--W`，默认 4 层）：跑起来
+  的 h2o 服务约占 0.6 GB；`--W 0` 把 32 层全部常驻，约需 4.5 GB。
 - arm64 Python 3.11 或更新。
 - Xcode Command Line Tools（`xcode-select --install`），`clang` 需要它。
 - 磁盘：h2o 权重约 9.3 GB、mude 约 4 GB，另加约 4 GiB 编译产物。权重在首次使用时下载。
