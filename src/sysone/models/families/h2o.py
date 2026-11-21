@@ -9,6 +9,7 @@ from ...domain.attention import MaskMode
 from ...weights.checkpoint import stored_quant
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan, WeightPlan
+from ..recipe import PooledRecipe
 from ..registry import register_family
 from . import qwen35
 
@@ -62,5 +63,18 @@ def weight_plan(model_dir: Path) -> WeightPlan:
     )
 
 
+def open_serve(model_dir: str | Path, tokenizer: object | None = None) -> object:
+    """厂商答面：题面渲染、按题型换温度、noul 的地板与阈值、判答全在它里面。
+
+    惰性 import：`h2o_serve` 会拖进厂商的 shim 模块，注册家族时不该付这笔开销。
+    """
+    from ..vendors.h2o_serve import Serve
+
+    return Serve.open(model_dir, tokenizer)
+
+
+# 交给 pooled 策略的接入件。形状与张量前缀仍由 `weight_plan` 给，两者各管一半。
+RECIPE = PooledRecipe(serve=open_serve)
+
 register_family("h2o", parse_config, build_layer_plan,
-                strategy="pooled", weight_plan=weight_plan, source=__name__)
+                strategy="pooled", weight_plan=weight_plan, recipe=RECIPE, source=__name__)

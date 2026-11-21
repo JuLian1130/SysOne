@@ -95,7 +95,9 @@ def runner(*, last=(0.0, 0.0, 0.0, 1.0), max_len: int = 64, chain=None, serve_ov
         subject = Serve(CONFIG, _TailShim(), FakeTokenizer())
     else:
         subject = serve_override
-    runner = PooledRunner(lambda: chain, subject, rows_by_label, max_len=max_len)
+    runner = PooledRunner(lambda: chain, subject, rows_by_label,
+                          supported_modes=frozenset({MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL}),
+                          max_len=max_len)
     if loaded:
         runner.load_weights()
     return runner

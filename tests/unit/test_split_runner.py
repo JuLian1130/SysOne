@@ -21,6 +21,7 @@ from sysone.domain.work import CompilationTimes
 from sysone.engine.engine import Engine
 from sysone.engine.strategies.decision import DecisionMetrics
 from sysone.engine.strategies.split import SplitRunner
+from sysone.models.families.mude import confidence as mude_confidence
 from sysone.errors import (
     ConfigError,
     NotReadyError,
@@ -124,7 +125,7 @@ def _runner(
     chain: FakeChain, *, max_len: int = 4096, tokenizer: FakeTokenizer | None = None
 ) -> SplitRunner:
     prompter, _ = _prompter(tokenizer)
-    return SplitRunner(lambda: chain, prompter, max_len=max_len)
+    return SplitRunner(lambda: chain, prompter, confidence=mude_confidence, max_len=max_len)
 
 
 def _engine(chain: FakeChain, config: EngineConfig | None = None, *, max_len: int = 4096) -> Engine:
@@ -572,7 +573,8 @@ class ScriptedPrompter:
 
 
 def _forced_runner(plans, chain: FakeChain, *, max_len: int = 4096) -> SplitRunner:
-    return SplitRunner(lambda: chain, ScriptedPrompter(plans), max_len=max_len)
+    return SplitRunner(lambda: chain, ScriptedPrompter(plans),
+                       confidence=mude_confidence, max_len=max_len)
 
 
 def test_two_questions_with_one_state_share_the_prefix() -> None:
@@ -782,7 +784,8 @@ def test_a_single_sequence_through_the_batch_route_counts_as_a_miss() -> None:
 def test_images_are_refused_by_a_model_without_a_tower() -> None:
     """没有视觉塔的装配收到图：当场拒（422 那一类），不能变成"占位符数不对"的裸 ValueError。"""
     chain = FakeChain()
-    runner = SplitRunner(lambda: chain, _prompter()[0], max_len=4096)      # 没给 image_token_id
+    runner = SplitRunner(lambda: chain, _prompter()[0], confidence=mude_confidence,
+                         max_len=4096)      # 没给 image_token_id
     runner.load_weights()
     media = merge.Media(counts=(4,), grids=((2, 2),), rows=np.zeros((4, 8), np.float32))
     with pytest.raises(UnsupportedMediaError):
@@ -832,7 +835,8 @@ def _vision_runner(chain, slot: FakeSlot | None, *, metal: bool = True, missing:
         chain.metal_runtime = object()          # 只用来回答"有没有 Metal 运行时"
     state = None if slot is None else (lambda held: {"reusable": 26 - missing, "total": 26})
     return SplitRunner(
-        lambda: chain, prompter, max_len=4096, image_token_id=248056,
+        lambda: chain, prompter, confidence=mude_confidence, max_len=4096,
+        image_token_id=248056,
         load_tower=(lambda held: slot) if slot is not None else None,
         vision_state=state,
     )
@@ -878,7 +882,8 @@ def test_shutdown_closes_the_tower_before_the_chain() -> None:
 def test_the_contract_says_which_of_the_four_reasons_applies() -> None:
     chain = FakeChain()
 
-    text_only = SplitRunner(lambda: chain, _prompter()[0], max_len=4096)
+    text_only = SplitRunner(lambda: chain, _prompter()[0], confidence=mude_confidence,
+                            max_len=4096)
     text_only.load_weights()
     assert text_only.vision_unavailable() == "这个模型没有视觉塔，收不了图"
     assert text_only.image_contract()["supported"] is False
@@ -912,7 +917,8 @@ def test_vision_warmup_reports_the_artifacts_of_the_tower() -> None:
     assert report is not None
     assert slot.calls == ["warm"]
     assert report["programs"] == {"reusable": 26, "total": 26}
-    assert SplitRunner(lambda: chain, _prompter()[0], max_len=4096).vision_warmup() is None
+    assert SplitRunner(lambda: chain, _prompter()[0], confidence=mude_confidence,
+                       max_len=4096).vision_warmup() is None
 
 
 def _with_media(request, *, data: bytes = b"\x89PNG\r\n\x1a\n"):

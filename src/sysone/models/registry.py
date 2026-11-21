@@ -12,6 +12,9 @@ monkeypatch 挂进来。这里把"读懂 config"（`parse_config`）与"切层"�
 `strategy` 是**声明**不是实现：家族只说"我的答案从这个形态读出"（固定码表 = `split`、
 标签行 = `pooled`、厂商自带读出 = `vendor`），具体哪个执行器接它由
 `engine.strategies.assembly` 查。这样 CLI 不必认识任何家族名，家族也不必 import 引擎。
+
+`recipe` 是同一份声明的另一半：策略挑执行器，配方给**这一家**的答案码、题面与判答口径
+（`models.recipe`）。两者成对才能装配 —— 只有策略名时，新家族会静默借走前一家的题面。
 """
 
 from __future__ import annotations
@@ -32,13 +35,19 @@ WeightPlanFn = Callable[[Path], WeightPlan]
 
 @dataclass(frozen=True)
 class Family:
-    """一个已注册的模型家族。"""
+    """一个已注册的模型家族。
+
+    `recipe` 是这一家交给策略的接入件（`models.recipe` 的三种之一）。它与 `strategy` 成对
+    才有意义：策略挑执行器，配方给这家自己的题面与读出。缺配方时装配**必须报错** ——
+    早先的写法按策略名直接查工厂，新家族声明同一个策略就会静默借走前一家的题面。
+    """
 
     name: str
     parse_config: ParseConfig
     build_layer_plan: BuildLayerPlan
     strategy: str
     weight_plan: WeightPlanFn | None = None
+    recipe: object | None = None
     source: str = ""
 
 
@@ -52,9 +61,14 @@ def register_family(
     *,
     strategy: str,
     weight_plan: WeightPlanFn | None = None,
+    recipe: object | None = None,
     source: str = "",
 ) -> None:
-    """注册家族；重复注册直接报错（同名两份实现是配置事故，不该静默覆盖）。"""
+    """注册家族；重复注册直接报错（同名两份实现是配置事故，不该静默覆盖）。
+
+    `recipe` 与 `strategy` 配套：策略是共享实现，配方是这一家的差异（见 `models.recipe`）。
+    注册时**不**强制有配方 —— 装配才是"能不能接上"的判据，报错也就在那一步说清楚缺什么。
+    """
     if not strategy:
         raise RegistrationError("家族必须声明读出策略", family=name, source=source)
     if name in _REGISTRY:
@@ -65,6 +79,7 @@ def register_family(
         build_layer_plan=build_layer_plan,
         strategy=strategy,
         weight_plan=weight_plan,
+        recipe=recipe,
         source=source,
     )
 

@@ -8,6 +8,7 @@ from ...config import EngineConfig
 from ...domain.attention import MaskMode
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan
+from ..recipe import VendorRecipe
 from ..registry import register_family
 from . import qwen35
 
@@ -31,5 +32,19 @@ def build_layer_plan(descriptor: ModelDescriptor, config: EngineConfig) -> Layer
     return qwen35.layer_plan(descriptor, config)
 
 
+def open_bridge(model_dir: Path) -> object:
+    """厂商桥：模板、前向与读出全归厂商包，我们只提供权重。
+
+    惰性 import 是必须的：`torchcast_bridge` 在模块级 import torch，而注册家族发生在启动
+    路径上（核心面不依赖 torch，`tests/unit/test_import_light.py` 盯着这条线）。
+    """
+    from ..vendors.torchcast_bridge import TorchcastBridge
+
+    return TorchcastBridge(model_dir)
+
+
+# 交给 vendor 策略的接入件。这条路径不建设备链，所以没有 `weight_plan`。
+RECIPE = VendorRecipe(bridge=open_bridge)
+
 register_family("torchcast", parse_config, build_layer_plan,
-                strategy="vendor", source=__name__)
+                strategy="vendor", recipe=RECIPE, source=__name__)

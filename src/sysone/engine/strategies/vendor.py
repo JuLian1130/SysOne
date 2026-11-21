@@ -13,6 +13,8 @@ from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest
 from ...domain.work import CompilationTimes
 from ...errors import ConfigError, UnsupportedModeError
+from ...models.layer_plan import WeightPlan
+from ...models.recipe import VendorRecipe
 from ...models.vendors.base import VendorBridge, question_spec
 from .decision import DecisionRunner
 
@@ -88,20 +90,27 @@ class VendorRunner(DecisionRunner):
         self._bridge.close()
 
 
-def torchcast_runner(model_dir: str | Path, *, scratch_dir: str | Path | None = None) -> VendorRunner:
-    """装一条 torchcast 的 vendor 路径：装载、题面与读出全交给厂商包。
+def vendor_runner(
+    model_dir: str | Path,
+    *,
+    recipe: VendorRecipe,
+    weights: WeightPlan | None = None,
+    scratch_dir: str | Path | None = None,
+) -> VendorRunner:
+    """装一条 vendor 路径：装载、题面与读出全交给厂商包。
 
-    桥在模块级 import `torch`，所以这里才把它带进来 —— 核心面不依赖 torch（
-    `tests/unit/test_import_light.py` 盯着这条线），只有真要走 vendor 路径时才付这笔导入。
+    这条工厂**只认配方里的桥**（家族注册时给的那一项），自己不认识任何厂商包 —— 换一家
+    厂商，改动在它自己的家族模块里。桥在家族那边惰性 import `torch`，所以核心面不依赖
+    torch（`tests/unit/test_import_light.py` 盯着这条线），只有真要走这条路时才付这笔导入。
 
-    `scratch_dir` 只是 `assemble` 的统一签名：这条路径不编 ANE program、不落产物，
-    `artifact_bytes()` 恒为 0 —— 前向在厂商引擎里，用不上我们的产物缓存。
+    `weights` 与 `scratch_dir` 只是 `assemble` 的统一签名：这条路径不经过设备链、不编
+    ANE program、不落产物，`artifact_bytes()` 恒为 0。
 
     没装 `vendor` 附加依赖时报一条配置错误而不是裸 `ImportError`：`pip install -e ./src`
     默认不带 torch，而这条路必须要有它。
     """
     try:
-        from ...models.vendors.torchcast_bridge import TorchcastBridge
+        bridge = recipe.bridge(Path(model_dir))
     except ImportError as exc:
         raise ConfigError(
             "vendor 路径需要 torch 与 transformers",
@@ -110,4 +119,4 @@ def torchcast_runner(model_dir: str | Path, *, scratch_dir: str | Path | None = 
             hint="pip install -e './src[vendor]'",
         ) from exc
 
-    return VendorRunner(TorchcastBridge(model_dir))
+    return VendorRunner(bridge)  # type: ignore[arg-type]

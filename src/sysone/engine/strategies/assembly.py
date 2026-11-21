@@ -8,6 +8,10 @@
    码表读出（整链 ANE + Metal 注意力），`pooled` 是 h2o 的标签行读出，`vendor` 是
    torchcast 的厂商引擎（它的模板、前向与读出，我们只提供权重）。
 
+   工厂是**共享实现**，不认识任何家族：这一家的题面、答案码与判答口径走 `recipe`，
+   形状与张量名前缀走 `weight_plan`。两者都由家族在 `register_family` 时给出，缺配方
+   直接报错 —— 早先按策略名查表时，新家族会静默借走前一家的题面。
+
 不在这里做"猜家族"：`--model` 显式给，猜错家族不会崩，只会拿错模板算出看似正常的答案。
 后端与家族声明的策略不符时**报错并说出两边**，而不是悄悄按后端跑 —— 那样
 `--backend split --model h2o` 会走一条根本没为它验证过的路。
@@ -23,9 +27,9 @@ from ...errors import ConfigError
 from ...models import families as _family_modules  # noqa: F401  导入即注册
 from ...models.descriptor import ModelDescriptor
 from ...models.registry import family
-from .pooled import h2o_runner
-from .split import mude_runner
-from .vendor import torchcast_runner
+from .pooled import pooled_runner
+from .split import split_runner
+from .vendor import vendor_runner
 
 # 可选的 `--backend`（`reference` 不走这里：它是 M0 的语义裁判，不读家族的权重）。
 BACKENDS = ("split", "pooled", "vendor")
@@ -34,10 +38,12 @@ BACKENDS = ("split", "pooled", "vendor")
 QUANT_MODES = ("int8", "fp16")
 
 # 策略名 → 工厂。`bucket` / `width` 是链的形状（两条链策略都有）。
+# 值是**共享实现**：它们不认识任何家族 —— 家族的具体件从注册表的两项来：`recipe`
+# （题面、答案码、判答口径）与 `weight_plan`（前缀、norm 偏移、RoPE 角基）。
 _BUILDERS: dict[str, Callable[..., object]] = {
-    "split": mude_runner,
-    "pooled": h2o_runner,
-    "vendor": torchcast_runner,
+    "split": split_runner,
+    "pooled": pooled_runner,
+    "vendor": vendor_runner,
 }
 
 # 每条策略**认**哪些参数（`resident` 是 Metal 流水线的待命窗口，两条链策略都有 Metal 形态）。
@@ -132,15 +138,29 @@ def assemble(
         )
     if quant is not None and quant not in QUANT_MODES:
         raise ConfigError("未知的量化档", quant=quant, available=list(QUANT_MODES))
+    # 策略是共享实现，配方是这一家的差异。缺配方就装不出来 —— 这里必须报错，而不是让工厂
+    # 退回"上一次那个家族"的题面与码表：那样它算得出形状正常的答案，错得没有声音。
+    if entry.recipe is None:
+        raise ConfigError(
+            "这个家族没有提供接入配方",
+            family=name,
+            strategy=entry.strategy,
+            hint="在 register_family(..., recipe=...) 里给出这一家的题面与读出"
+                 "（models.recipe 的 SplitRecipe / PooledRecipe / VendorRecipe）",
+        )
     root = Path(model_dir)
     descriptor = entry.parse_config(root)
+    # 形状、张量前缀、norm 存法偏移与 RoPE 角基都由家族声明的 `weight_plan` 解析一次，
+    # 工厂只管消费；vendor 不建设备链，所以是 `None`。
+    weights = entry.weight_plan(root) if entry.weight_plan is not None else None
     # `quant` 是装配层的名字，执行器只认 `quantize: bool`：别把两套名字同时递给工厂，
-    # 加一个参数就会在 `mude_runner` 的签名上撞成 TypeError。
+    # 加一个参数就会在工厂签名上撞成 TypeError。
     options = {key: value for key, value in given.items()
                if key in accepted and key != "quant" and value is not None}
     if quant is not None:
         options["quantize"] = quant == "int8"
-    runner = builder(root, **options, scratch_dir=artifacts_dir)
+    runner = builder(root, recipe=entry.recipe, weights=weights, **options,
+                     scratch_dir=artifacts_dir)
     return Assembly(descriptor=descriptor, runner=runner, strategy=entry.strategy)
 
 

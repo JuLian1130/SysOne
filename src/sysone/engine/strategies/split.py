@@ -22,7 +22,8 @@ from ...errors import (
     NotReadyError,
     ReadoutError,
 )
-from ...models.families.mude import confidence as mude_confidence
+from ...models.layer_plan import WeightPlan
+from ...models.recipe import SplitRecipe
 
 # 预热用的题：真正的冷启动失败（program 没装上、面没绑好）在第一题就会炸，
 # 这一题让它在 `Engine.start()` 里就炸，而不是让第一道真实请求撞上。
@@ -105,6 +106,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
         load_chain: Callable[[], ModelChain],
         prompter: Prompter,
         *,
+        confidence: Callable[[Sequence[float]], float],
         max_len: int,
         image_token_id: int | None = None,
         load_tower: Callable[[object], object] | None = None,
@@ -114,6 +116,9 @@ class SplitRunner(VisionRunner, DecisionRunner):
             raise ConfigError("max_len 必须为正", max_len=max_len)
         self._load_chain = load_chain
         self._prompter = prompter
+        # 置信度口径由家族给（配方的第三项）：协议层原样发出去，所以这里算的必须与这条读出
+        # 的厂商口径一致，不能由策略替它挑一个"看起来合理"的。
+        self._confidence = confidence
         self._max_len = int(max_len)
         # 占位 token 的 id 来自 descriptor（`image_token_id`）。没有任何模型的 `validate()`
         # 允许"带塔却不说 id"，所以这里的 `None` 只出现在纯文本装配里。
@@ -231,7 +236,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
             value=encoded.labels[best],
             probs=values,
             labels=encoded.labels,
-            confidence=mude_confidence(values),
+            confidence=self._confidence(values),
         )
 
     def _warm(self) -> None:
@@ -271,9 +276,11 @@ class SplitRunner(VisionRunner, DecisionRunner):
 # ---------------------------------------------------------------------- 装配
 
 
-def mude_runner(
+def split_runner(
     model_dir: str | Path,
     *,
+    recipe: SplitRecipe,
+    weights: WeightPlan | None = None,
     bucket: int | None = None,
     width: int | None = None,
     metal: bool = True,
@@ -284,7 +291,11 @@ def mude_runner(
     vision_idle: float = 60.0,
     vision_bucket: int | None = None,
 ) -> SplitRunner:
-    """装一条 mude split 链：分词器 + 回答码 + ANE/Metal 链。
+    """装一条 split 链：分词器 + 家族给的题面/码表 + ANE/Metal 链。
+
+    这条工厂**不认识任何家族**：答案码、题面渲染与置信度口径都从 `recipe` 来（装配层从
+    注册表取），形状与张量名从 `weights` 来（家族声明的 `weight_plan`，装配层解析好传进来）。
+    换个 Qwen3.5 决策模型接进来，改动只在它自己的家族模块里。
 
     `bucket` 是 ANE program 的静态列宽（默认 `S_NATIVE`），`width` 是 GPU 侧缓冲的列数
     （默认等于 bucket，prompt 更长时必须给更大的值）。两者都决定内存，所以由调用方说。
@@ -299,14 +310,18 @@ def mude_runner(
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
     from ...devices.apple.platform import warn_if_unmeasured
-    from ...models.families import mude as mude_family
 
+    if weights is None:
+        raise ConfigError(
+            "split 策略需要家族提供 weight_plan",
+            strategy="split",
+            hint="在 register_family(..., weight_plan=...) 里给出这份检查点的前缀与 norm/rope 事实",
+        )
     # 形状检查放在分词器与检查点之前：它只读 config，却要在任何"看起来像结果"的运行之前
     # 先出声。告警不拦（`platform.py` 顶部写明理由）。
-    weights = mude_family.weight_plan(Path(model_dir))
     warn_if_unmeasured(weights.descriptor, strategy="split")
-    codes = mude_family.read_codes(model_dir)
-    prompter = mude_family.MudePrompter(_load_tokenizer(model_dir), codes)
+    codes = recipe.labels(Path(model_dir))
+    prompter = recipe.prompter(_load_tokenizer(model_dir), codes)
     bucket_width = int(S_NATIVE if bucket is None else bucket)
     buffer_width = int(bucket_width if width is None else width)
 
@@ -355,7 +370,7 @@ def mude_runner(
         return {"directory": str(state.directory), "reusable": state.hits, "total": state.total}
 
     load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
-    return SplitRunner(load_chain, prompter, max_len=buffer_width,
+    return SplitRunner(load_chain, prompter, confidence=recipe.confidence, max_len=buffer_width,
                        image_token_id=weights.descriptor.image_token_id, load_tower=load,
                        vision_state=tower_state if load is not None else None)
 
@@ -374,4 +389,4 @@ def _load_tokenizer(model_dir: str | Path) -> object:
         ) from exc
 
 
-__all__ = ["ModelChain", "Prompter", "SplitRunner", "mude_runner"]
+__all__ = ["ModelChain", "Prompter", "SplitRunner", "split_runner"]

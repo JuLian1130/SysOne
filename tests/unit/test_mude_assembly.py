@@ -198,19 +198,23 @@ def test_the_shipping_factories_warn_before_they_touch_the_chain(caplog, monkeyp
     from helpers import FIXTURES
 
     from sysone.devices.apple import platform as apple_platform
-    from sysone.engine.strategies.pooled import h2o_runner
-    from sysone.engine.strategies.split import mude_runner
+    from sysone.engine.strategies.pooled import pooled_runner
+    from sysone.engine.strategies.split import split_runner
     from sysone.errors import SysOneError
+    from sysone.models.families import h2o as h2o_family
+    from sysone.models.families import mude as mude_family
 
     monkeypatch.setattr(apple_platform, "MEASURED_GEOMETRIES", frozenset())
-    for factory, directory, strategy in (
-        (mude_runner, FIXTURES / "mude", "split"),
-        (h2o_runner, FIXTURES / "h2o", "pooled"),
+    for build, strategy in (
+        (lambda: split_runner(FIXTURES / "mude", recipe=mude_family.RECIPE,
+                              weights=mude_family.weight_plan(FIXTURES / "mude")), "split"),
+        (lambda: pooled_runner(FIXTURES / "h2o", recipe=h2o_family.RECIPE,
+                               weights=h2o_family.weight_plan(FIXTURES / "h2o")), "pooled"),
     ):
         caplog.clear()
         with caplog.at_level("WARNING", logger="sysone.devices.apple.platform"):
             try:
-                factory(directory)
+                build()
             except SysOneError:
                 pass  # 夹具没有分词器/答面配置：这里只关心告警已经发出
         messages = [record.getMessage() for record in caplog.records]

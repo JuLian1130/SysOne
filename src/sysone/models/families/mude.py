@@ -13,6 +13,7 @@ from ...errors import ConfigError, UnsupportedKindError
 from ...weights.checkpoint import stored_quant
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan, WeightPlan
+from ..recipe import SplitRecipe
 from ..registry import register_family
 from ..vendors.base import question_spec
 from . import qwen35
@@ -293,5 +294,9 @@ def weight_plan(model_dir: Path) -> WeightPlan:
     )
 
 
+# 交给 split 策略的接入件：答案码表、题面渲染、置信度口径。换一份 checkpoint 就换这里，
+# 策略与设备层都不动。
+RECIPE = SplitRecipe(labels=read_codes, prompter=MudePrompter, confidence=confidence)
+
 register_family("mude", parse_config, build_layer_plan,
-                strategy="split", weight_plan=weight_plan, source=__name__)
+                strategy="split", weight_plan=weight_plan, recipe=RECIPE, source=__name__)

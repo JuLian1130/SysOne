@@ -30,13 +30,15 @@ from ...domain.attention import MaskMode
 from ...domain.decision import Answer, DecisionRequest, Question
 from ...domain.work import CompilationTimes
 from ...errors import ConfigError, NotReadyError, UnsupportedModeError
+from ...models.layer_plan import WeightPlan
+from ...models.recipe import PooledRecipe
 from ...models.vendors.base import question_spec
 from ...models.vendors.h2o_serve import Prepared, Serve
 from .decision import MIN_SLOT, DecisionRunner, Encoded
 from .vision import VisionRunner
 
-# h2o 训练过两种读法、也只声明了两种：整段因果，或整段双向（没有 prefix 语义）。
-_SUPPORTED_MODES = (MaskMode.CAUSAL, MaskMode.NONCAUSAL_FULL)
+# 读出与答面都归厂商；这里只保留"池化读出"这件事的共性。能读哪几种掩码由每份 checkpoint
+# 的 descriptor 声明（`supported_modes`），策略不再写死一份 —— 写死会把下一家挡在门外。
 
 _WARMUP_STATE = "warmup"
 _WARMUP_QUESTION = Question(text="Which option is correct?", options=("This one", "That one"))
@@ -108,6 +110,7 @@ class PooledRunner(VisionRunner, DecisionRunner):
         serve: Serve,
         rows: Callable[[Sequence[int]], np.ndarray],
         *,
+        supported_modes: frozenset[MaskMode],
         max_len: int,
         image_token_id: int | None = None,
         load_tower: Callable[[object], object] | None = None,
@@ -118,6 +121,12 @@ class PooledRunner(VisionRunner, DecisionRunner):
         self._load_chain = load_chain
         self._serve = serve
         self._rows = rows
+        # 训练过哪些读法是**这份 checkpoint** 的事实，由家族写进 descriptor（`parse_config`），
+        # 装配层转交进来。策略不自己另写一份：写死的话，下一个 pooled 家族会被前一家的
+        # 掩码集合挡住。
+        self._modes = frozenset(supported_modes)
+        if not self._modes:
+            raise ConfigError("pooled 策略需要 checkpoint 声明支持的读法", strategy="pooled")
         self._max_len = int(max_len)
         self._image_token = image_token_id
         # 视觉塔的工厂（`chain → VisionSlot`）：塔要复用链的权重容器与运行时，所以只能在
@@ -198,22 +207,23 @@ class PooledRunner(VisionRunner, DecisionRunner):
     def answers_for(
         self, request: DecisionRequest, mode: MaskMode, *, media: object | None = None
     ) -> tuple[tuple[Answer, ...], int, float]:
-        """一次请求的所有题：先过 h2o 的读法门，再交给基类的编排。
+        """一次请求的所有题：先过这份 checkpoint 的读法门，再交给基类的编排。
 
-        读法的门留在这里而不是基类：`causal` / `noncausal_full` 是**这个 checkpoint** 训练过
-        的两种读法，不是所有决策模型的共性。一个没验证过的读法（比如 `prefix_noncausal`）
-        在 h2o 上会算出一个"看起来正常"的答案，所以它必须当场拒绝，而不是等数值对不上才发现。
+        读法的门留在这里而不是基类：能读哪几种掩码是**这个 checkpoint** 训练出来的事实，
+        由家族在 descriptor 里声明、装配层传进来；一个没验证过的读法（比如 h2o 上的
+        `prefix_noncausal`）会算出一个"看起来正常"的答案，所以它必须当场拒绝，而不是等
+        数值对不上才发现。
 
         `media` 是给门与替身用的旁路（塔已经算完的图像侧）；请求自带的图仍走真路径，两条路
         在基类汇合。跨请求合批那条入口不需要这道门：`batch_limit` 是基类的 1，引擎据此既不
         攒批、也不把单条送进批路（`supports_batch` 只回答"链有没有那条原语"）。
         """
-        if mode not in _SUPPORTED_MODES:
+        if mode not in self._modes:
             raise UnsupportedModeError(
-                "h2o 只有 causal / noncausal_full 两种读法",
+                "这个 checkpoint 没有声明所选读法",
                 mode=mode.value,
                 strategy="pooled",
-                supported=sorted(item.value for item in _SUPPORTED_MODES),
+                supported=sorted(item.value for item in self._modes),
             )
         return super().answers_for(request, mode, media=media)
 
@@ -319,9 +329,11 @@ class PooledRunner(VisionRunner, DecisionRunner):
 # ---------------------------------------------------------------------- 装配
 
 
-def h2o_runner(
+def pooled_runner(
     model_dir: str | Path,
     *,
+    recipe: PooledRecipe,
+    weights: WeightPlan | None = None,
     bucket: int | None = None,
     width: int | None = None,
     quantize: bool = True,
@@ -333,10 +345,14 @@ def h2o_runner(
     vision_idle: float = 60.0,
     vision_bucket: int | None = None,
 ) -> PooledRunner:
-    """装一条 h2o 的 pooled 链：厂商答面 + 词表行按需取 + ANE 链。
+    """装一条 pooled 链：家族给的厂商答面 + 词表行按需取 + ANE 链。
 
-    `bucket` 是 ANE program 的静态列宽、`width` 是缓冲宽度（默认都取 `S_NATIVE`）。h2o 的
-    `ffn` 是 9216、`hidden` 是 2560，两个 program 都比 mude 大，所以这两项由调用方说清楚，
+    这条工厂**不认识任何家族**：答面（题面、温度、地板、判答）从 `recipe` 来，形状与张量名
+    从 `weights` 来（家族声明的 `weight_plan`，装配层解析好传进来）。换个 Qwen3.5 决策模型
+    接进来，改动只在它自己的家族模块里。
+
+    `bucket` 是 ANE program 的静态列宽、`width` 是缓冲宽度（默认都取 `S_NATIVE`）。4B 的
+    `ffn` 是 9216、`hidden` 是 2560，两个 program 都比 2B 大，所以这两项由调用方说清楚，
     不在这里猜。
 
     `metal=True` 默认开：h2o 的 `(2560, 9216)` 已经做过 numpy vs Metal 的逐位对拍
@@ -354,17 +370,21 @@ def h2o_runner(
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
     from ...devices.apple.platform import warn_if_unmeasured
-    from ...models.families import h2o as h2o_family
     from ...weights.checkpoint import open_checkpoint
 
+    if weights is None:
+        raise ConfigError(
+            "pooled 策略需要家族提供 weight_plan",
+            strategy="pooled",
+            hint="在 register_family(..., weight_plan=...) 里给出这份检查点的前缀与 norm/rope 事实",
+        )
     # 形状检查放在开答面与检查点之前：它只读 config，却要在任何"看起来像结果"的运行之前
     # 先出声。告警不拦（`platform.py` 顶部写明理由）—— ANE 对形状很宽容，未测几何也会
     # 编译、会跑出数字，所以日志里必须有这条记录。
-    weights = h2o_family.weight_plan(Path(model_dir))
     warn_if_unmeasured(weights.descriptor, strategy="pooled")
-    serve = Serve.open(model_dir, tokenizer)
+    serve = recipe.serve(model_dir, tokenizer)
     store = open_checkpoint(Path(model_dir))
-    embed_name = f"{h2o_family.PREFIX}.embed_tokens.weight"
+    embed_name = f"{weights.prefix}.embed_tokens.weight"
     if not weights.descriptor.tied_embeddings:
         raise ConfigError(
             "h2o 的读出权重来自词表（tied），这份 checkpoint 却不是 tied",
@@ -416,10 +436,11 @@ def h2o_runner(
 
     load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
     return PooledRunner(
-        load_chain, serve, rows, max_len=buffer_width,
+        load_chain, serve, rows, supported_modes=weights.descriptor.supported_modes,
+        max_len=buffer_width,
         image_token_id=weights.descriptor.image_token_id, load_tower=load,
         vision_state=tower_state if load is not None else None,
     )
 
 
-__all__ = ["PooledRunner", "h2o_runner"]
+__all__ = ["PooledRunner", "pooled_runner"]

@@ -1,7 +1,8 @@
-"""按注册表装配执行器：家族声明的策略决定谁来跑，CLI 不认识家族名。
+"""按注册表装配执行器：策略决定谁来跑，配方决定这家怎么读，CLI 不认识家族名。
 
-工厂在这里换成假的 —— 这条测的是"装配"而不是链：形状从哪个函数来、参数有没有传下去、
-后端与声明不符时说不说得清。真链的装配在集成测试与 `.scratch` 的探针里跑。
+工厂在这里换成假的 —— 这条测的是"装配"而不是链：形状从哪个函数来、配方与 weight_plan
+有没有原样转交、缺配方时说不说得清、后端与声明不符时说不说得清。真链的装配在集成测试与
+`.scratch` 的探针里跑。
 """
 
 from __future__ import annotations
@@ -11,18 +12,29 @@ from helpers import FIXTURES, make_mude_checkpoint
 
 from sysone.engine.strategies import assembly
 from sysone.errors import ConfigError
-from sysone.models.registry import family
+from sysone.models.recipe import PooledRecipe, SplitRecipe, VendorRecipe
+from sysone.models.registry import Family, family
+from sysone.models import registry
 
 
 class FakeBuilder:
-    """记账用的执行器工厂：把收到的参数原样存下来，返回一个哨兵对象。"""
+    """记账用的执行器工厂：把收到的参数原样存下来，返回一个哨兵对象。
+
+    `recipe` / `weights` 单独记两份，因为它们是对象身份（"是不是这一家的配方"），与形状
+    参数（值）分开断言更直白。
+    """
 
     def __init__(self, label: str) -> None:
         self.label = label
         self.calls: list[dict] = []
+        self.recipes: list[object] = []
+        self.weights: list[object] = []
 
-    def __call__(self, model_dir, *, bucket=None, width=None, resident=None, scratch_dir=None,
-                 quantize=None, vision=None, vision_idle=None, vision_bucket=None):
+    def __call__(self, model_dir, *, recipe=None, weights=None, bucket=None, width=None,
+                 resident=None, scratch_dir=None, quantize=None, vision=None,
+                 vision_idle=None, vision_bucket=None):
+        self.recipes.append(recipe)
+        self.weights.append(weights)
         self.calls.append(
             {"dir": str(model_dir), "bucket": bucket, "width": width,
              "resident": resident, "scratch_dir": scratch_dir, "quantize": quantize,
@@ -44,6 +56,72 @@ def test_families_declare_how_their_answers_are_read():
     assert family("mude").strategy == "split"
     assert family("h2o").strategy == "pooled"
     assert family("torchcast").strategy == "vendor"
+
+
+def test_each_family_brings_the_pieces_of_its_own_readout():
+    """策略只是共享实现，题面与读出是每家的配方 —— 新模型能接进来靠的就是这一层。
+
+    三个配方类型各不相同（码表 / 答面 / 桥），因为它们各自需要的东西本来就不一样；共同点
+    只有一个：都由家族给，不写在策略里。
+    """
+    assert isinstance(family("mude").recipe, SplitRecipe)
+    assert isinstance(family("h2o").recipe, PooledRecipe)
+    assert isinstance(family("torchcast").recipe, VendorRecipe)
+
+
+def test_the_family_recipe_and_weight_plan_reach_the_factory(tmp_path, builders):
+    """配方与 weight_plan 都由家族给、装配层原样转交：换一家只改家族模块，工厂不动。"""
+    from sysone.models.families import mude
+
+    split, _ = builders
+    root = make_mude_checkpoint(tmp_path)
+    assembly.assemble(root, "mude", backend="split")
+
+    assert split.recipes == [mude.RECIPE]
+    assert split.weights[0] is not None
+    assert split.weights[0].prefix == mude.PREFIX
+    assert split.weights[0].descriptor.family == "mude"
+
+
+def test_a_family_without_a_recipe_cannot_borrow_another(tmp_path, builders, monkeypatch):
+    """新家族只声明策略、不带配方时必须报错，而且不许落到任何一家的工厂上。
+
+    早先的写法按策略名查工厂：新家族声明 `split` 会静默拿到 mude 的 `MudePrompter` 与 255 行
+    码表，算得出形状正常的答案，错得没有声音。这条钉的就是"借不到"。
+    """
+    monkeypatch.setitem(registry._REGISTRY, "bare-split", Family(
+        name="bare-split",
+        parse_config=lambda path: family("mude").parse_config(FIXTURES / "mude"),
+        build_layer_plan=lambda descriptor, config: None,
+        strategy="split",
+    ))
+    with pytest.raises(ConfigError) as caught:
+        assembly.assemble(FIXTURES / "mude", "bare-split", backend="split")
+    context = caught.value.context
+    assert context["family"] == "bare-split"
+    assert context["strategy"] == "split"
+    assert "接入配方" in caught.value.message
+    assert "recipe=" in context["hint"]
+    assert builders[0].calls == []
+
+
+def test_runners_take_no_family_at_all():
+    """三条工厂都不认识家族名：它们的签名里只有配方、weight_plan 与形状参数。
+
+    这是一条"改回去会被拦下"的检查：给工厂再加一个 `family=` 之类的口子，新模型又要靠
+    特判才能接。
+    """
+    import inspect
+
+    from sysone.engine.strategies.pooled import pooled_runner
+    from sysone.engine.strategies.split import split_runner
+    from sysone.engine.strategies.vendor import vendor_runner
+
+    for factory in (split_runner, pooled_runner, vendor_runner):
+        parameters = inspect.signature(factory).parameters
+        assert "recipe" in parameters, factory.__name__
+        assert "weights" in parameters, factory.__name__
+        assert not {"family", "name"} & set(parameters), factory.__name__
 
 
 def test_assemble_builds_the_runner_the_family_declares(tmp_path, builders):
@@ -94,7 +172,7 @@ def test_a_vendor_family_assembles_through_its_bridge(tmp_path, monkeypatch):
     """
     calls: list[dict] = []
 
-    def builder(model_dir, *, scratch_dir=None):
+    def builder(model_dir, *, recipe=None, weights=None, scratch_dir=None):
         calls.append({"dir": str(model_dir), "scratch_dir": scratch_dir})
         return "runner:vendor"
 
