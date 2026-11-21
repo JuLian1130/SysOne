@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import pytest
-from helpers import FIXTURES, make_mude_checkpoint
+from helpers import FIXTURES, make_code_checkpoint, make_mude_checkpoint
 
 from sysone.engine.strategies import assembly
 from sysone.errors import ConfigError
@@ -52,8 +52,10 @@ def builders(monkeypatch):
 
 
 def test_families_declare_how_their_answers_are_read():
-    """声明是**家族**给的：mude 固定码表、h2o 与 torchcast 都走池化读出。"""
+    """声明是**家族**给的：mude / d3 / pplx 固定码表、h2o 与 torchcast 走池化读出。"""
     assert family("mude").strategy == "split"
+    assert family("d3").strategy == "split"
+    assert family("pplx").strategy == "split"
     assert family("h2o").strategy == "pooled"
     assert family("torchcast").strategy == "pooled"
 
@@ -69,6 +71,10 @@ def test_each_family_brings_the_pieces_of_its_own_readout():
     assert isinstance(family("torchcast").recipe, PooledRecipe)
     assert family("torchcast").recipe is not family("h2o").recipe
     assert family("torchcast").recipe.serve is not family("h2o").recipe.serve
+    # d3 / pplx 与 mude 是同一条线格式的另外两份检查点：题面、255 个回答码与置信度口径没有
+    # 第二套定义，所以**显式**共用同一份配方（`bare-split` 那条测试守的是"静默借"）。
+    assert family("d3").recipe is family("mude").recipe
+    assert family("pplx").recipe is family("mude").recipe
 
 
 def test_the_family_recipe_and_weight_plan_reach_the_factory(tmp_path, builders):
@@ -83,6 +89,20 @@ def test_the_family_recipe_and_weight_plan_reach_the_factory(tmp_path, builders)
     assert split.weights[0] is not None
     assert split.weights[0].prefix == mude.PREFIX
     assert split.weights[0].descriptor.family == "mude"
+
+
+def test_a_d3_checkpoint_assembles_with_its_own_weight_plan(tmp_path, builders):
+    """新家族只改家族模块：4B 的 `language_model` 前缀与共用配方原样交给 split 工厂。"""
+    split, _ = builders
+    root = make_code_checkpoint(tmp_path)
+
+    assembled = assembly.assemble(root, "d3", backend="split", bucket=1024, width=2048)
+
+    assert assembled.strategy == "split"
+    assert assembled.descriptor.family == "d3"
+    assert split.recipes == [family("mude").recipe]
+    assert split.weights[0].prefix == "language_model"
+    assert split.weights[0].descriptor.family == "d3"
 
 
 def test_a_family_without_a_recipe_cannot_borrow_another(tmp_path, builders, monkeypatch):

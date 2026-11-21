@@ -28,7 +28,6 @@ from sysone.errors import (
     RequestTooLongError,
     UnsupportedKindError,
     UnsupportedMediaError,
-    UnsupportedModeError,
 )
 from sysone.models.families import mude
 from sysone.models.vision import merge
@@ -957,3 +956,25 @@ def test_prepare_vision_burns_the_26_programs_then_parks_the_tower() -> None:
     runner.load_weights()
     assert runner.prepare_vision() is None
     assert runner._vision.calls == [] and runner._vision.released == 0
+
+
+def test_warmup_uses_the_checkpoints_default_mode() -> None:
+    """预热与默认读法同掩码：只训练过双向的检查点不该用 `prefix_noncausal` 白热一遍。
+
+    `noncausal_full` 没有前缀行（`use_prefix=False`），所以链收到的是 0；默认形态仍是
+    `prefix_noncausal`（mude 这类检查点），题面前的公共前缀长度照常传下去。
+    """
+    chain = FakeChain()
+    prompter, _ = _prompter()
+    runner = SplitRunner(lambda: chain, prompter, confidence=mude_confidence, max_len=4096,
+                         default_mode=MaskMode.NONCAUSAL_FULL)
+    runner.load_weights()
+    runner.compile_or_warm_up()
+    assert chain.calls[0][2] == 0
+    assert runner.check_health() is True
+
+    chain.calls.clear()
+    default_runner = _runner(chain)
+    default_runner.load_weights()
+    default_runner.compile_or_warm_up()
+    assert chain.calls[0][2] > 0

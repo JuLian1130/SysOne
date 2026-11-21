@@ -8,12 +8,12 @@ import shutil
 
 import pytest
 
-from helpers import FIXTURES
+from helpers import FIXTURES, make_code_checkpoint
 from sysone.devices.apple.geometry import Geometry, mude_geometry
 from sysone.domain.attention import AttentionRole, MaskMode
 from sysone.domain.quant import Scheme
 from sysone.errors import ConfigError
-from sysone.models.families import h2o, mude, qwen35, torchcast
+from sysone.models.families import d3, h2o, mude, pplx, qwen35, torchcast
 
 
 def test_mude_geometry() -> None:
@@ -252,3 +252,51 @@ def test_linear_geometry_is_not_required_without_linear_layers() -> None:
 def test_missing_config_is_config_error(tmp_path) -> None:
     with pytest.raises(ConfigError):
         mude.parse_config(tmp_path)
+
+
+def test_d3_and_pplx_read_the_same_wire_format_on_the_4b_body(tmp_path) -> None:
+    """两家都是 d3 线格式的 4B 检查点：255 行码表、`language_model` 前缀、只有双向。
+
+    与 mude 的差别只有几何与掩码声明：读出方案、`norm` 存法（`w + 1`）都与那两份 4B 家族
+    相同，所以它们共用同一条 `SplitChain`，不需要新的设备路径。
+    """
+    for module, name in ((d3, "d3"), (pplx, "pplx")):
+        root = make_code_checkpoint(tmp_path / name)
+        descriptor = module.parse_config(root)
+        assert descriptor.family == name
+        assert (descriptor.num_layers, descriptor.hidden, descriptor.ffn) == (32, 2560, 9216)
+        assert descriptor.readout.kind == "code_rows"
+        assert (descriptor.readout.weight, descriptor.readout.file) == (
+            "weight", "readout.safetensors")
+        assert descriptor.readout.rows == 255
+        assert descriptor.readout.temperature == pytest.approx(1.1)
+        # 只训练过整段双向：因果臂是实验读数，不进能力声明（与 torchcast 同一条判据）
+        assert descriptor.supported_modes == frozenset({MaskMode.NONCAUSAL_FULL})
+        assert descriptor.trained_modes == frozenset({MaskMode.NONCAUSAL_FULL})
+        assert descriptor.default_mode is MaskMode.NONCAUSAL_FULL
+        plan = module.weight_plan(root)
+        assert plan.prefix == "language_model"
+        assert plan.norm_offset == 1.0
+        assert plan.descriptor.family == name
+
+
+def test_a_text_only_decision_checkpoint_declares_no_tower(tmp_path) -> None:
+    """准备时按 `visual.*` 丢了塔权重，config 里却还留着整块视觉声明。
+
+    照读会让 descriptor 声明一座没有权重的塔：首启预处理去编它，然后报"缺张量" —— 症状
+    与原因隔得很远。`text_only` 去掉顶层那几项，塔从描述符起就不存在。
+    """
+    config = json.loads((FIXTURES / "h2o" / "config.json").read_text(encoding="utf-8"))
+    assert "vision_config" in config and config.get("image_token_id") is not None
+
+    stripped = qwen35.text_only(config)
+    for key in ("vision_config", "image_token_id", "video_token_id",
+                "vision_start_token_id", "vision_end_token_id"):
+        assert key not in stripped
+    # 原 dict 不被改：同一份 config 还要给别的家族读
+    assert "vision_config" in config
+
+    descriptor = d3.parse_config(make_code_checkpoint(tmp_path))
+    assert descriptor.vision is None
+    assert descriptor.image_token_id is None
+    assert descriptor.vision_start_token_id is None

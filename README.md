@@ -71,6 +71,13 @@ shares no prompt prefix between questions; the vendor extra
 (`pip install -e './src[vendor]'`) is only needed to run the vendor's own torch
 engine as a comparison baseline.
 
+The d3-mini and pplx-decider-flash decision models have no published package
+either: pass `--model d3` or `--model pplx` with `--weights`. They read the same
+255-code d3 table as mude on a 4B backbone, so they run on the split chain and
+only support the full-bidirectional mask — no shared prompt prefix, though
+batching still applies. Both always need `--model`: their packages carry the
+same required files as mude's.
+
 Check it from another shell:
 
 ```sh
@@ -89,12 +96,12 @@ optional.
 
 | Flag | Default / values | Meaning |
 |---|---|---|
-| `--model {h2o,mude,torchcast}` | from `--backend` or `--weights` | model family |
-| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
+| `--model {d3,h2o,mude,pplx,torchcast}` | from `--backend` or `--weights` | model family |
+| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude, d3 and pplx | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |
 | `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast) | mask; a request can override it |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast, d3 and pplx) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `16384` | GPU buffer width, also the max input tokens |
 | `--W N` | `4` | resident layers; `0` keeps all of them |

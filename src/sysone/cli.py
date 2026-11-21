@@ -61,25 +61,39 @@ _CLI_FAMILIES = tuple(name for name in families() if family(name).strategy in ST
 # 单看它两家都命中。mude 多一份码表 `readout.safetensors`，torchcast 多一份 int8 清单而没有
 # 码表，于是各命中各的。torchcast 的厂商包 `torchcast_decision/` **不**是标记件：改走 pooled
 # 之后出货路径不读它，把它当标记会把"没带厂商包"的目录推到别的家族上。
+#
+# d3 / mude / pplx 三家**共用同一组必需件**：它们是同一条 d3 线格式（255 个回答码 + 独立读出
+# 表）的三份检查点，目录里能看到的文件一模一样。所以这三家一律要求显式 `--model`：猜成 mude
+# 会拿到 `prefix_noncausal` 这个另外两家没训练过的默认掩码，概率看起来仍然像模像样。
 _FAMILY_MARKERS = {
+    "d3": ("decision_config.json", "readout.safetensors"),
     "mude": ("decision_config.json", "readout.safetensors"),
+    "pplx": ("decision_config.json", "readout.safetensors"),
     "h2o": ("serve_config.json",),
     "torchcast": ("decision_config.json", "int8_manifest.json"),
 }
 
 
 def _infer_family(weights: Path) -> str:
-    """从模型目录的必需件推断家族；推断不出来就要求显式 `--model`。"""
+    """从模型目录的必需件推断家族；认不出**唯一**一家就要求显式 `--model`。"""
     if weights.is_dir():
-        found = [name for name, markers in _FAMILY_MARKERS.items()
-                 if all((weights / marker).is_file() for marker in markers)]
+        found = sorted(name for name, markers in _FAMILY_MARKERS.items()
+                       if all((weights / marker).is_file() for marker in markers))
         if len(found) == 1:
             return found[0]
+        if found:
+            raise ConfigError(
+                "模型目录认不出唯一家族",
+                weights=str(weights),
+                matches=found,
+                hint="加 --model 显式指定（d3 / h2o / mude / pplx / torchcast）；"
+                     "d3 / mude / pplx 是同一条线格式的三份检查点，必需件本来就相同",
+            )
     raise ConfigError(
         "需要 --model 或 --backend",
         weights=str(weights),
         available=list(_CLI_FAMILIES),
-        hint="mude 加 --model mude，h2o 加 --model h2o，torchcast 加 --model torchcast；"
+        hint="--model 取 d3 / h2o / mude / pplx / torchcast；"
              "reference 后端用 --backend reference --descriptor",
     )
 
@@ -92,7 +106,8 @@ def _resolve_backend(args: argparse.Namespace) -> str:
         if args.weights is None:
             raise ConfigError(
                 "需要 --model 或 --backend",
-                hint="省略 --weights 时没有权重包可认家族；先给 --model mude / h2o",
+                hint="省略 --weights 时没有权重包可认家族；"
+                     "先给 --model（d3 / h2o / mude / pplx / torchcast）",
             )
         args.model = _infer_family(args.weights)
     strategy = family(args.model).strategy
@@ -102,7 +117,7 @@ def _resolve_backend(args: argparse.Namespace) -> str:
             family=args.model,
             strategy=strategy,
             available=list(_CLI_FAMILIES),
-            hint="给 --backend split（mude）或 pooled（h2o / torchcast）",
+            hint="给 --backend split（mude / d3 / pplx）或 pooled（h2o / torchcast）",
         )
     return strategy
 
@@ -114,9 +129,9 @@ def _model_flags() -> argparse.ArgumentParser:
         "--backend",
         default=None,
         choices=("reference",) + STRATEGY_BACKENDS,
-        help="执行路径：不给时按 --model 的家族推断（mude → split、h2o 与 torchcast → pooled，"
-             "没给 --model 时按权重包身份认）；reference（M0 语义裁判，只做全注意力层）必须"
-             "显式给，且只配合 --descriptor",
+        help="执行路径：不给时按 --model 的家族推断（mude / d3 / pplx → split、h2o 与 "
+             "torchcast → pooled，没给 --model 时按权重包身份认）；reference（M0 语义裁判，"
+             "只做全注意力层）必须显式给，且只配合 --descriptor",
     )
     common.add_argument(
         "--model", default=None, choices=_CLI_FAMILIES,

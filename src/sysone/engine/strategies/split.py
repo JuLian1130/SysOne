@@ -108,6 +108,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
         *,
         confidence: Callable[[Sequence[float]], float],
         max_len: int,
+        default_mode: MaskMode = MaskMode.PREFIX_NONCAUSAL,
         image_token_id: int | None = None,
         load_tower: Callable[[object], object] | None = None,
         vision_state: Callable[[object], dict[str, object]] | None = None,
@@ -120,6 +121,9 @@ class SplitRunner(VisionRunner, DecisionRunner):
         # 的厂商口径一致，不能由策略替它挑一个"看起来合理"的。
         self._confidence = confidence
         self._max_len = int(max_len)
+        # 预热用这份检查点自己的默认读法（与 `pooled` 同一条口径）。写死成 `prefix_noncausal`
+        # 时，一份只训练过双向的检查点会拿另一种掩码去热 —— 热的是它永远不会跑的那条路。
+        self._default_mode = default_mode
         # 占位 token 的 id 来自 descriptor（`image_token_id`）。没有任何模型的 `validate()`
         # 允许"带塔却不说 id"，所以这里的 `None` 只出现在纯文本装配里。
         self._image_token = image_token_id
@@ -240,9 +244,14 @@ class SplitRunner(VisionRunner, DecisionRunner):
         )
 
     def _warm(self) -> None:
+        """用这份检查点的默认读法跑一次预热（`descriptor.default_mode`）。
+
+        预热只验证"链装起来了、面绑好了、概率合法"。拿 `prefix_noncausal` 去热一份只训练过
+        双向的检查点会走另一条掩码计划（前缀行与尾巴的可见集合都不同），等于白热一遍。
+        """
         answers, _, _ = self.answers_for(
             DecisionRequest(state=_WARMUP_STATE, questions=(_WARMUP_QUESTION,)),
-            MaskMode.PREFIX_NONCAUSAL,
+            self._default_mode,
         )
         answer = answers[0]
         if not answer.probs or not all(math.isfinite(value) for value in answer.probs):
@@ -371,6 +380,7 @@ def split_runner(
 
     load = load_tower if (vision is not False and weights.descriptor.vision is not None) else None
     return SplitRunner(load_chain, prompter, confidence=recipe.confidence, max_len=buffer_width,
+                       default_mode=weights.descriptor.default_mode,
                        image_token_id=weights.descriptor.image_token_id, load_tower=load,
                        vision_state=tower_state if load is not None else None)
 

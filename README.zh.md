@@ -62,6 +62,11 @@ mude 用 `--model mude`。torchcast 也没有发布包：用
 支持全双向掩码，所以题与题之间不共享前缀；vendor 附加依赖
 （`pip install -e './src[vendor]'`）只在要把厂商自己的 torch 引擎当对拍基线时才会用到。
 
+d3-mini 与 pplx-decider-flash 也没有发布包：用 `--model d3` 或 `--model pplx` 配上
+`--weights` 即可。它们与 mude 共用同一张 255 行 d3 码表，底座是 4B，所以走 split 链，且只
+支持全双向掩码 —— 题与题之间不共享前缀，但合批仍然可用。这两家都必须显式给 `--model`：
+发布包的必需件与 mude 相同。
+
 另开一个 shell 检查：
 
 ```sh
@@ -79,12 +84,12 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 
 | 参数 | 默认 / 取值 | 含义 |
 |---|---|---|
-| `--model {h2o,mude,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
-| `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
+| `--model {d3,h2o,mude,pplx,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
+| `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude 与 d3 / pplx 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
 | `--weights PATH` | 自动下载 | 显式包；只读，永不下网 |
 | `--offline` | 关 | 不碰网络 |
 | `--quant {int8,fp16}` | `int8` | ANE 权重存储形态；计算始终 fp16 |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast `noncausal_full`） | 掩码；请求可覆盖 |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast / d3 / pplx `noncausal_full`） | 掩码；请求可覆盖 |
 | `--bucket N` | `1024` | ANE program 列宽 |
 | `--width N` | `16384` | GPU 缓冲宽度，也是最大输入 token 数 |
 | `--W N` | `4` | 常驻层数；`0` = 全部常驻 |

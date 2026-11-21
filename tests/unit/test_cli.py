@@ -161,13 +161,20 @@ def test_backend_follows_the_model_family() -> None:
     args = SimpleNamespace(backend=None, model="torchcast", weights=FIXTURES / "torchcast",
                            descriptor=None)
     assert _resolve_backend(args) == "pooled"
+    # d3 / pplx 的答案也是按码表读出的：同一个 split 后端，家族只换码表与掩码声明
+    for name in ("d3", "pplx"):
+        args = SimpleNamespace(backend=None, model=name, weights=FIXTURES / "torchcast",
+                               descriptor=None)
+        assert _resolve_backend(args) == "split"
 
 
 def test_package_markers_name_one_family_or_none(tmp_path: Path) -> None:
-    """没给 --model 时按发布包的必需件认家族；命中两个就要求显式指定，不猜。
+    """没给 --model 时按发布包的必需件认家族；认不出**唯一**一家就要求显式指定，不猜。
 
-    torchcast 的目录同时带 `decision_config.json`（与 mude 同名）与厂商包目录，所以它落进
-    "认不出唯一家族"那一支 —— 猜成 mude 会拿 mude 的码表读出一份看起来正常的答案。
+    d3 / mude / pplx 是同一条 d3 线格式的三份检查点：`decision_config.json` +
+    `readout.safetensors` 一模一样，所以这三个目录都落进"认不出唯一家族" —— 猜成 mude
+    会拿 `prefix_noncausal` 这个另外两家没训练过的默认掩码读出一份看起来正常的答案。
+    torchcast 的 `decision_config.json` 同名，但它多一份 int8 清单、没有码表，于是各认各的。
     """
     def package(name: str, *files: str) -> Path:
         directory = tmp_path / name
@@ -176,15 +183,19 @@ def test_package_markers_name_one_family_or_none(tmp_path: Path) -> None:
             (directory / file).write_text("{}", encoding="utf-8")
         return directory
 
-    # mude 与 torchcast 都带 `decision_config.json`：单看它两家都命中，所以各自还要一份标志件
-    assert _infer_family(package("mude", "decision_config.json", "readout.safetensors")) == "mude"
     assert _infer_family(package("h2o", "serve_config.json")) == "h2o"
     assert _infer_family(package("tc", "decision_config.json", "int8_manifest.json")) == "torchcast"
 
-    # 两份标记件都像、又都不全（只有 mude 与 torchcast 共有的那个文件）：不猜
+    # 同一份 d3 线格式的三家：必需件相同，认不出是哪一家
+    with pytest.raises(ConfigError) as ambiguous:
+        _infer_family(package("wire", "decision_config.json", "readout.safetensors"))
+    assert ambiguous.value.context["matches"] == ["d3", "mude", "pplx"]
+    assert "--model" in ambiguous.value.context["hint"]
+
+    # 只带一个共用的文件名：哪一家都不像
     with pytest.raises(ConfigError) as caught:
         _infer_family(package("bare", "decision_config.json"))
-    assert "torchcast" in caught.value.context["hint"]
+    assert "d3" in caught.value.context["hint"]
 
 
 def test_the_vendor_path_refuses_the_knobs_of_our_chain(monkeypatch, capsys) -> None:
@@ -241,12 +252,23 @@ def test_batch_flag_folds_into_the_scheduler_config() -> None:
 
 
 def test_backend_is_inferred_from_the_weights_package(tmp_path: Path) -> None:
-    """没给 --model 时按必需件认家族：mude 带 `decision_config.json` 与它的码表。"""
-    (tmp_path / "decision_config.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "readout.safetensors").write_text("{}", encoding="utf-8")
+    """没给 --model 时按必需件认家族；只有**一家**像时才推断。
+
+    d3 / mude / pplx 是同一组必需件（d3 线格式的三份检查点），三家同时命中就不猜 ——
+    猜成 mude 会拿到另外两家没训练过的 `prefix_noncausal` 默认掩码。
+    """
+    (tmp_path / "serve_config.json").write_text("{}", encoding="utf-8")
     args = SimpleNamespace(backend=None, model=None, weights=tmp_path, descriptor=None)
-    assert _resolve_backend(args) == "split"
-    assert args.model == "mude"
+    assert _resolve_backend(args) == "pooled"
+    assert args.model == "h2o"
+
+    wired = tmp_path / "wire"
+    wired.mkdir()
+    for name in ("decision_config.json", "readout.safetensors"):
+        (wired / name).write_text("{}", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        _resolve_backend(SimpleNamespace(backend=None, model=None, weights=wired, descriptor=None))
+    assert caught.value.context["matches"] == ["d3", "mude", "pplx"]
 
 
 def test_backend_inference_asks_for_an_explicit_model_on_an_unknown_package(tmp_path: Path) -> None:

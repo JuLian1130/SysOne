@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import struct
 from pathlib import Path
 
@@ -23,6 +24,26 @@ def load_tiny_descriptor() -> ModelDescriptor:
         (FIXTURES / "reference_tiny" / "descriptor.json").read_text(encoding="utf-8")
     )
     return ModelDescriptor.from_mapping(payload)
+
+
+def make_code_checkpoint(
+    directory: Path, *, temperature: float = 1.1, rows: int = 255
+) -> Path:
+    """造一个 d3 线格式的检查点目录：4B 的 `config.json` + `decision_config.json`。
+
+    不写权重与读出表：用它的用例只看解析、装配与 CLI 推断，不装链。config 借 h2o 那份 ——
+    它正是"从多模态基座微调、准备时丢掉 `visual.*`"的形态（`vision_config` 与占位 token 都
+    还在），所以 `text_only` 那条也在这些用例里被走到。
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIXTURES / "h2o" / "config.json", directory / "config.json")
+    (directory / "decision_config.json").write_text(json.dumps({
+        "format_id": "d3-code-readout-v1",
+        "codes": [f"K{index:03d}" for index in range(rows)],
+        "temperature": temperature,
+        "attention_mode": "noncausal_full",
+    }), encoding="utf-8")
+    return directory
 
 
 def write_safetensors(path: Path, tensors: dict[str, np.ndarray]) -> Path:
