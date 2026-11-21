@@ -19,6 +19,8 @@ issue 与 spec 以本地 markdown 形式存放于 `.scratch/`（不走 GitHub Is
 
 单上下文：领域词汇与设计决策写在模块 docstring 与根 `README.md`。公开仓库不依赖额外的 `GLOSSARY.md` 或 ADR 目录；需要追溯旧引擎时再看本地私有 `docs/`，它不参与构建或运行。
 
+根 README 是双语的：`README.md`（英文，主稿）与 `README.zh.md`（中文）必须在同一次改动里同步，新增段落先写英文再翻中文。`tests/unit/test_readme_parity.py` 对账两边的围栏代码块（逐字节）、标题层级、表格行数与形状、行内代码（参数名/环境变量/路径的出现次数）与链接；只改一份会被 CI 拦下。
+
 ### Local scratch（本机临时产物）
 
 本机临时产物放仓库根的 `.tmp/`（已被 `.gitignore` 忽略），**不要**放 `/tmp` 或 `$TMPDIR`：本机开机会清空 `/tmp`（2026-11-19 实测：重启后 `/tmp` 里没有一项早于 boottime），macOS 还会按访问时间清理 `$TMPDIR` 里的条目。两种失效都表现为"重启后一切重算"，而代价本该只是重编一次。

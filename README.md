@@ -1,3 +1,5 @@
+English | [简体中文](README.zh.md)
+
 # SysOne
 
 A fast, local decision inference engine. System-1 speed for edge AI.
@@ -9,14 +11,16 @@ and FFN stages, and runtime-compiled Metal kernels for attention and the GDN
 state. Both halves share IOSurfaces zero-copy.
 
 This README is the complete public path from a fresh clone to a running service
-on an Apple Silicon Mac. It does not require any private repository.
+on an Apple Silicon Mac. It does not require any private repository. It is the
+master copy; the Chinese translation is `README.zh.md` and both are kept in
+sync.
 
 ## What is supported
 
 | Backend | Family | Model | Verified path |
 |---|---|---|---|
-| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) | ANE + Metal, code-row readout |
 | `pooled` | h2o | [`h2oai/h2o-lightning-4b`](https://huggingface.co/h2oai/h2o-lightning-4b) | ANE + Metal, vendor pooled readout |
+| `split` | mude | [`qybaihe/mude-1.0`](https://huggingface.co/qybaihe/mude-1.0) | ANE + Metal, code-row readout |
 
 `--backend reference` is the M0 semantic judge used by tests. It is not a
 production path and requires an explicit `--descriptor`. Non-macOS platforms
@@ -32,7 +36,7 @@ does not.
   16 GB of memory on macOS 15.7.2.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
-- Disk: about 4 GB of weights for mude, about 9.3 GB for h2o, plus several
+- Disk: about 9.3 GB of weights for h2o, about 4 GB for mude, plus several
   GiB of compiled artifacts (h2o is about 3.33 GiB). The weights are downloaded
   on first use.
 
@@ -95,7 +99,7 @@ size and directory; later starts read the `source.json` marker and touch no
 network.
 
 - Default directory: `~/Library/Caches/sysone/weights/<repo directory>`
-  (`mude-1.0`, `h2o-lightning-4b`). `SYS1_WEIGHTS_DIR` overrides it.
+  (`h2o-lightning-4b`, `mude-1.0`). `SYS1_WEIGHTS_DIR` overrides it.
 - `--offline` forbids the download. A missing package then fails with the exact
   pinned `hf download` command; an air-gapped host copies a finished package
   (including its `source.json`) under `SYS1_WEIGHTS_DIR`.
@@ -109,7 +113,7 @@ network.
 ## Start the service
 
 ```sh
-sysone serve --model mude
+sysone serve --model h2o
 ```
 
 That one command is the whole path. On the first start it downloads the pinned
@@ -119,10 +123,10 @@ and report `compile 0.00s`. Run it again at any time: it is idempotent and never
 rebuilds what is already on disk.
 
 The port is bound before loading, so `/health` and `/v1/systemone` answer `503`
-until the ready line. For h2o use `--model h2o`. The bidirectional
-`noncausal_full` mode requires the whole prompt to fit in one ANE bucket, so
-long prompts need `--bucket 4096` (the default bucket is 1024); the causal
-default has no such constraint.
+until the ready line. For mude use `--model mude`. h2o also accepts the
+bidirectional `noncausal_full` mode, which requires the whole prompt to fit in
+one ANE bucket: long prompts need `--bucket 4096` (the default bucket is 1024),
+while the causal default has no such constraint.
 
 ### Options
 
@@ -131,12 +135,12 @@ what a first run needs; every flag is optional.
 
 | Flag | Default / values | Meaning |
 |---|---|---|
-| `--model {mude,h2o}` | from `--backend` or `--weights` | model family |
+| `--model {h2o,mude}` | from `--backend` or `--weights` | model family |
 | `--backend {split,pooled,reference}` | from `--model` | execution path; `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |
 | `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`prefix_noncausal` for mude, `causal` for h2o) | mask; a request can override it |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `16384` | GPU buffer width, also the max input tokens |
 | `--W N` | `4` | resident layers; `0` keeps all of them |
@@ -230,7 +234,7 @@ serialized as JSON into the prompt.
     "q1": {"type": "choice", "choice": "continue", "probabilities": {"continue": 0.7, "divert": 0.3}}
   },
   "usage": {"input_tokens": 123, "output_tokens": 0},
-  "attention_mode": "prefix_noncausal",
+  "attention_mode": "causal",
   "attention_trained": true
 }
 ```
@@ -245,11 +249,11 @@ serialized as JSON into the prompt.
 
 ## Capability matrix
 
-| | mude | h2o |
+| | h2o | mude |
 |---|---|---|
-| Question kinds | `choice`, `noul` | `choice`, `noul`, `score` |
-| Attention modes | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) | `causal` (default), `noncausal_full` |
-| Readout | fixed 255-row code table | vendor pooled readout |
+| Question kinds | `choice`, `noul`, `score` | `choice`, `noul` |
+| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) |
+| Readout | vendor pooled readout | fixed 255-row code table |
 | Max options per question | 255 | 255 |
 | Max input tokens | `--width` (default 16384) | `--width` (default 16384) |
 | Vision | available by default (`--vision auto`) | available by default (`--vision auto`) |
@@ -316,8 +320,8 @@ only the load. `--vision off` skips the tower and its programs. The third dylib
 
 ## Licenses
 
-The model weights carry their own licenses: mude is MIT for the changed files
-plus Apache-2.0 for the Qwen base; h2o is Apache-2.0. Their `LICENSE`, `NOTICE`,
+The model weights carry their own licenses: h2o is Apache-2.0; mude is MIT for
+the changed files plus Apache-2.0 for the Qwen base. Their `LICENSE`, `NOTICE`,
 and `LICENSES/` files are part of the download and must be kept.
 
 The engine source in this repository does not yet carry a root `LICENSE`; that
