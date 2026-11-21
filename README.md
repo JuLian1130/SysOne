@@ -21,13 +21,7 @@ questions and options, and returns a probability for every option.
   own torch engine on the same MPS machine and the same int8 checkpoint — 1.2 s
   per question against 10.2 s.
 
-```
-111 questions, one per request, noncausal_full, h2o 4B int8
-loading excluded; one block ≈ 28 s
-
-SysOne   ANE + Metal   136.03  █████
-vendor   torch, MPS   1137.30  █████████████████████████████████████████
-```
+![h2o on the 111-question benchmark: 136.03 s on SysOne, 1137.30 s on the vendor's torch engine](assets/h2o-111.svg)
 
 ## Requirements
 

@@ -17,13 +17,7 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
   136 秒；同一台机器的 MPS 上、同一份 int8 权重，厂商自己的 torch 引擎要 1137 秒 ——
   每题 1.2 秒对 10.2 秒。
 
-```
-111 questions, one per request, noncausal_full, h2o 4B int8
-loading excluded; one block ≈ 28 s
-
-SysOne   ANE + Metal   136.03  █████
-vendor   torch, MPS   1137.30  █████████████████████████████████████████
-```
+![h2o 在 111 道题基准上：SysOne 136.03 秒，厂商 torch 引擎 1137.30 秒](assets/h2o-111.svg)
 
 ## 环境要求
 
