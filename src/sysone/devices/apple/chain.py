@@ -375,7 +375,10 @@ class SplitChain:
                         quantize=quantize, source=source, split=split,
                     )
                     compile_s += time.perf_counter() - building
-                layer = AneLayer(runtime, files, name=f"mude{chain_id}_layer_{index}",
+                # program 名带上家族：ANE 报错时 `program=` 就是这一串，没有它分不清是
+                # 哪条链的哪一层（对拍时 numpy 与 Metal、或者两个模型的两条链会同时活着）。
+                layer = AneLayer(runtime, files,
+                                 name=f"{weights.descriptor.family}{chain_id}_layer_{index}",
                                  hidden=hidden, core_out=geometry.core_out,
                                  cout=cout, ffn=ffn, s=s, pool=pool,
                                  split_rows=split)
