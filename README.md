@@ -36,9 +36,8 @@ does not.
   GiB of compiled artifacts (h2o is about 3.33 GiB). The weights are downloaded
   on first use.
 
-Versions are pinned: engine `0.1.0`; compiled artifact format version 3 (shown by
-`sysone doctor --platform apple` as `artifact_version`); model revisions are
-pinned in `src/sysone/models/sources.py`.
+Versions are pinned: engine `0.1.0`; compiled artifact format version 3; model
+revisions are pinned in `src/sysone/models/sources.py`.
 
 ## Install
 
@@ -83,22 +82,17 @@ Do not use `/tmp`: macOS clears it on reboot, and a missing dylib makes the whol
 Apple path unavailable. `ANE_SRC` can point the script at another source
 directory; the repository source is `tools/native/`.
 
-Verify the machine can see them:
-
-```sh
-sysone doctor --platform apple
-```
-
-The report includes the loaded `libe8ane.dylib` path, ANE program count, memory
-figures, and the available dtypes and quantizations.
+The engine finds `.tmp/e8` on its own (`SYS1_E8_DIR` overrides it); if a dylib
+is missing, the startup error names the path and tells you to run the build
+script.
 
 ## Weights
 
-`sysone run`, `serve` and `compile` resolve the weight package themselves. If
-`--weights` is omitted and the package is not cached, the first command
-downloads it from Hugging Face at a pinned revision, then compiles the ANE
-artifacts. The download prints one line with the repository, revision, size and
-directory; later starts read the `source.json` marker and touch no network.
+`sysone serve` resolves the weight package itself. If `--weights` is omitted
+and the package is not cached, the first start downloads it from Hugging Face at
+a pinned revision. The download prints one line with the repository, revision,
+size and directory; later starts read the `source.json` marker and touch no
+network.
 
 - Default directory: `~/Library/Caches/sysone/weights/<repo directory>`
   (`mude-1.0`, `h2o-lightning-4b`). `SYS1_WEIGHTS_DIR` overrides it.
@@ -112,25 +106,23 @@ directory; later starts read the `source.json` marker and touch no network.
 - `HF_TOKEN` is honoured through `huggingface_hub`'s standard environment for
   private mirrors.
 
-## Run mude (`split`)
+## Start the service
 
 ```sh
-sysone compile --model mude
-sysone run --model mude --input examples/request-run.json
+sysone serve --model mude
 ```
 
-The first command in a fresh cache downloads the weights and builds the
-artifacts (see [Weights](#weights)); `sysone compile` is optional, but it keeps
-a later `serve` from paying that cost at startup. `--backend` and `--model` are
-optional when `--weights` is given: the family is inferred from the weight
-package (`decision_config.json` marks mude), and the backend is inferred from
-the family (`mude → split`).
+That one command is the whole path. On the first start it downloads the pinned
+weights, compiles the missing ANE programs (the vision tower's 26 included) and
+then prints `sysone serve: ready in ...s`; later starts read the artifact cache
+and report `compile 0.00s`. Run it again at any time: it is idempotent and never
+rebuilds what is already on disk.
 
-Serve it:
-
-```sh
-sysone serve --model mude --port 8000
-```
+The port is bound before loading, so `/health` and `/v1/systemone` answer `503`
+until the ready line. For h2o use `--model h2o`. The bidirectional
+`noncausal_full` mode requires the whole prompt to fit in one ANE bucket, so
+long prompts need `--bucket 4096` (the default bucket is 1024); the causal
+default has no such constraint.
 
 In another shell:
 
@@ -141,40 +133,11 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
   -d @examples/request-service.json
 ```
 
-## Run h2o (`pooled`)
-
-```sh
-sysone compile --model h2o --attention-mode causal
-sysone run --model h2o --input examples/request-run.json --attention-mode causal
-sysone serve --model h2o --port 8000 --attention-mode causal
-```
-
-The first command downloads the weights if they are not cached. The h2o family
-already defaults to causal attention; the explicit flag documents the path. For
-the bidirectional `noncausal_full` mode the whole prompt must fit in one ANE
-bucket, so long prompts need `--bucket 4096` (the default bucket is 1024). The
-causal default does not have that constraint.
-
 ## Requests
 
-There are two wire shapes, one for the CLI and one for the service.
-
-**CLI** (`examples/request-run.json`) carries `state` plus a `questions` **array**.
-Each question has `text`, `options`, and optionally `kind` (`choice`, `noul`,
-`score`):
-
-```json
-{
-  "state": {"battery": 8},
-  "questions": [
-    {"text": "What now?", "options": ["keep going", "divert"]}
-  ]
-}
-```
-
-**Service** (`examples/request-service.json`) carries `state` plus a `questions`
-**object** keyed by question id. Each question has `type`, `instructions`, and
-`criteria`:
+`/v1/systemone` carries `state` plus a `questions` **object** keyed by question
+id (`examples/request-service.json`). Each question has `type`, `instructions`,
+and `criteria`:
 
 ```json
 {
@@ -260,27 +223,20 @@ only the load. `--vision off` skips the tower and its programs. The third dylib
   `SYS1_WEIGHTS_DIR`; `--weights` points at a package directly and never
   downloads. Deleting the directory forces a re-download.
 - Default artifacts directory: `~/Library/Caches/sysone/artifacts`. Override with
-  `--artifacts` or `SYS1_ARTIFACTS_DIR`. Deleting it forces a recompile.
-- `sysone compile` pre-builds the artifacts, including the vision tower's 26
-  programs when vision is enabled. The first compile is minutes-level; later
-  starts hit the cache and the compile phase is about 0 s.
+  `--artifacts` or `SYS1_ARTIFACTS_DIR`. Deleting it forces a recompile (the
+  first compile is minutes-level; later starts report `compile 0.00s`).
 - `--quant {int8,fp16}` selects the ANE weight storage (default `int8`):
   per-output-channel codes with fp16 scales, or plain fp16. Compute stays fp16
   either way (ANE has no int8 MAC). The two artifact sets live side by side,
   `s<bucket>` for int8 and `s<bucket>-fp16` for fp16, so switching does not
-  overwrite the other mode. `sysone doctor --artifacts` takes the same flag; a
-  mismatch in the flag reports the other mode's layers as outstanding.
+  overwrite the other mode.
 - `--bucket` is the ANE program column width (default 1024); `--width` is the
   GPU buffer width and the max input tokens (default 16384); `--W` is the
   resident window in layers (default 4 = one block).
 - On a 16 GB machine, lower `--width` (for example `--width 8192`) to shrink the
   GPU-side buffers. A prompt longer than `--width` is rejected with `422`.
-- `sysone doctor --platform apple --model h2o
-  --weights ~/Library/Caches/sysone/weights/h2o-lightning-4b --artifacts <dir>`
-  reports how many compiled layers are reusable and which are missing (`doctor`
-  takes an explicit path; it never downloads).
 - A geometry outside the measured whitelist still runs, but its numbers are
-  experimental; the doctor output says so.
+  experimental.
 
 ## Troubleshooting
 
