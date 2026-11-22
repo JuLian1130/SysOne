@@ -223,12 +223,10 @@ class SplitRunner(VisionRunner, DecisionRunner):
         `use_prefix=False`（`noncausal_full`）时前缀长度传 0：那条掩码没有前缀行，带进去会
         让批里的序列按另一种掩码收行。
 
-        **读出不在末位的序列不进合批**：块对角那条路只交每条序列的**末行** hidden
-        （`last_hidden_batched`）。`Encoded.readout` 非 `None` 时退回逐题 —— 位置错一位就是
-        拿末尾几个 token 的概率当答案，这条不需要试一次才知道。
+        **读出位置按题传下去**（`positions`）：pplx v1.2 的标记不在末位（后面还有模板补的
+        助手头），每题的读出列都是自己量出来的。打包区里最后层本来就整段算满，所以读哪一列
+        只是取哪一格 —— 与逐题那条路读的是同一列（`forward_at`），数值差只在批的 ulp 量级。
         """
-        if any(item.readout is not None for item in encoded):
-            return None
         batch = getattr(self._require_chain(), "forward_batched", None)
         if not callable(batch):
             return None
@@ -237,6 +235,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
             options=[len(item.labels) for item in encoded],
             prefixes=[0 if not use_prefix or item.prefix_len is None else item.prefix_len
                       for item in encoded],
+            positions=[item.readout for item in encoded],
             causal=causal,
         )
 

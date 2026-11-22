@@ -506,8 +506,14 @@ class MudePipeline:
 
     def run_batched(self, rows: Sequence[np.ndarray], *,
                     prefixes: Sequence[int] = (),
-                    causal: bool = False) -> list[np.ndarray] | None:
-        """N 条**互不相干**的序列并排跑一个 pass，返回各自的末行 hidden（`[hidden]` fp32）。
+                    causal: bool = False,
+                    positions: Sequence[int | None] | None = None,
+                    ) -> list[np.ndarray] | None:
+        """N 条**互不相干**的序列并排跑一个 pass，返回各自读出位置上那一行的 hidden。
+
+        `positions[k]` 是第 k 条要读的列（`None` = 末行）；不给就是每条都读末行 —— 那是
+        `last_hidden_batched` 的用法。非末位读出（pplx v1.2 的标记后面还有模板补的助手头）
+        靠它才能进这个批：读哪一列不影响这趟算出什么，只是取哪一格。
 
         **布局**：一条序列一个**槽**，槽宽 `slotw = 向上取整到 128 的最长序列`，一格（= 一个瓦片
         = `bucket` 列）里塞 `bucket / slotw` 条。这一条是收益的全部来源：**ANE 的算力按瓦片计**
@@ -532,18 +538,34 @@ class MudePipeline:
 
         形状判据只在 `_slot_layout` 里有一份，调用方**不要**再抄一份预判：抄出来的那份曾经漏过
         "槽宽整除桶宽"，于是它判"能批"、这里拒，一次本该静默回退的请求变成了 500。
+
+        **位置越界是错误，不是 `None`**：读出位置来自编码（标记在 id 里的下标），它越界说明
+        编码与传进来的序列对不上，退回逐条只会算出同样的错，所以当场抛 `ValueError`。
         """
         if not rows:
             raise ConfigError("批里至少要有 一条序列")
         lengths = [int(np.asarray(row).shape[0]) for row in rows]
         if min(lengths) <= 0:
             raise ConfigError("批里的序列长度必须为正", lengths=lengths)
+        if positions is not None:
+            if len(positions) != len(rows):
+                raise ValueError(
+                    f"positions 与序列条数不一致：{len(positions)} vs {len(rows)}")
+            for index, position in enumerate(positions):
+                if position is not None and not 0 <= int(position) < lengths[index]:
+                    raise ValueError(
+                        f"第 {index} 条的读出位置 {int(position)} 不在 [0, {lengths[index]}) 里")
         if len(rows) == 1:
             # 一条不成批：走普通那条路（与 `run` 逐位同一条代码），省得为 1 条造一个槽位布局。
-            # 这条出口只读末行，所以末层可以走 S3 的末行规则。
+            # 读末行时末层可以走 S3 的末行规则；要读别的列就得让末层算满。
+            position = None if positions is None else positions[0]
+            if position is None:
+                self.run(np.asarray(rows[0]), length=lengths[0], causal=causal,
+                         last_row_only=True)
+                return [self.last_hidden(lengths[0])]
             self.run(np.asarray(rows[0]), length=lengths[0], causal=causal,
-                     last_row_only=True)
-            return [self.last_hidden(lengths[0])]
+                     last_row_only=False)
+            return [self.hidden_row(int(position))]
         # 打包：一条序列一个**槽**，槽宽取"最长序列向上取到 AT_BM"，一格里能塞几条就塞几条。
         # 这一步决定赚多少 —— ANE 的算力是按**瓦片**计的（program 的静态宽度就是桶宽），
         # 所以 4 条塞进 1 格只花 1 格的 ANE 时间；一条一格就和逐条跑一样贵。
@@ -576,9 +598,16 @@ class MudePipeline:
                 self._residency.finish()
         finally:
             self._slot_fresh = False
-        # `last_hidden(n)` 取的是第 `n-1` 列，所以这里传"末列 + 1"。
-        return [self.last_hidden(layout.starts[index] + lengths[index])
-                for index in range(len(rows))]
+        # `last_hidden(n)` 取的是第 `n-1` 列，所以这里传"末列 + 1"；指定位置则是槽起点 + 该列。
+        out: list[np.ndarray] = []
+        for index in range(len(rows)):
+            start = layout.starts[index]
+            position = None if positions is None else positions[index]
+            if position is None:
+                out.append(self.last_hidden(start + lengths[index]))
+            else:
+                out.append(self.hidden_row(start + int(position)))
+        return out
 
     def _slot_table(self, tile: int) -> tuple[int, ...]:
         """这一瓦片里各槽位的可行行数（按片内相对槽位排，表长 = `per`）。"""

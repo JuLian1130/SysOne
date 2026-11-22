@@ -659,6 +659,7 @@ class SplitChain:
     def forward_batched(
         self, sequences: Sequence[Sequence[int]], *, options: Sequence[int],
         prefixes: Sequence[int] = (), causal: bool = False,
+        positions: Sequence[int | None] | None = None,
     ) -> list[np.ndarray] | None:
         """N 条**互不相干**的序列并排跑一个 pass，返回各自的 softmax 概率（按 `options` 截断）。
 
@@ -666,15 +667,19 @@ class SplitChain:
         （GDN 状态每段一份零值，注意力按块对角互不可见）。所以它能合的是"不同 state 的独立
         请求"，而 `forward_shared` 合的是"同一个 state 的多个问题"。
 
-        `options[k]` 是第 k 条序列的候选码数；`mm` 不支持 —— 带图的序列要走塔与像素管线，
-        那是按请求的，不进这个批。
+        `options[k]` 是第 k 条序列的候选码数。`positions[k]` 是第 k 条序列里的读出列
+        （`None` = 末行）—— 非末位读出的协议（pplx v1.2 的标记后面还有模板补的助手头）靠它
+        与本条序列里的最后一列区分开；不给就每条都读末行。
+
+        `mm` 不支持 —— 带图的序列要走塔与像素管线，那是按请求的，不进这个批。
 
         这批排不进一趟打包区（每条 ≤ 桶宽、槽宽整除桶宽、打包区 ≤ 缓冲宽度）时返回 `None`：
         调用方（策略层）退回逐条整趟。形状判据只有流水线那一份，这里不预判。
         """
         if len(options) != len(sequences):
             raise ValueError(f"options 与序列条数不一致：{len(options)} vs {len(sequences)}")
-        hidden = self.last_hidden_batched(sequences, causal=causal, prefixes=prefixes)
+        hidden = self.last_hidden_batched(
+            sequences, causal=causal, prefixes=prefixes, positions=positions)
         if hidden is None:
             return None
         readout = self._require_readout()
@@ -684,11 +689,16 @@ class SplitChain:
     def last_hidden_batched(
         self, sequences: Sequence[Sequence[int]], *, prefixes: Sequence[int] = (),
         causal: bool = False,
+        positions: Sequence[int | None] | None = None,
     ) -> list[np.ndarray] | None:
-        """块对角的末行 hidden：N 条互不相干的序列并排一个 pass，各交一份最终归一化 hidden。
+        """块对角的读出 hidden：N 条互不相干的序列并排一个 pass，各交一份最终归一化 hidden。
 
         `last_hidden()` 的"多条序列"版本。它与 `last_hidden_shared` 的差别是**没有共享前缀**：
         它合的是"不同 state 的独立请求"，后者合的是"同一个 state 的多个问题"。
+
+        `positions[k]` 选第 k 条序列里要读的那一列（`None` = 末行）。读哪一列不影响这趟算出
+        什么：打包区里最后层本来就整段算满（`run_batched` 不走 S3 的末行裁剪），所以这是取
+        哪一格的问题，不是多花一趟。
 
         装不进一趟的打包区（每条 ≤ 桶宽、槽宽整除桶宽、总列数 ≤ 缓冲宽度）返回 `None` ——
         不是错误，调用方退回逐条整趟即可（形状判据只有 `Pipeline._slot_layout` 一份）。
@@ -702,7 +712,8 @@ class SplitChain:
         # RoPE 表按**最长**那条准备：`e8_fold` 之后每段各自从 0 起，所以前缀那段行数够用即可。
         self._prepare_rope(None, max(lengths))
         rows = [self._embeddings(self._ids_and_length(seq, 0)[0]) for seq in sequences]
-        hidden = self._pipeline.run_batched(rows, prefixes=prefixes, causal=causal)
+        hidden = self._pipeline.run_batched(
+            rows, prefixes=prefixes, causal=causal, positions=positions)
         if hidden is None:
             return None
         # 流水线给的是**最后一层的原始隐态**，`_final_norm` 还没做 —— 与 `last_hidden()`

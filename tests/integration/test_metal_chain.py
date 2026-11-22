@@ -566,6 +566,39 @@ def test_forward_batched_returns_none_when_the_batch_does_not_pack(chains) -> No
     assert gpu.forward_batched(sequences, options=[4, 4, 4]) is None
 
 
+def test_forward_batched_reads_each_slot_at_its_own_position(chains) -> None:
+    """每条序列按**自己的**读出列取读数：与它单独整趟、钉在同一个位置对得上。
+
+    非末位读出（pplx v1.2 的标记后面还有模板补的助手头）以前被整批拒掉。读哪一列不影响
+    这趟算出什么 —— 打包区里最后层本来就整段算满 —— 所以这里量的是"取对格子"：槽 0 与
+    `forward_at` 逐位相同，其余槽按票据 10 的契约差 ≤ `SHARED_TOL`，答案必须相同。
+    """
+    _, gpu = chains
+    sequences = [_ids(120, seed=7), _ids(96, seed=11)]
+    positions = [17, 0]
+    packed = gpu.forward_batched(sequences, options=[4, 4], positions=positions)
+    assert packed is not None, "两条短序列该能排进一个桶"
+    alone = [gpu.forward_at(sequence, position, options=4)
+             for sequence, position in zip(sequences, positions)]
+    assert np.array_equal(packed[0], alone[0]), "槽 0 的指定列不再逐位"
+    for index, (got, want) in enumerate(zip(packed, alone)):
+        drift = float(np.abs(got - want).max())
+        assert drift <= SHARED_TOL, f"第 {index} 条序列的指定列差 {drift:.3e}"
+        assert int(np.argmax(got)) == int(np.argmax(want)), f"第 {index} 条的答案变了"
+    # 与"读末行"必须不同，否则这条测试什么都没证明（位置真的生效了）。
+    last = gpu.forward_batched(sequences, options=[4, 4])
+    assert last is not None
+    assert float(np.abs(last[0] - packed[0]).max()) > 1e-3, "第 17 列与末行不可能一样"
+
+
+def test_forward_batched_refuses_a_position_outside_its_sequence(chains) -> None:
+    """读出位置越界是编码与序列对不上，退回逐条只会算出同样的错 —— 当场报错。"""
+    _, gpu = chains
+    sequences = [_ids(64, seed=3), _ids(64, seed=4)]
+    with pytest.raises(ValueError, match="读出位置"):
+        gpu.last_hidden_batched(sequences, positions=[10, 64])
+
+
 def test_last_hidden_batched_stays_finite_and_steady_over_repeated_passes(chains) -> None:
     """块对角的末行 hidden：连跑几遍都要与逐条整趟一致，而不只是第一遍。
 

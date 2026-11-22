@@ -736,10 +736,13 @@ class TiledChain(SharedChain):
         super().__init__()
         self.rows: list[tuple[tuple[int, ...], ...]] = []
         self.prefixes: tuple[int, ...] | None = None
+        self.positions: tuple[int | None, ...] | None = None
 
-    def forward_batched(self, sequences, *, options, prefixes, causal=False):
+    def forward_batched(self, sequences, *, options, prefixes, positions=None, causal=False):
         self.rows.append(tuple(tuple(sequence) for sequence in sequences))
         self.prefixes = tuple(int(value) for value in prefixes)
+        self.positions = None if positions is None else tuple(
+            None if value is None else int(value) for value in positions)
         return [[1.0 / int(count)] * int(count) for count in options]
 
 
@@ -996,7 +999,7 @@ def test_noncausal_questions_of_one_request_tile_into_one_pass() -> None:
 
 
 class _NarrowTiledChain(TiledChain):
-    def forward_batched(self, sequences, *, options, prefixes, causal=False):
+    def forward_batched(self, sequences, *, options, prefixes, positions=None, causal=False):
         return None
 
 
@@ -1008,6 +1011,36 @@ def test_noncausal_questions_fall_back_to_serial_when_the_pass_does_not_fit() ->
                        MaskMode.NONCAUSAL_FULL)
     assert runner.decisions.batch_hit == 0 and runner.decisions.batch_fallback == 1
     assert len(chain.calls) == 2, "装不下就退回逐题"
+
+
+def test_a_readout_that_is_not_last_tiles_with_its_own_column() -> None:
+    """读出不在末位的协议（pplx v1.2）也要能进块对角：每题的列一起传下去。
+
+    以前这条路径被整批拒掉（只交末行 hidden），于是同一请求的多题退回逐题；读出位置本来就是
+    编码时量出来的下标，块对角只是"取哪一格"，不是另一种语义。
+    """
+    chain = TiledChain()
+    plan = ((11, 12, 13, 14, 15, 16), 0, ("a", "b"), (0, 1), 3)
+    runner = _forced_runner([plan, plan], chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2, mode=MaskMode.NONCAUSAL_FULL),
+                       MaskMode.NONCAUSAL_FULL)
+    assert runner.decisions.batch_hit == 1, "非末位读出不该再把整批挡回去"
+    assert chain.positions == (3, 3)
+    assert chain.calls == [], "能合批时不该再逐题整趟"
+
+
+def test_a_batch_mixes_last_row_and_marker_readouts() -> None:
+    """末位读出与标记读出可以同批：末位的传 `None`（链读末行），标记的传它自己的列。"""
+    chain = TiledChain()
+    plans = [((11, 12, 13), 0, ("a", "b"), (0, 1), None),
+             ((21, 22, 23, 24), 0, ("a", "b"), (0, 1), 1)]
+    runner = _forced_runner(plans, chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2, mode=MaskMode.NONCAUSAL_FULL),
+                       MaskMode.NONCAUSAL_FULL)
+    assert runner.decisions.batch_hit == 1
+    assert chain.positions == (None, 1)
 
 
 class _ReadoutChain(FakeChain):
