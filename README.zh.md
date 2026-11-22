@@ -125,6 +125,7 @@ HTTP：
 | `--port N` | `8000` | 监听端口；`0` 取随机空闲口 |
 | `--queue N` | `8` | 准入等待位 |
 | `--admit-timeout S` | `120` | 请求最多等多少秒，超过回 `429` |
+| `--access-log PATH` | 关 | 每个 HTTP 请求向这个文件追加一行 JSON；`/v1/systemone` 的行另带输入 token、题数与 attention 口径 |
 | `--name NAME` | 模型 id | 回包里的 `model` 字段 |
 
 环境变量覆盖：`SYS1_LOG_LEVEL`（默认 `info`）、`SYS1_WEIGHTS_DIR`、

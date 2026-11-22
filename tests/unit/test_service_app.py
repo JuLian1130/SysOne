@@ -91,7 +91,8 @@ def _decider(engine: FakeEngine | None = None) -> service_app.EngineDecider:
 def start_server():
     servers: list[service_app.SystemOneServer] = []
 
-    def start(*, load=None, engine=None, api_key=None, queue=2, workers=1, debug=False):
+    def start(*, load=None, engine=None, api_key=None, queue=2, workers=1, debug=False,
+              access_log=None):
         decider = None if load else _decider(engine)
         server, gate = service_app.serve(
             load=load or (lambda: (decider, CompilationTimes(0.0, 0.0, 0.0))),
@@ -101,6 +102,7 @@ def start_server():
             workers=workers,
             queue=queue,
             debug_timings=debug,
+            access_log=access_log,
         )
         threading.Thread(target=server.serve_forever, name="test-http", daemon=True).start()
         servers.append(server)
@@ -582,3 +584,55 @@ def test_an_engine_that_cannot_batch_is_not_given_a_batcher() -> None:
     assert decider.batcher is None
     assert decider.metrics()["batching"] is None
     assert decider.answer(CHOICE)["answers"]
+
+
+# ---------------------------------------------------------------------- 访问日志
+
+
+def test_no_access_log_unless_asked(start_server, capsys) -> None:
+    """默认静默：标准库那行纯文本访问日志也关掉，只有给了 `--access-log` 才写。"""
+    server, gate = start_server()
+    assert gate.wait(5.0)
+    status, _, _ = _call(server, "POST", "/v1/systemone", body=CHOICE)
+    assert status == 200
+    assert "POST /v1/systemone" not in capsys.readouterr().err
+
+
+def test_access_log_appends_one_json_line_per_request(start_server, tmp_path) -> None:
+    """一行一个请求：状态码、耗时都在；推理请求另带 token 数、题数与 attention 口径。"""
+    log = tmp_path / "access.jsonl"
+    server, gate = start_server(access_log=log)
+    assert gate.wait(5.0)
+    assert _call(server, "POST", "/v1/systemone", body=CHOICE)[0] == 200
+    assert _call(server, "GET", "/health")[0] == 200
+
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 2
+    first, second = records
+    assert first["logger"] == "sysone.service.access"
+    assert first["level"] == "info"
+    assert first["msg"] == "request"
+    data = first["data"]
+    assert data["method"] == "POST"
+    assert data["path"] == "/v1/systemone"
+    assert data["status"] == 200
+    assert data["duration_ms"] >= 0
+    assert data["input_tokens"] == 10
+    assert data["questions"] == 1
+    assert data["attention_mode"] == "prefix_noncausal"
+    assert data["attention_trained"] is True
+    # 非推理路由只记 HTTP 那一层，不硬塞引擎字段。
+    assert second["data"]["path"] == "/health"
+    assert second["data"]["status"] == 200
+    assert "input_tokens" not in second["data"]
+
+
+def test_an_unwritable_access_log_fails_at_startup(tmp_path) -> None:
+    """路径写不了就在启动时明确报错，而不是等第一个请求才丢日志。"""
+    with pytest.raises(ConfigError):
+        service_app.serve(
+            load=lambda: (_decider(), CompilationTimes(0.0, 0.0, 0.0)),
+            host="127.0.0.1",
+            port=0,
+            access_log=tmp_path / "missing" / "access.jsonl",
+        )

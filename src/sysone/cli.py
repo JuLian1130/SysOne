@@ -327,6 +327,10 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8000, help="监听端口（0 表示随机空闲端口）")
     serve.add_argument("--queue", type=int, default=None, help="准入等待位（默认取 scheduler.queue）")
     serve.add_argument("--admit-timeout", type=float, default=120.0, help="排队超过这么多秒就 429")
+    serve.add_argument(
+        "--access-log", type=Path, default=None, metavar="PATH",
+        help="把每个请求写成一行 JSON 追加到这个文件；默认不打访问日志",
+    )
     serve.add_argument("--name", default=None, help="回包里的 model 名（默认模型 id）")
 
     sub.add_parser(
@@ -697,6 +701,7 @@ def _serve(args: argparse.Namespace) -> int:
         queue=queue,
         admit_timeout=float(args.admit_timeout),
         debug_timings=bool(args.debug_timings),
+        access_log=args.access_log,
     )
 
 

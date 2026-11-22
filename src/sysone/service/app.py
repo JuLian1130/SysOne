@@ -15,16 +15,19 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from ..domain.decision import DecisionRequest, DecisionResult
 from ..domain.work import CompilationTimes
 from ..engine.stats import RunStats
 from ..errors import NotReadyError, SysOneError
+from ..logging import file_logger
 from . import protocol
 from .admission import Admission
 from .batching import Batcher
@@ -217,12 +220,21 @@ class SystemOneServer(ThreadingHTTPServer):
         api_key: str | None = None,
         admission: Admission | None = None,
         debug_timings: bool = False,
+        access: logging.Logger | None = None,
     ) -> None:
         super().__init__(address, SystemOneHandler)
         self.gate = gate
         self.key_digest = hashlib.sha256(api_key.encode("utf-8")).digest() if api_key else None
         self.admission = admission or Admission()
         self.debug_timings = bool(debug_timings)
+        self.access = access
+
+    def server_close(self) -> None:
+        super().server_close()
+        if self.access is not None:
+            handlers, self.access.handlers = self.access.handlers[:], []
+            for handler in handlers:
+                handler.close()
 
 
 class SystemOneHandler(BaseHTTPRequestHandler):
@@ -241,6 +253,14 @@ class SystemOneHandler(BaseHTTPRequestHandler):
         if code == HTTPStatus.HTTP_VERSION_NOT_SUPPORTED:
             code = HTTPStatus.BAD_REQUEST
         super().send_error(code, message, explain)
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._last_status = int(code)
+        super().send_response(code, message)
+
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:
+        """关掉标准库那行纯文本访问日志：要打就由 `server.access` 打结构化的一行。"""
+        return
 
     def do_GET(self) -> None:
         self.route("GET")
@@ -269,19 +289,22 @@ class SystemOneHandler(BaseHTTPRequestHandler):
         """先过准入（读 body 之前），再读 body，最后分派 / 重定向 / 405 / 404。"""
         # 目标按原样取：http.server 会把开头的 "//" 折叠掉。
         path, mark, query = self.requestline.split()[1].partition("?")
+        started = time.perf_counter() if self.server.access is not None else None
+        self._last_status: int | None = None
+        self._request_data: dict[str, object] = {}
         admitted = False
-        if path == protocol.SYSTEM_ONE_PATH and method == protocol.ROUTES[protocol.SYSTEM_ONE_PATH]:
-            if not self.server.admission.enter():
-                on_duty, waiting = self.server.admission.snapshot()
-                self.close_connection = True
-                self._reply(
-                    HTTPStatus.TOO_MANY_REQUESTS,
-                    {"detail": f"at capacity: {on_duty} in flight, {waiting} waiting"},
-                    {"Retry-After": str(self.server.admission.retry_after)},
-                )
-                return
-            admitted = True
         try:
+            if path == protocol.SYSTEM_ONE_PATH and method == protocol.ROUTES[protocol.SYSTEM_ONE_PATH]:
+                if not self.server.admission.enter():
+                    on_duty, waiting = self.server.admission.snapshot()
+                    self.close_connection = True
+                    self._reply(
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                        {"detail": f"at capacity: {on_duty} in flight, {waiting} waiting"},
+                        {"Retry-After": str(self.server.admission.retry_after)},
+                    )
+                    return
+                admitted = True
             try:
                 raw = self.read_body()
             except protocol.Framing as exc:
@@ -292,6 +315,19 @@ class SystemOneHandler(BaseHTTPRequestHandler):
         finally:
             if admitted:
                 self.server.admission.leave()
+            if started is not None:
+                self._record_access(method, path, started)
+
+    def _record_access(self, method: str, path: str, started: float) -> None:
+        """一个请求一行 JSON；`server.access` 为 `None` 时调用方不会进来。"""
+        data = {
+            "method": method,
+            "path": path,
+            "status": self._last_status,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+            **self._request_data,
+        }
+        self.server.access.info("request", extra={"data": data})
 
     def _dispatch(self, method: str, path: str, mark: str, query: str, raw: bytes) -> None:
         try:
@@ -342,7 +378,15 @@ class SystemOneHandler(BaseHTTPRequestHandler):
     def _answer(self, path: str, raw: bytes) -> dict[str, Any]:
         if path == protocol.SYSTEM_ONE_PATH:
             # 未就绪时先回 503：此时连模型信息都还没定下来，答案更不可能对。
-            return self.server.gate.decider.answer(self.parse(raw))
+            reply = self.server.gate.decider.answer(self.parse(raw))
+            usage = reply.get("usage") or {}
+            self._request_data.update(
+                input_tokens=usage.get("input_tokens"),
+                questions=len(reply.get("answers") or {}),
+                attention_mode=reply.get("attention_mode"),
+                attention_trained=reply.get("attention_trained"),
+            )
+            return reply
         if path == protocol.MODELS_PATH:
             return self.server.gate.decider.models()
         if path == protocol.METRICS_PATH:
@@ -453,9 +497,11 @@ def serve(
     retry_after: int = RETRY_AFTER_SECONDS,
     admit_timeout: float = 120.0,
     debug_timings: bool = False,
+    access_log: str | Path | None = None,
 ) -> tuple[SystemOneServer, Gate]:
     """绑好监听口、后台开始装载，返回 (server, gate)；调用方负责 `serve_forever()`。"""
     gate = Gate()
+    access = file_logger(access_log, name="sysone.service.access") if access_log is not None else None
     server = SystemOneServer(
         (host, int(port)),
         gate,
@@ -464,6 +510,7 @@ def serve(
             workers=workers, queue=queue, retry_after=retry_after, timeout=admit_timeout
         ),
         debug_timings=debug_timings,
+        access=access,
     )
     gate.start(load)
     return server, gate
@@ -480,6 +527,7 @@ def run(
     retry_after: int = RETRY_AFTER_SECONDS,
     admit_timeout: float = 120.0,
     debug_timings: bool = False,
+    access_log: str | Path | None = None,
     announce: bool = True,
 ) -> int:
     """前台服务：边装载边回 503，装载完成后（或失败时）由调用方决定退出码。"""
@@ -493,6 +541,7 @@ def run(
         retry_after=retry_after,
         admit_timeout=admit_timeout,
         debug_timings=debug_timings,
+        access_log=access_log,
     )
     if announce:
         hostname, portname = server.server_address[:2]

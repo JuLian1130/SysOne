@@ -141,6 +141,7 @@ HTTP:
 | `--port N` | `8000` | bind port; `0` picks a free one |
 | `--queue N` | `8` | admission waiting slots |
 | `--admit-timeout S` | `120` | seconds a request may wait before `429` |
+| `--access-log PATH` | off | append one JSON line per HTTP request to this file; `/v1/systemone` lines also carry input tokens, question count and attention mode |
 | `--name NAME` | model id | `model` field in responses |
 
 Environment overrides: `SYS1_LOG_LEVEL` (default `info`), `SYS1_WEIGHTS_DIR`,

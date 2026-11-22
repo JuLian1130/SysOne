@@ -10,9 +10,11 @@ import json
 import logging
 import sys
 import time
+from pathlib import Path
 from typing import IO
 
 from . import env
+from .errors import ConfigError
 
 
 class JsonFormatter(logging.Formatter):
@@ -50,3 +52,19 @@ def get_logger(name: str) -> logging.Logger:
     if name.startswith("sysone"):
         return logging.getLogger(name)
     return logging.getLogger(f"sysone.{name}")
+
+
+def file_logger(path: str | Path, name: str = "sysone.access") -> logging.Logger:
+    """新建一个只写文件的 logger（一行一条 JSON），调用方负责关闭它的 handler。
+
+    不动 `sysone` 根 logger：访问日志落在指定文件，进程里其它日志的去向不变。
+    """
+    logger = logging.Logger(name, level=logging.INFO)
+    logger.propagate = False
+    try:
+        handler = logging.FileHandler(path, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError("访问日志无法打开", path=str(path), error=str(exc)) from exc
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+    return logger
