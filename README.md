@@ -120,7 +120,7 @@ Vision (only for models with a tower):
 | Flag | Default / values | Meaning |
 |---|---|---|
 | `--vision {auto,off}` | `auto` | `off` serves text only; image requests get `422` |
-| `--vision-idle S` | `60` | seconds before the tower is unloaded; `0` unloads after every request |
+| `--vision-idle S` | `0` | seconds before the tower is unloaded; the default unloads it after every request, so an idle server holds no tower memory; raise it (e.g. `60`) to keep the tower warm through a burst |
 | `--vision-bucket N` | chain bucket | tower tile width; must be a multiple of 4 |
 
 HTTP:

@@ -357,7 +357,7 @@ def pooled_runner(
     metal: bool = True,
     resident: int | None = None,
     vision: bool | None = None,
-    vision_idle: float = 60.0,
+    vision_idle: float = 0.0,
     vision_bucket: int | None = None,
 ) -> PooledRunner:
     """装一条 pooled 链：家族给的厂商答面 + 词表行按需取 + ANE 链。
@@ -383,7 +383,7 @@ def pooled_runner(
 
     `vision` 是 `None`（自动）/ `False`（`--vision off`，纯文本服务：不建塔、不读塔权重）。
     h2o 的塔与 mude **同一套几何**，只差 merger 的输出宽度（2560 vs 2048），所以这里不需要
-    第二份实现；`vision_idle` 是塔的空闲卸载秒数（`0` = 每请求后即卸）。
+    第二份实现；`vision_idle` 是塔的空闲卸载秒数，默认 `0`（每请求后即卸，闲时 0 常驻）。
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE

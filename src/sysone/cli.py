@@ -47,9 +47,10 @@ _RESIDENT_W = 4
 # 但它的目录带两个厂商标记件、认不出唯一家族，所以一直要显式 `--model`）。`vendor` 今天没有
 # 出货家族 —— 这条路仍在注册表里，取它就要显式给家族。
 _DEFAULT_FAMILY = {"split": "mude", "pooled": "h2o"}
-# 视觉塔的空闲卸载窗口（票据 07 §6 未定项 2 的默认值）。60 s 是"连续几张图算同一批"的量级：
-# 装一次 0.6–2 s、卸一次同样，窗口短于这个数就等于每张图都付两遍。
-_VISION_IDLE = 60.0
+# 视觉塔的空闲卸载窗口：默认 0 = 每请求后立刻卸，闲时 0 常驻 —— 非文本的塔不该占常态内存。
+# 产物已编好时重装 83–208 ms、卸 31 ms（实测值是票据 07 §6 那一组）；连着来一堆带图请求、
+# 想把这段重装省掉时可以给 60 之类的值，代价是那段时间里 629–690 MiB 不还。
+_VISION_IDLE = 0.0
 # run / serve 只列有 CLI 装配入口的家族。`inspect` / `doctor` 仍列全部家族（它们只看配置）。
 _CLI_FAMILIES = tuple(name for name in families() if family(name).strategy in STRATEGY_BACKENDS)
 
@@ -182,10 +183,10 @@ def _model_flags() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--vision-idle", type=float, default=_VISION_IDLE, dest="vision_idle",
-        help=f"视觉塔空闲多少秒后真卸载（默认 {_VISION_IDLE:.0f}；0 = 每请求后立刻卸）。"
+        help=f"视觉塔空闲多少秒后真卸载（默认 {_VISION_IDLE:.0f} = 每请求后立刻卸，闲时 0 常驻）。"
              "卸载是把 26 个 program 卸掉、面释放，不是挂起。代价已实测：卸一次 31 ms，"
              "装回来 80 ms（其中 64 是 ANE 装载），端到端每图 +119 ms（1024²）/ +78 ms（512²）；"
-             "换来空闲时释放 629–690 MiB（随桶宽）",
+             "换来闲时释放 629–690 MiB（随桶宽）。连着来一堆带图请求时可以给 60 之类，省掉重装",
     )
     common.add_argument(
         "--vision-bucket", type=int, default=None, dest="vision_bucket", metavar="COLS",

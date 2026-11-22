@@ -251,6 +251,23 @@ def test_batch_flag_folds_into_the_scheduler_config() -> None:
     assert scheduler("--batch", "0").batch == 0, "0 也当不攒批（引擎会再取 max(1, …)）"
 
 
+def test_the_tower_is_unloaded_after_every_request_by_default() -> None:
+    """非文本的塔不占常态内存：默认窗口 0（每请求后即卸），留着是显式的选择。
+
+    `_chain_knobs_given` 按"与默认值不同"认显式，所以默认值一改，`--vision-idle 0` 就不再是
+    vendor 那条路要拒的旋钮 —— 这两件事必须由同一个常量决定，否则默认值只是文档里的一句话。
+    """
+    from sysone.cli import _VISION_IDLE, _build_parser, _chain_knobs_given
+
+    def knobs(*argv: str) -> list[str]:
+        return _chain_knobs_given(_build_parser().parse_args(["run", "--input", "x", *argv]))
+
+    assert _VISION_IDLE == 0.0, "闲时 0 常驻是默认契约"
+    assert knobs() == []
+    assert knobs("--vision-idle", "0") == [], "与默认值相同就是没给"
+    assert knobs("--vision-idle", "60") == ["--vision-idle"]
+
+
 def test_backend_is_inferred_from_the_weights_package(tmp_path: Path) -> None:
     """没给 --model 时按必需件认家族；只有**一家**像时才推断。
 

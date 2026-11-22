@@ -311,7 +311,7 @@ def split_runner(
     scratch_dir: str | Path | None = None,
     resident: int | None = None,
     vision: bool | None = None,
-    vision_idle: float = 60.0,
+    vision_idle: float = 0.0,
     vision_bucket: int | None = None,
 ) -> SplitRunner:
     """装一条 split 链：分词器 + 家族给的题面/码表 + ANE/Metal 链。
@@ -327,8 +327,8 @@ def split_runner(
     `devices/apple/residency.py`（它是这张卡上最大的一笔内存，所以由调用方决定让不让）。
 
     `vision` 是 `None`（自动：有塔且图能解就收图）/ `False`（`--vision off`：纯文本服务，
-    不建塔、不读塔权重）。`vision_idle` 是塔的空闲卸载秒数（`0` = 每请求后即卸）。**都不预热**：
-    建塔发生在第一次带图请求（`VisionSlot`）。
+    不建塔、不读塔权重）。`vision_idle` 是塔的空闲卸载秒数，默认 `0`（每请求后即卸，闲时
+    0 常驻）。**都不预热**：建塔发生在第一次带图请求（`VisionSlot`）。
     """
     from ...devices.apple.chain import SplitChain
     from ...devices.apple.compile import S_NATIVE
