@@ -32,7 +32,7 @@ GOLDEN = json.loads((FIXTURES / "mude_tokens.json").read_text(encoding="utf-8"))
 def test_prompt_ids_match_the_golden() -> None:
     prompter = mude.MudePrompter(ChatTokenizer.load(MUDE), mude.read_codes(MUDE))
     for case in GOLDEN["cases"]:
-        sequence, prefix, _labels, _indexes = prompter.encode(
+        sequence, prefix, _labels, _indexes, _readout = prompter.encode(
             case["state"], Question(**case["question"])
         )
         label = case["state"][:40] or "empty state"

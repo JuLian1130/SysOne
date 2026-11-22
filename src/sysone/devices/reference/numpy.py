@@ -203,7 +203,7 @@ class ReferenceRunner:
             value=labels[best],
             probs=tuple(float(value) for value in probabilities),
             labels=labels,
-            confidence=mude_confidence(probabilities),
+            confidence=mude_confidence(probabilities, question.kind),
         )
 
     def _readout_name(self) -> str:

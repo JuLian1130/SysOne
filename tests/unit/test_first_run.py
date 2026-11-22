@@ -20,7 +20,8 @@ import pytest
 
 from helpers import FIXTURES, write_safetensors, write_sharded_checkpoint
 from sysone.cli import _CLI_FAMILIES
-from sysone.models.families import d3, torchcast
+from sysone.domain.quant import DType
+from sysone.models.families import d3, pplx, torchcast
 from sysone.models.sources import SOURCES, WeightsSource, source_for
 from sysone.models.tokenizer import ChatTokenizer
 from sysone.weights.checkpoint import open_checkpoint
@@ -28,10 +29,19 @@ from sysone.weights.fetch import ensure_weights
 
 HIDDEN = 2560
 ROWS = 255
+LICENCES = {"LICENSE", "NOTICE", "LICENSE-qwen-Apache-2.0"}
 
 _D3_SHARDS = {
     "model-00001-of-00002.safetensors": {
         "language_model.embed_tokens.weight": np.arange(HIDDEN * 2, dtype=np.float32).reshape(2, HIDDEN),
+    },
+    "model-00002-of-00002.safetensors": {
+        "language_model.layers.0.input_layernorm.weight": np.ones(HIDDEN, dtype=np.float32),
+    },
+}
+_PPLX_SHARDS = {
+    "model-00001-of-00002.safetensors": {
+        "language_model.embed_tokens.weight": np.zeros((2, HIDDEN), dtype=np.float32),
     },
     "model-00002-of-00002.safetensors": {
         "language_model.layers.0.input_layernorm.weight": np.ones(HIDDEN, dtype=np.float32),
@@ -54,13 +64,14 @@ _TORCHCAST_SHARDS = {
 class Publisher:
     """假下载器：按发布包的结构写出 `source.files` 里的每一个文件。
 
-    它不认识的文件名直接失败 —— 清单长出新文件时，这条用例要求有人先想清楚那是什么。
+    `files` 是"用例要的那几份"（fixture 路径或要写进去的 JSON）；其余按名字补齐：分片来自
+    `shards`、读出表按 `ROWS × HIDDEN` 写、license 写一行占位文本。清单里出现用例不认识的
+    文件名就失败 —— 那是清单变了而没有人看。
     """
 
-    def __init__(self, shards: dict[str, dict[str, np.ndarray]], config: Path, decision: dict) -> None:
+    def __init__(self, shards: dict[str, dict[str, np.ndarray]], files: dict[str, Path | dict]) -> None:
         self.shards = shards
-        self.config = config
-        self.decision = decision
+        self.files = files
         self.calls = 0
 
     def __call__(self, source: WeightsSource, destination: Path) -> None:
@@ -71,14 +82,18 @@ class Publisher:
             destination / "readout.safetensors",
             {"weight": np.zeros((ROWS, HIDDEN), dtype=np.float32)},
         )
-        shutil.copy(self.config, destination / "config.json")
-        (destination / "decision_config.json").write_text(json.dumps(self.decision), encoding="utf-8")
-        _write_tokenizer(destination)
+        for name, value in self.files.items():
+            if isinstance(value, Path):
+                shutil.copy(value, destination / name)
+            else:
+                (destination / name).write_text(json.dumps(value), encoding="utf-8")
+        if not (destination / "tokenizer.json").exists():
+            _write_tokenizer(destination)
         for name in source.files:
             path = destination / name
             if path.exists():
                 continue
-            if name in {"LICENSE", "NOTICE", "LICENSE-qwen-Apache-2.0"}:
+            if name in LICENCES:
                 path.write_text("license", encoding="utf-8")
                 continue
             raise AssertionError(f"清单里有这条用例不认识的文件：{name}")
@@ -101,6 +116,18 @@ def _never(*_args, **_kwargs) -> None:
     raise AssertionError("这份权重已经齐了，不该再下载")
 
 
+def _d3_publisher() -> Publisher:
+    return Publisher(_D3_SHARDS, {
+        "config.json": FIXTURES / "h2o" / "config.json",
+        "decision_config.json": {
+            "format_id": "d3-code-readout-v1",
+            "codes": [f"K{index:03d}" for index in range(ROWS)],
+            "temperature": 1.0,
+            "attention_mode": "noncausal_full",
+        },
+    })
+
+
 def test_every_cli_family_has_a_published_source() -> None:
     """D9：能由 CLI 装配的家族，首启都必须能下载 —— 少一个就是漏接。"""
     missing = sorted(name for name in _CLI_FAMILIES if name not in SOURCES)
@@ -110,12 +137,7 @@ def test_every_cli_family_has_a_published_source() -> None:
 def test_the_d3_source_is_enough_to_first_run_and_read(tmp_path: Path) -> None:
     """d3 的清单下载完就是一个能装载的检查点：两个分片都读到，配置解析成纯文本 4B。"""
     source = source_for("d3")
-    publisher = Publisher(
-        _D3_SHARDS,
-        FIXTURES / "h2o" / "config.json",
-        {"format_id": "d3-code-readout-v1", "codes": [f"K{index:03d}" for index in range(ROWS)],
-         "temperature": 1.0, "attention_mode": "noncausal_full"},
-    )
+    publisher = _d3_publisher()
     target = ensure_weights(source, tmp_path, download=publisher)
     assert publisher.calls == 1
     store = open_checkpoint(target)
@@ -136,11 +158,11 @@ def test_the_d3_source_is_enough_to_first_run_and_read(tmp_path: Path) -> None:
 def test_the_torchcast_source_is_enough_to_first_run_and_read(tmp_path: Path) -> None:
     """torchcast 的清单下载完也是一个能装载的检查点：三个分片、解绑的 `lm_head` 都在。"""
     source = source_for("torchcast")
-    publisher = Publisher(
-        _TORCHCAST_SHARDS,
-        FIXTURES / "torchcast" / "config.json",
-        {"format": "StartLux-Decision-v1", "letter_token_ids": list(range(32, 58))},
-    )
+    publisher = Publisher(_TORCHCAST_SHARDS, {
+        "config.json": FIXTURES / "torchcast" / "config.json",
+        "decision_config.json": {"format": "StartLux-Decision-v1",
+                                 "letter_token_ids": list(range(32, 58))},
+    })
     target = ensure_weights(source, tmp_path, download=publisher)
     assert publisher.calls == 1
     store = open_checkpoint(target)
@@ -161,15 +183,41 @@ def test_the_torchcast_source_is_enough_to_first_run_and_read(tmp_path: Path) ->
     assert descriptor.vision is not None
 
 
+@pytest.mark.parametrize(("label", "parse", "codes_for", "temperature"), (
+    ("v12", pplx.parse_config_12, pplx.read_codes_12, 1.5539092221462472),
+    ("v13", pplx.parse_config_13, pplx.read_codes_13, 1.3302962111834522),
+))
+def test_the_pplx_sources_are_enough_to_first_run_and_load(
+    tmp_path: Path, label: str, parse, codes_for, temperature: float
+) -> None:
+    """两版 pplx 的清单下载完都能装载；模板只有兄弟 `.jinja` 那一条路（配置里是 null）。"""
+    directory = FIXTURES / "pplx" / label
+    files = {name: directory / name for name in (
+        "config.json", "decision_config.json", "joint_config.json",
+        "tokenizer.json", "tokenizer_config.json", "chat_template.jinja")}
+    publisher = Publisher(_PPLX_SHARDS, files)
+    target = ensure_weights(source_for(f"pplx{label[1:]}"), tmp_path, download=publisher)
+    assert publisher.calls == 1
+    store = open_checkpoint(target)
+    try:
+        np.testing.assert_allclose(store.read("language_model.layers.0.input_layernorm.weight"), 1.0)
+    finally:
+        store.close()
+    config = json.loads((Path(target) / "tokenizer_config.json").read_text(encoding="utf-8"))
+    assert config["chat_template"] is None            # 模板只能来自兄弟文件
+    tokenizer = ChatTokenizer.load(target)
+    assert tokenizer.special_tokens                    # 转义表是从分词器里读出来的
+    descriptor = parse(Path(target))
+    assert descriptor.vision is None
+    assert descriptor.readout.dtype is DType.BF16
+    assert descriptor.readout.temperature == pytest.approx(temperature)
+    assert len(codes_for(Path(target))) == ROWS
+
+
 def test_a_second_start_reads_the_marker_instead_of_the_network(tmp_path: Path) -> None:
     """首启扫一遍清单；之后只认 `source.json`，离线也一样能用。"""
     source = source_for("d3")
-    publisher = Publisher(
-        _D3_SHARDS,
-        FIXTURES / "h2o" / "config.json",
-        {"format_id": "d3-code-readout-v1", "codes": [f"K{index:03d}" for index in range(ROWS)],
-         "temperature": 1.0, "attention_mode": "noncausal_full"},
-    )
+    publisher = _d3_publisher()
     target = ensure_weights(source, tmp_path, download=publisher)
     assert ensure_weights(source, tmp_path, download=_never) == target
     assert ensure_weights(source, tmp_path, offline=True, download=_never) == target

@@ -49,14 +49,16 @@ class ModelChain(Protocol):
 
 
 class Prompter(Protocol):
-    """题面 → (整条 prompt 的 id, 前缀长度, 答案标签, 标签对应的选项序号)。
+    """题面 → (整条 prompt 的 id, 前缀长度, 答案标签, 标签对应的选项序号, 读出位置)。
 
     `images` 是这道题题面里的图数；给出的 id 里一张图仍然只占**一个**占位符。
+    读出位置是第五项：`None` 表示末位（码表读出的默认），`int` 表示第几个 token ——
+    `pplx` v1.2 的标记后面还有模板补的 assistant 头，读出不在末位。
     """
 
     def encode(
         self, state: str, question: Question, *, images: int = 0
-    ) -> tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]: ...
+    ) -> tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...], int | None]: ...
 
 
 class SplitRunner(VisionRunner, DecisionRunner):
@@ -183,15 +185,21 @@ class SplitRunner(VisionRunner, DecisionRunner):
         `images` 是这道题里的图数：一张图在题面里仍只占一个占位符，展开在基类
         （`DecisionRunner.encode_request`）里做，因为"一图多占位"是协议层的事实，不是模型特征。
         """
-        sequence, prefix_len, labels, indexes = self._prompter.encode(
+        sequence, prefix_len, labels, indexes, readout = self._prompter.encode(
             state, question, images=images)
-        return Encoded(ids=sequence, prefix_len=prefix_len, labels=labels, indexes=indexes)
+        return Encoded(ids=sequence, prefix_len=prefix_len, labels=labels, indexes=indexes,
+                       readout=readout)
 
     def forward(self, encoded: Encoded, *, prefix: int, causal: bool = False,
                 mm: object | None = None) -> Sequence[float]:
-        """单题一整趟：链给出该题的候选概率。"""
-        return self._require_chain().forward(
-            encoded.ids, options=len(encoded.labels), prefix=prefix, causal=causal, mm=mm)
+        """单题一整趟：链给出该题的候选概率（读出位置由 `Encoded.readout` 决定）。"""
+        chain = self._require_chain()
+        if encoded.readout is None:
+            return chain.forward(
+                encoded.ids, options=len(encoded.labels), prefix=prefix, causal=causal, mm=mm)
+        return chain.forward_at(  # type: ignore[attr-defined]
+            encoded.ids, encoded.readout, options=len(encoded.labels), prefix=prefix,
+            causal=causal, mm=mm)
 
     def forward_shared(self, prefix: Sequence[int], tails: Sequence[Sequence[int]],
                        *, options: Sequence[int], causal: bool = False,
@@ -214,7 +222,13 @@ class SplitRunner(VisionRunner, DecisionRunner):
 
         `use_prefix=False`（`noncausal_full`）时前缀长度传 0：那条掩码没有前缀行，带进去会
         让批里的序列按另一种掩码收行。
+
+        **读出不在末位的序列不进合批**：块对角那条路只交每条序列的**末行** hidden
+        （`last_hidden_batched`）。`Encoded.readout` 非 `None` 时退回逐题 —— 位置错一位就是
+        拿末尾几个 token 的概率当答案，这条不需要试一次才知道。
         """
+        if any(item.readout is not None for item in encoded):
+            return None
         batch = getattr(self._require_chain(), "forward_batched", None)
         if not callable(batch):
             return None
@@ -240,7 +254,7 @@ class SplitRunner(VisionRunner, DecisionRunner):
             value=encoded.labels[best],
             probs=values,
             labels=encoded.labels,
-            confidence=self._confidence(values),
+            confidence=self._confidence(values, kind),
         )
 
     def _warm(self) -> None:

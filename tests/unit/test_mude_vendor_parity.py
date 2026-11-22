@@ -67,7 +67,7 @@ def test_the_answer_object_matches_the_vendor(case: dict) -> None:
         value=labels[best],
         probs=probs,
         labels=labels,
-        confidence=mude.confidence(probs),
+        confidence=mude.confidence(probs, item.question.kind),
     )
     ours = protocol._answer_object(answer, item)
     theirs = case["answer"]

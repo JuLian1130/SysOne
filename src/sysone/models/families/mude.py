@@ -203,8 +203,11 @@ def common_prefix(sequence: Sequence[int], prefix: Sequence[int]) -> int:
 # ---------------------------------------------------------------------- 答面
 
 
-def confidence(shares: Sequence[float]) -> float:
+def confidence(shares: Sequence[float], kind: str) -> float:
     """码表读出这一家的置信度：`1 - H/log n`（厂商 `d3_runtime._confidence`）。
+
+    `kind` 只是接口的一部分：d3 的厂商答面对三种题型用同一个熵口径（`d3_runtime` 只算一遍），
+    所以这里不看它，与 pplx 那两个公式不是一回事。
 
     与"最大概率"不是一回事：n 个选项平分时它是 0，退化成一点时是 1。协议层原样发出去，所以
     这里算的不是我们的口径，是厂商的 —— h2o 那一家用的是另一种（归一化最大值），由它自己的
@@ -236,16 +239,18 @@ class MudePrompter:
 
     def encode(
         self, state: str, question: Question, *, images: int = 0
-    ) -> tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...]]:
-        """一道题的 (整条 prompt 的 id, 前缀长度, 答案标签, 标签对应的选项序号)。
+    ) -> tuple[tuple[int, ...], int, tuple[str, ...], tuple[int, ...], int | None]:
+        """一道题的 (整条 prompt 的 id, 前缀长度, 答案标签, 标签对应的选项序号, 读出位置)。
 
         `images` 是这道题题面里的图数；给出的 id 里仍然**一张图一个占位符**（展开成 `L/4` 个是
         合流那一步的事，见 `models/vision/merge.expand_image_tokens`）。
+
+        读出位置是 `None`（末位）：这条线格式的 `_CLOSING_LINE` 之后没有别的 token。
         """
         texts, labels, indexes = option_plan(question)
         sequence = self._ids(
             self._chat(render_messages(state, question, texts, self._codes, images=images)))
-        return sequence, common_prefix(sequence, self._prefix_ids(state, images)), labels, indexes
+        return sequence, common_prefix(sequence, self._prefix_ids(state, images)), labels, indexes, None
 
     def _chat(self, conversation: list[dict]) -> str:
         return self._tokenizer.apply_chat_template(

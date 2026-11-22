@@ -252,7 +252,7 @@ def test_render_messages_falls_back_for_empty_state_and_text() -> None:
 def test_prompter_cuts_the_prefix_right_before_the_question() -> None:
     prompter, _ = _prompter()
     question = Question(text="选哪个？", options=("甲", "乙"))
-    sequence, prefix_len, labels, indexes = prompter.encode("只有这一句", question)
+    sequence, prefix_len, labels, indexes, _readout = prompter.encode("只有这一句", question)
     assert labels == ("甲", "乙")
     assert indexes == (0, 1)
     # 前缀停在"Question:"换行之后，所以前缀之后第一个 token 就是题干的第一个字符。
@@ -559,7 +559,7 @@ class SharedChain(FakeChain):
 
 
 class ScriptedPrompter:
-    """按调用次序给固定 `(sequence, prefix_len, labels, indexes)`：用来造"前缀不同"的请求。"""
+    """按调用次序给固定 `(sequence, prefix_len, labels, indexes, readout)`：造"前缀不同"的请求。"""
 
     def __init__(self, plans) -> None:
         self.plans = list(plans)
@@ -606,7 +606,8 @@ def test_a_different_prefix_per_question_falls_back() -> None:
     """分词边界把某题的前缀和别的题错开时，不共用前缀（复用会改那一题的数值）。"""
     chain = SharedChain()
     labels = ("甲", "乙")
-    plans = [((10, 11, 12, 13), 2, labels, (0, 1)), ((10, 99, 12, 13), 2, labels, (0, 1))]
+    plans = [((10, 11, 12, 13), 2, labels, (0, 1), None),
+             ((10, 99, 12, 13), 2, labels, (0, 1), None)]
     runner = _forced_runner(plans, chain)
     runner.load_weights()
     runner.answers_for(make_request(questions=2), MaskMode.PREFIX_NONCAUSAL)
@@ -697,7 +698,8 @@ def test_a_lone_question_is_neither_a_hit_nor_a_miss() -> None:
 def test_a_different_prefix_per_question_is_counted_as_a_miss() -> None:
     chain = SharedChain()
     labels = ("甲", "乙")
-    plans = [((10, 11, 12, 13), 2, labels, (0, 1)), ((10, 99, 12, 13), 2, labels, (0, 1))]
+    plans = [((10, 11, 12, 13), 2, labels, (0, 1), None),
+             ((10, 99, 12, 13), 2, labels, (0, 1), None)]
     runner = _forced_runner(plans, chain)
     runner.load_weights()
     runner.answers_for(make_request(questions=2), MaskMode.PREFIX_NONCAUSAL)

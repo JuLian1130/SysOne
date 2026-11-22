@@ -28,12 +28,13 @@ class SplitRecipe:
     分词器重算：重算出来的行序错了，概率看起来仍然像模像样）。
     `prompter(tokenizer, labels)` 渲染题面，返回的对象要实现
     `engine.strategies.split.Prompter`（`encode` → 整条 prompt / 前缀长度 / 标签 / 选项序号）。
-    `confidence(shares)` 是这一家报给协议层的置信度口径，与"最大概率"不是一回事。
+    `confidence(shares, kind)` 是这一家报给协议层的置信度口径，与"最大概率"不是一回事；
+    `kind` 是题型：pplx 的厂商答面对 choice 与 score 用的是两个公式，一个钩子要能分开。
     """
 
     labels: Callable[[Path], tuple[str, ...]]
     prompter: Callable[..., object]
-    confidence: Callable[[Sequence[float]], float]
+    confidence: Callable[[Sequence[float], str], float]
 
 
 @dataclass(frozen=True)

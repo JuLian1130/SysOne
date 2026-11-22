@@ -30,9 +30,9 @@ questions and options, and returns a probability for every option.
   all 32 layers resident and needs about 4.5 GB.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
-- Disk: about 4 GB of weights for mude, 9.1 GB for d3, 9.3 GB for h2o and
-  10.4 GB for torchcast (one model at a time), plus about 4 GiB of compiled
-  artifacts. The weights are downloaded on first use.
+- Disk: about 4 GB of weights for mude and 9.1–10.4 GB for each 4B checkpoint
+  (d3, h2o, pplx12, pplx13, torchcast; one model at a time), plus about 4 GiB
+  of compiled artifacts. The weights are downloaded on first use.
 
 ## Install
 
@@ -74,6 +74,13 @@ explicitly for those two (their packages carry the same required files as
 mude's). The vendor extra (`pip install -e './src[vendor]'`) is only needed to
 run the vendor's own torch engine as a comparison baseline.
 
+pplx-decider-flash is two separate checkpoints (`--model pplx12` and
+`--model pplx13`): v1.2 reads out at a `<|fim_suffix|>` marker inside the user
+turn, v1.3 chunks the context and one question and reads out on the marker that
+ends the sequence. Both run on the split chain with the full-bidirectional mask,
+one question per sequence; images, the multi-question `isolated` layout and
+v1.3's locate head are not supported yet.
+
 Check it from another shell:
 
 ```sh
@@ -92,12 +99,12 @@ optional.
 
 | Flag | Default / values | Meaning |
 |---|---|---|
-| `--model {d3,h2o,mude,torchcast}` | from `--backend` or `--weights` | model family |
-| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude and d3 | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
+| `--model {d3,h2o,mude,pplx12,pplx13,torchcast}` | from `--backend` or `--weights` | model family |
+| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude, d3, pplx12 and pplx13 | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |
 | `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast and d3) | mask; a request can override it |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast, d3, pplx12 and pplx13) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `16384` | GPU buffer width, also the max input tokens |
 | `--W N` | `4` | resident layers; `0` keeps all of them |
@@ -139,7 +146,8 @@ win over the variables.
   `--weights <that directory>`; or copy a finished package (including its
   `source.json`) under `SYS1_WEIGHTS_DIR`.
 - `权重文件不存在` from an explicit `--weights` — the directory must be the
-  published layout: a single `model.safetensors`, or a row-int8 directory with
+  published layout: a single `model.safetensors`, a shard set with
+  `model.safetensors.index.json`, or a row-int8 directory with
   `int8_manifest.json`. Do not use `qybaihe/mude-1.0-mlx-8bit`: its MLX q8
   shards are not readable by the ANE chain.
 - `422` with `prompt 超过链的缓冲宽度` — raise `--width` (and `--bucket` if

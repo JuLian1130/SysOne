@@ -1174,6 +1174,16 @@ class MudePipeline:
         view = self._last.array(np.float16, (self._hidden, self._width))
         return np.asarray(view[:, :length].T, np.float32)
 
+    def hidden_row(self, index: int) -> np.ndarray:
+        """最后一层的第 `index` 个位置（`[hidden]` fp32）。
+
+        `last_hidden` 取末列、`hidden_rows` 取整段；这是第三种：协议把读出钉在一个**不是末位**
+        的标记上（`pplx` v1.2 的 `<|fim_suffix|>` 后面还有模板补的 assistant 头），只要那一列。
+        整段读回在 16k 上是 164 MB / 87 ms，一列是 0.02 ms。
+        """
+        view = self._last.array(np.float16, (self._hidden, self._width))
+        return np.asarray(view[:, int(index)], np.float32)
+
     def close(self) -> None:
         residency, self._residency = getattr(self, "_residency", None), None
         if residency is not None:

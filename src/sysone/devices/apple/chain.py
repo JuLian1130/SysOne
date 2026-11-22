@@ -622,6 +622,40 @@ class SplitChain:
             self.logits(tokens, prefix=prefix, causal=causal, mm=mm), options
         )
 
+    def forward_at(self, tokens: Sequence[int], position: int, *, options: int,
+                   prefix: int = 0, causal: bool = False,
+                   mm: object | None = None) -> np.ndarray:
+        """读出钉在**指定位置**上的那条序列：前 `options` 个码的 softmax 概率。
+
+        协议不总是把读出放在末位：`pplx` v1.2 的标记是 `<|fim_suffix|>`，而模板在它之后还要
+        补 `<|im_end|>` 与 assistant 头，标记不是最后一条 token。位置是编码时量出来的
+        （把标记 token 在 id 序列里的下标存进 `Encoded.readout`），不是重新数出来的。
+
+        Metal 那条路必须让最后一层算满（`last_row_only=False` 是"末行"的优化），但只读回
+        这一列 —— 不是整段。
+        """
+        length = int(np.asarray(tokens, dtype=np.int64).reshape(-1).size)
+        if not 0 <= int(position) < length:
+            raise ValueError(f"读出位置 {position} 不在 [0, {length}) 里")
+        return self._probabilities(
+            self.logits_at(tokens, position, prefix=prefix, causal=causal, mm=mm), options
+        )
+
+    def logits_at(self, tokens: Sequence[int], position: int, *, prefix: int = 0,
+                  causal: bool = False, mm: object | None = None) -> np.ndarray:
+        """指定位置的 `[rows]` 原始 logits（未除温度）。"""
+        readout = self._require_readout()
+        ids, length = self._ids_and_length(tokens, prefix)
+        if not 0 <= int(position) < length:
+            raise ValueError(f"读出位置 {position} 不在 [0, {length}) 里")
+        if self._pipeline is not None:
+            self._prepare_rope(mm, length)
+            self._pipeline.run(self._embeddings(ids, mm), length=length, prefix=prefix,
+                               causal=causal, last_row_only=False)
+            row = rms_norm(self._pipeline.hidden_row(int(position))[None, :], self._final_norm)[0]
+            return readout @ row
+        return readout @ self.hidden(tokens, prefix=prefix, causal=causal, mm=mm)[int(position)]
+
     def forward_batched(
         self, sequences: Sequence[Sequence[int]], *, options: Sequence[int],
         prefixes: Sequence[int] = (), causal: bool = False,

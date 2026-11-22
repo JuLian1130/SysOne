@@ -66,6 +66,10 @@ class Encoded:
     就够读出。没有码表的链（h2o 的 pooled）要把厂商答面给出的 `Prepared` 带到 `answer` ——
     温度、noul 的地板与阈值、score 的期望值都在那里，`indexes` 只装得下标签 id。基类不碰
     它、也不认识它的类型：这里只是"编码"到"读出"之间搭的一趟便车。
+
+    `readout` 是读出的**位置**：`None` 表示末位（mude / d3 / h2o 都是），`int` 表示这条序列
+    的第几个 token。`pplx` v1.2 的标记读在 `<|fim_suffix|>`，而模板在它之后还补了
+    `<|im_end|>` 与 assistant 头 —— 位置不对就会拿末尾那几个 token 的概率当答案。
     """
 
     ids: tuple[int, ...]
@@ -73,6 +77,7 @@ class Encoded:
     labels: tuple[str, ...]
     indexes: tuple[int, ...]
     payload: object | None = None
+    readout: int | None = None
 
 
 def shared_prefix(encoded: Sequence[Encoded]) -> tuple[int, ...] | None:

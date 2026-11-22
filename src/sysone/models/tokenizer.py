@@ -46,6 +46,24 @@ def _environment():
     return environment
 
 
+def _special_texts(backend: object) -> tuple[str, ...]:
+    """分词器里 `special=True` 的 added token 文本（最长在前，便于逐条替换）。
+
+    这是 `all_special_tokens` 的那一半：`added_tokens_decoder` 里标了 special 的那些。
+    协议自己的标记（`<|fim_suffix|>` / `<|fim_middle|>`）在这份表里是 `special=False`，
+    所以由协议层显式加进转义集合（与厂商 `Encoder._escapes` 同一条）。
+    """
+    decoder = getattr(backend, "get_added_tokens_decoder", None)
+    if not callable(decoder):
+        return ()
+    texts = {
+        str(token.content)
+        for token in decoder().values()
+        if getattr(token, "special", False)
+    }
+    return tuple(sorted(texts, key=len, reverse=True))
+
+
 def _template_text(directory: Path, config: dict) -> str:
     """模板从哪来：`tokenizer_config.json` 的内嵌字符串，或同目录的 `chat_template.jinja`。
 
@@ -78,6 +96,10 @@ class ChatTokenizer:
     def __init__(self, backend: object, template: str) -> None:
         self._backend = backend
         self._template = _environment().from_string(template)
+        # 标成 special 的 token 文本（最长在前）：协议层渲染题面时要把用户内容里的它们转义，
+        # 否则一段 state 里出现 `<|im_end|>` 就会提前结束一个轮次。判据与 transformers 的
+        # `all_special_tokens` 同一条（added token 且 special=True）。
+        self.special_tokens = _special_texts(backend)
 
     @classmethod
     def load(cls, model_dir: str | Path) -> "ChatTokenizer":

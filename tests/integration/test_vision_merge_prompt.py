@@ -47,11 +47,11 @@ def test_one_image_renders_exactly_one_placeholder(prompter: mude.MudePrompter) 
 
     合流靠这个数对齐图与行：渲染成两个，就会把第二张图的行放到第一张的位置上。
     """
-    ids, _, _, _ = prompter.encode(STATE, QUESTION, images=1)
+    ids, _, _, _, _ = prompter.encode(STATE, QUESTION, images=1)
     token = int(mude.parse_config(MUDE_DIR).image_token_id)
     assert list(ids).count(token) == 1
 
-    two, _, _, _ = prompter.encode(STATE, QUESTION, images=2)
+    two, _, _, _, _ = prompter.encode(STATE, QUESTION, images=2)
     assert list(two).count(token) == 2
     assert len(two) > len(ids)
 
@@ -89,8 +89,8 @@ def test_the_prompt_expands_to_text_plus_four_rows_per_image(
     prompter: mude.MudePrompter,
 ) -> None:
     """`L/4 = 4`（64×64 的图，2×2 合并）：展开之后恰好比文本多 `4 + 2` 个 token。"""
-    plain, _, _, _ = prompter.encode(STATE, QUESTION)
-    with_image, _, _, _ = prompter.encode(STATE, QUESTION, images=1)
+    plain, _, _, _, _ = prompter.encode(STATE, QUESTION)
+    with_image, _, _, _, _ = prompter.encode(STATE, QUESTION, images=1)
     descriptor = mude.parse_config(MUDE_DIR)
     rows = np.zeros((4, int(descriptor.vision.out_hidden_size)), np.float16)  # type: ignore[union-attr]
     media = merge.Media(counts=(4,), grids=((2, 2),), rows=rows)

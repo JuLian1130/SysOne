@@ -25,8 +25,9 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
   `--W 0` 把 32 层全部常驻，约需 4.5 GB。
 - arm64 Python 3.11 或更新。
 - Xcode Command Line Tools（`xcode-select --install`），`clang` 需要它。
-- 磁盘：mude 权重约 4 GB、d3 约 9.1 GB、h2o 约 9.3 GB、torchcast 约 10.4 GB
-  （一次装一个模型），另加约 4 GiB 编译产物。权重在首次使用时下载。
+- 磁盘：mude 权重约 4 GB，5 个 4B 检查点（d3 / h2o / pplx12 / pplx13 /
+  torchcast）各约 9.1–10.4 GB（一次装一个模型），另加约 4 GiB 编译产物。权重在首次
+  使用时下载。
 
 ## 安装
 
@@ -65,6 +66,11 @@ mude 用 `--model mude`。d3 与 torchcast 的分片包同样在首次使用时�
 mude 相同）。vendor 附加依赖（`pip install -e './src[vendor]'`）只在要把厂商自己的
 torch 引擎当对拍基线时才会用到。
 
+pplx-decider-flash 是两份独立的检查点（`--model pplx12` 与 `--model pplx13`）：v1.2
+的读出打在用户轮里的 `<|fim_suffix|>` 标记上，v1.3 把 context 与一道题分块、读出在这条
+序列末尾的标记上。两者都走 split 链、只有全双向掩码、一题一条序列；图像、多题的
+`isolated` 布局与 v1.3 的 locate 头暂不支持。
+
 另开一个 shell 检查：
 
 ```sh
@@ -82,12 +88,12 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 
 | 参数 | 默认 / 取值 | 含义 |
 |---|---|---|
-| `--model {d3,h2o,mude,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
-| `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude 与 d3 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
+| `--model {d3,h2o,mude,pplx12,pplx13,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
+| `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude / d3 / pplx12 / pplx13 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
 | `--weights PATH` | 自动下载 | 显式包；只读，永不下网 |
 | `--offline` | 关 | 不碰网络 |
 | `--quant {int8,fp16}` | `int8` | ANE 权重存储形态；计算始终 fp16 |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast / d3 `noncausal_full`） | 掩码；请求可覆盖 |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast / d3 / pplx12 / pplx13 `noncausal_full`） | 掩码；请求可覆盖 |
 | `--bucket N` | `1024` | ANE program 列宽 |
 | `--width N` | `16384` | GPU 缓冲宽度，也是最大输入 token 数 |
 | `--W N` | `4` | 常驻层数；`0` = 全部常驻 |
@@ -126,9 +132,9 @@ HTTP：
 - 带 `--offline` 的 `download` 错误——去掉 `--offline` 让首次运行拉权重；或跑打印出来的
   `hf download …`，再用 `--weights <that directory>` 启动；或把下好的整包（含
   `source.json`）放到 `SYS1_WEIGHTS_DIR` 下。
-- 显式 `--weights` 报 `权重文件不存在`——目录必须是发布布局：单文件 `model.safetensors`，
-  或带 `int8_manifest.json` 的 row-int8 目录。不要用 `qybaihe/mude-1.0-mlx-8bit`：它的
-  MLX q8 分片 ANE 链读不了。
+- 显式 `--weights` 报 `权重文件不存在`——目录必须是发布布局：单文件 `model.safetensors`、
+  带 `model.safetensors.index.json` 的分片包，或带 `int8_manifest.json` 的 row-int8 目录。
+  不要用 `qybaihe/mude-1.0-mlx-8bit`：它的 MLX q8 分片 ANE 链读不了。
 - 回 `422` 且提示 `prompt 超过链的缓冲宽度`——加大 `--width`（必要时也加 `--bucket`），
   或缩短 prompt。
 - OOM 或 wired memory 警告——调低 `--width`，并确认没有别的大模型常驻。
