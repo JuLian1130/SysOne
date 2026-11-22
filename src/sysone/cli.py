@@ -25,6 +25,7 @@ from .engine.strategies.assembly import BACKENDS as STRATEGY_BACKENDS
 from .engine.strategies.assembly import QUANT_MODES, assemble
 from .env import read as read_env
 from .errors import ConfigError, SysOneError
+from .logging import configure
 from .models import families as _family_modules  # noqa: F401  导入即注册
 from .models.descriptor import ModelDescriptor
 from .models.registry import families, family
@@ -740,6 +741,8 @@ def _compile(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        # 环境变量里的日志级别在这里生效：早于任何命令，warning 才有 JSON 去向。
+        configure()
         if args.command == "doctor":
             geometry = (
                 None

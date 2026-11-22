@@ -37,14 +37,23 @@ class JsonFormatter(logging.Formatter):
 
 def configure(level: str | None = None, stream: IO[str] | None = None) -> None:
     """配置 `sysone` 根 logger；`level=None` 时读环境变量。"""
-    resolved = (level or str(env.read()["SYS1_LOG_LEVEL"])).upper()
+    resolved = (level or str(env.read()["SYS1_LOG_LEVEL"])).strip().upper()
+    number = logging.getLevelName(resolved)
+    if not isinstance(number, int):
+        raise ConfigError(
+            "日志级别不合法",
+            level=resolved,
+            allowed=["debug", "info", "warning", "error"],
+        )
     handler = logging.StreamHandler(stream or sys.stderr)
     handler.setFormatter(JsonFormatter())
     root = logging.getLogger("sysone")
     root.handlers.clear()
     root.addHandler(handler)
-    root.setLevel(resolved)
-    root.propagate = False
+    root.setLevel(number)
+    # 不关传播：宿主（含测试的 caplog）挂在 root logger 上的 handler 仍要能看到这些记录。
+    # CLI 进程的 root 没有 handler，所以不会重复输出。
+    root.propagate = True
 
 
 def get_logger(name: str) -> logging.Logger:
