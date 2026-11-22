@@ -312,6 +312,26 @@ def test_fatal_engine_errors_do_not_ask_the_client_to_retry(start_server) -> Non
     assert "retry-after" not in headers
 
 
+def test_a_request_the_model_cannot_answer_is_400(start_server) -> None:
+    """模型答不了这条请求（题型 / 选项数 / 档位数）时按 400 回，而不是 500。
+
+    500 让客户端以为重试有意义；这类错误改一改请求就能过。状态码来自错误类自己的
+    `status`（`UnsupportedKindError` = 400），服务层不按字符串判。
+    """
+    from sysone.errors import UnsupportedKindError
+
+    class Narrow(FakeEngine):
+        def run(self, request):
+            raise UnsupportedKindError("score 的档位数超出这个模型的范围", levels=11)
+
+    server, gate = start_server(engine=Narrow())
+    assert gate.wait(5.0)
+    status, headers, raw = _call(server, "POST", "/v1/systemone", body=CHOICE)
+    assert status == 400
+    assert _json(raw)["detail"] == "score 的档位数超出这个模型的范围"
+    assert "retry-after" not in headers
+
+
 # ---------------------------------------------------------------------- 鉴权
 
 

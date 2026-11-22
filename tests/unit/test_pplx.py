@@ -130,6 +130,13 @@ def test_a_score_keeps_the_wider_range_the_vendor_allows() -> None:
     assert len(texts) == 12 and labels[-1] == "11"
 
 
+def test_a_one_level_score_is_a_bad_request() -> None:
+    """一档折不出期望档位：400（协议层只要求 `criteria` 非空，2 档的下限只有家族知道）。"""
+    with pytest.raises(UnsupportedKindError) as caught:
+        pplx.option_plan(Question(text="", kind="score", options=("0: 只有一档",)))
+    assert caught.value.status == 400 and caught.value.code == "unsupported_kind"
+
+
 def test_an_unknown_kind_is_refused() -> None:
     with pytest.raises(UnsupportedKindError):
         pplx.option_plan(Question(text="", kind="rank"))

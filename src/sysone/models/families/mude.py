@@ -130,13 +130,15 @@ def option_plan(question: Question) -> tuple[tuple[str, ...], tuple[str, ...], t
         levels = tuple(question_spec(question)["criteria"])
         low, high = SCORE_LEVELS
         if not low <= len(levels) <= high:
-            raise ConfigError(
+            # 档位数是**这个模型的读出能力**（厂商 `SCORE_LEVELS`），不是我们的配置坏了：
+            # 客户端改一改档位就能过，所以是 400 而不是 500。
+            raise UnsupportedKindError(
                 "score 的档位数超出这个模型的范围",
                 levels=len(levels),
                 range=list(SCORE_LEVELS),
             )
         if not all(levels) or len(set(levels)) != len(levels):
-            raise ConfigError("score 的档位必须互不相同且非空", levels=list(levels))
+            raise UnsupportedKindError("score 的档位必须互不相同且非空", levels=list(levels))
         labels = tuple(str(index) for index in range(len(levels)))
         return levels, labels, tuple(range(len(levels)))
     if question.kind != "choice":

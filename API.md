@@ -35,6 +35,9 @@ Set `DECISION_API_KEY` (not `SYS1_API_KEY`) to enable it. `/v1/models` and
 - Malformed requests return the same two `422` shapes as the reference
   protocol: a string `detail`, or `{"invalid_questions": {id: reason}}` with
   every bad question reported at once.
+- A request this model cannot answer returns `400` with a `detail`: a question
+  kind it has no readout for, or more options or `score` levels than its
+  readout carries (see the table below). Retrying it unchanged will not help.
 
 ## Request
 

@@ -51,10 +51,11 @@ class UnsupportedModeError(SysOneError):
 
 
 class UnsupportedKindError(SysOneError):
-    """请求的题型不在该模型的读出能力里（线格式认、这个模型答不了）。
+    """这个模型答不了这条请求的**形状**：题型、选项数或 `score` 的档位数。
 
     与 `ConfigError` 分开：这是**坏请求**不是我们的配置坏了，客户端据此知道不要重试。
-    今天只有 mude 会抛（码表读出没有 score 的档位模板）。
+    各家的上限不同（torchcast 26 个选项 / 10 档、mude 与 d3 10 档、pplx 255 档），而这些
+    上限是模型的读出能力，协议层不知道 —— 所以由家族在编码时抛。
     """
 
     code = "unsupported_kind"

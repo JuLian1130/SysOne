@@ -184,7 +184,8 @@ def option_plan(question: Question) -> tuple[tuple[str, ...], tuple[str, ...], t
     if question.kind == "score":
         levels = tuple(question_spec(question)["criteria"])
         if len(levels) < 2:
-            raise ConfigError("score 至少两档", levels=len(levels))
+            # 档位数是这个模型的读出能力（至少两档才折得出期望档位）：坏请求，不是配置坏。
+            raise UnsupportedKindError("score 至少两档", levels=len(levels))
         labels = tuple(str(index) for index in range(len(levels)))
         return levels, labels, tuple(range(len(levels)))
     if question.kind != "choice":

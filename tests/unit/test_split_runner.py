@@ -201,14 +201,21 @@ def test_option_plan_reads_score_levels_in_order() -> None:
 
 
 def test_option_plan_refuses_a_scale_the_vendor_would_refuse() -> None:
-    """档位数与重复档位按厂商 `SCORE_LEVELS` / `normalize_question` 的判据挡掉。"""
+    """档位数与重复档位按厂商 `SCORE_LEVELS` / `normalize_question` 的判据挡掉。
+
+    挡掉的是**请求**不是配置：档位数是这个模型的读出能力，客户端改一改档位就能过 ——
+    所以是 400。这条曾经抛 `ConfigError`（`status = 500`），于是同一类输入在 torchcast 上
+    是 400、在 mude/d3 上是 500。协议层只挡到 255 档，2–10 这一档只有家族知道。
+    """
     for options in (
         ("0: 只有一档",),
         tuple(f"{index}: 档{index}" for index in range(11)),
         ("0: 一样", "1: 一样"),
+        ("0: ", "1: 差"),
     ):
-        with pytest.raises(ConfigError):
+        with pytest.raises(UnsupportedKindError) as caught:
             mude.option_plan(Question(text="打分", options=options, kind="score"))
+        assert caught.value.status == 400 and caught.value.code == "unsupported_kind"
 
 
 def test_option_plan_refuses_a_kind_outside_the_wire_format() -> None:
