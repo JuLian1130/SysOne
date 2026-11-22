@@ -980,3 +980,56 @@ def test_warmup_uses_the_checkpoints_default_mode() -> None:
     default_runner.load_weights()
     default_runner.compile_or_warm_up()
     assert chain.calls[0][2] > 0
+
+
+def test_noncausal_questions_of_one_request_tile_into_one_pass() -> None:
+    """`noncausal_full` 的多题本来就是一题一条独立序列：块对角正好合它们，答案逐位相同。"""
+    chain = TiledChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=3, mode=MaskMode.NONCAUSAL_FULL),
+                       MaskMode.NONCAUSAL_FULL)
+    assert runner.decisions.batch_hit == 1
+    assert len(chain.rows) == 1 and len(chain.rows[0]) == 3
+    assert chain.prefixes == (0, 0, 0), "全双向没有前缀语义"
+    assert chain.calls == [], "能合批时不该再逐题整趟"
+
+
+class _NarrowTiledChain(TiledChain):
+    def forward_batched(self, sequences, *, options, prefixes, causal=False):
+        return None
+
+
+def test_noncausal_questions_fall_back_to_serial_when_the_pass_does_not_fit() -> None:
+    chain = _NarrowTiledChain()
+    runner = _runner(chain)
+    runner.load_weights()
+    runner.answers_for(make_request(questions=2, mode=MaskMode.NONCAUSAL_FULL),
+                       MaskMode.NONCAUSAL_FULL)
+    assert runner.decisions.batch_hit == 0 and runner.decisions.batch_fallback == 1
+    assert len(chain.calls) == 2, "装不下就退回逐题"
+
+
+class _ReadoutChain(FakeChain):
+    """只有 `forward_at`（pplx v1.2 那类非末位读出），按位置记账。"""
+
+    def forward_at(self, tokens, position, *, options, prefix=0, causal=False, mm=None):
+        self.calls.append((tuple(tokens), int(position), int(options)))
+        return [1.0 / int(options)] * int(options)
+
+
+def test_the_readout_position_moves_with_the_expanded_image_block() -> None:
+    """pplx v1.2 的标记位置是未展开时量出来的：一张图展开成 4 个占位符，读出右移 3。"""
+    chain = _ReadoutChain()
+    chain.metal_runtime = object()          # `vision_unavailable` 只问有没有 Metal 运行时
+    plan = ((5, 248056, 6, 7, 8), 0, ("a", "b"), (0, 1), 4)
+    runner = SplitRunner(lambda: chain, ScriptedPrompter([plan]),
+                         confidence=mude_confidence, max_len=4096,
+                         image_token_id=248056, load_tower=lambda _chain: FakeSlot())
+    runner.load_weights()
+    runner.answers_for(_with_media(make_request(questions=1, mode=MaskMode.NONCAUSAL_FULL)),
+                       MaskMode.NONCAUSAL_FULL)
+    tokens, position, options = chain.calls[0]
+    assert len(tokens) == 8, "5 个 id 里 1 个占位符展开成 4 个"
+    assert position == 7, "原下标 4 前面多出 4-1 个 token"
+    assert options == 2

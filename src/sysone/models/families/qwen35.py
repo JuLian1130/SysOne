@@ -31,23 +31,6 @@ def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     return nested if isinstance(nested, Mapping) else config  # type: ignore[return-value]
 
 
-# 多模态 config 顶层的视觉声明。权重按 `visual.*` 丢掉之后，这几项仍留在 config 里。
-_VISION_KEYS = ("vision_config", "image_token_id", "video_token_id",
-                "vision_start_token_id", "vision_end_token_id")
-
-
-def text_only(config: Mapping[str, object]) -> dict[str, object]:
-    """同一份 config 的纯文本读法：去掉顶层的视觉声明。
-
-    决策检查点常从多模态基座微调而来，准备阶段丢掉 `visual.*` 权重不会改 config。照读的话
-    descriptor 会声明一座没有权重的塔，首启预处理（`prepare_vision`）会去编它 —— 报出来的
-    是"缺张量"，而不是"这个检查点没有塔"。把声明去掉，塔从描述符起就不存在。
-    """
-    if not any(key in config for key in _VISION_KEYS):
-        return dict(config)
-    return {key: value for key, value in config.items() if key not in _VISION_KEYS}
-
-
 def layer_types(text: Mapping[str, object]) -> tuple[AttentionRole, ...]:
     """优先读显式 `layer_types`，退回 `full_attention_interval`。"""
     count = int(text["num_hidden_layers"])  # type: ignore[arg-type]

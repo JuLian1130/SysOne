@@ -16,7 +16,7 @@ import pytest
 from sysone.domain.attention import MaskMode
 from sysone.domain.decision import Question
 from sysone.domain.quant import DType
-from sysone.errors import ConfigError, UnsupportedKindError, UnsupportedMediaError
+from sysone.errors import ConfigError, UnsupportedKindError
 from sysone.models.families import pplx
 from sysone.models.tokenizer import ChatTokenizer
 
@@ -74,8 +74,10 @@ def test_parse_config_reads_the_4b_checkpoint(label: str, parse, temperature: fl
     assert (descriptor.heads, descriptor.kv_heads, descriptor.head_dim) == (16, 4, 256)
     assert descriptor.vocab == 248320
     assert descriptor.tied_embeddings is True
-    # 发布包是多模态的（vision_config 在 config 里），但这条装配按纯文本接：没有塔。
-    assert descriptor.vision is None
+    # 发布包是多模态的：整座塔就在 `visual.*` 里（297 个张量），所以这里照实声明它；
+    # 图片走 mude 同一条 content-parts 题面与 `models/vision/merge` 的合流。
+    assert descriptor.vision is not None and descriptor.vision.out_hidden_size == 2560
+    assert descriptor.image_token_id == 248056
     assert descriptor.default_mode is MaskMode.NONCAUSAL_FULL
     assert descriptor.supported_modes == frozenset({MaskMode.NONCAUSAL_FULL})
     assert descriptor.trained_modes == descriptor.supported_modes
@@ -140,11 +142,28 @@ def test_options_over_the_code_table_are_refused() -> None:
         prompter.encode("s", many)
 
 
-def test_images_are_refused_out_loud() -> None:
-    """图还没移植：出声拒绝，不是把图当文本丢掉。"""
-    prompter = _prompter("v13", pplx.V13)
-    with pytest.raises(UnsupportedMediaError):
-        prompter.encode("s", QUESTION, images=1)
+@pytest.mark.parametrize(("label", "protocol"), (("v12", pplx.V12), ("v13", pplx.V13)))
+def test_images_render_one_placeholder_before_the_state(label: str, protocol: pplx.Protocol) -> None:
+    """图块在正文之前、一张图一个占位符；标记与读出位置照旧（v1.2 仍是非末位）。"""
+    prompter = _prompter(label, protocol)
+    tokenizer = ChatTokenizer.load(FIXTURES / label)
+    placeholder = tokenizer("<|image_pad|>", add_special_tokens=False)["input_ids"]
+    assert len(placeholder) == 1
+    ids, prefix, _labels, _indexes, readout = prompter.encode("s", QUESTION, images=2)
+    assert list(ids).count(placeholder[0]) == 2
+    segments, _tails = prompter.text("s", QUESTION, images=2)
+    assert segments[0].count("<|image_pad|>") == 2
+    assert segments[0].index("State:") > segments[0].rindex("<|image_pad|>")
+    if protocol.chunked:
+        assert readout is None and ids[-1] == prompter._single(pplx.MARKER)
+    else:
+        assert readout is not None and ids[readout] == prompter._single(pplx.MARKER)
+    assert prefix == 0
+
+
+def test_images_cannot_be_negative() -> None:
+    with pytest.raises(ConfigError, match="图数"):
+        _prompter("v12", pplx.V12).encode("s", QUESTION, images=-1)
 
 
 def test_the_state_cannot_open_a_turn() -> None:

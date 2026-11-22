@@ -63,13 +63,14 @@ mude 用 `--model mude`。d3 与 torchcast 的分片包同样在首次使用时�
 跑 `vllm-sr/d3-mini`（split 链），`--model torchcast` 跑
 `torchcast-ai/torchcast-decision-4b`（pooled 链）。两者都只支持全双向掩码，所以题与
 题之间不共享前缀，但合批仍然可用。这两个家族要显式给 `--model`（发布包的必需件与
-mude 相同）。vendor 附加依赖（`pip install -e './src[vendor]'`）只在要把厂商自己的
+mude 相同）。d3 也收图（发布包自带视觉塔）。vendor 附加依赖（`pip install -e './src[vendor]'`）只在要把厂商自己的
 torch 引擎当对拍基线时才会用到。
 
 pplx-decider-flash 是两份独立的检查点（`--model pplx12` 与 `--model pplx13`）：v1.2
 的读出打在用户轮里的 `<|fim_suffix|>` 标记上，v1.3 把 context 与一道题分块、读出在这条
-序列末尾的标记上。两者都走 split 链、只有全双向掩码、一题一条序列；图像、多题的
-`isolated` 布局与 v1.3 的 locate 头暂不支持。
+序列末尾的标记上。两者都走 split 链、只有全双向掩码、一题一条序列（同一请求的多题可以
+挤进一个合批 pass）；图像已支持、放在正文之前；多题的 `isolated` 布局与 v1.3 的 locate
+头暂不支持。
 
 另开一个 shell 检查：
 

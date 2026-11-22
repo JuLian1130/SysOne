@@ -135,7 +135,11 @@ def test_every_cli_family_has_a_published_source() -> None:
 
 
 def test_the_d3_source_is_enough_to_first_run_and_read(tmp_path: Path) -> None:
-    """d3 的清单下载完就是一个能装载的检查点：两个分片都读到，配置解析成纯文本 4B。"""
+    """d3 的清单下载完就是一个能装载的检查点：两个分片都读到，配置解析成带塔的 4B。
+
+    塔的权重就在发布的分片里（297 个 `visual.*`），所以描述符照实声明它 —— 图片走 split 的
+    `load_tower` 与 mude 的 content-parts 题面。
+    """
     source = source_for("d3")
     publisher = _d3_publisher()
     target = ensure_weights(source, tmp_path, download=publisher)
@@ -148,7 +152,8 @@ def test_the_d3_source_is_enough_to_first_run_and_read(tmp_path: Path) -> None:
         store.close()
     descriptor = d3.parse_config(Path(target))
     assert (descriptor.hidden, descriptor.ffn, descriptor.num_layers) == (2560, 9216, 32)
-    assert descriptor.vision is None
+    assert descriptor.vision is not None and descriptor.vision.out_hidden_size == 2560
+    assert descriptor.image_token_id == 248056
     assert descriptor.readout.rows == ROWS and descriptor.readout.temperature == pytest.approx(1.0)
     tokenizer = ChatTokenizer.load(target)
     assert tokenizer.apply_chat_template([{"role": "user", "content": "hello"}], tokenize=False,
@@ -208,7 +213,7 @@ def test_the_pplx_sources_are_enough_to_first_run_and_load(
     tokenizer = ChatTokenizer.load(target)
     assert tokenizer.special_tokens                    # 转义表是从分词器里读出来的
     descriptor = parse(Path(target))
-    assert descriptor.vision is None
+    assert descriptor.vision is not None and descriptor.vision.model_type == "qwen3_5_vision"
     assert descriptor.readout.dtype is DType.BF16
     assert descriptor.readout.temperature == pytest.approx(temperature)
     assert len(codes_for(Path(target))) == ROWS

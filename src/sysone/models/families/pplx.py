@@ -33,7 +33,7 @@ from ...config import EngineConfig
 from ...domain.attention import MaskMode
 from ...domain.decision import Question
 from ...domain.quant import DType
-from ...errors import ConfigError, UnsupportedKindError, UnsupportedMediaError
+from ...errors import ConfigError, UnsupportedKindError
 from ...weights.checkpoint import stored_quant
 from ..descriptor import ModelDescriptor, ReadoutPlan
 from ..layer_plan import LayerPlan, WeightPlan
@@ -123,7 +123,9 @@ def read_codes(model_dir: str | Path, *, protocol: Protocol = V12) -> tuple[str,
 
 
 def _parse(model_dir: Path, protocol: Protocol) -> ModelDescriptor:
-    config = qwen35.text_only(qwen35.load_json(Path(model_dir) / "config.json"))
+    # 照读完整 config：两份发布包都带整座视觉塔（297 个 `visual.*`，几何与 d3 / torchcast 相同），
+    # `decision_config.json` 的 `max_pixels` = 1 638 400 与引擎的 `preprocess.MAX_PIXELS` 逐位相同。
+    config = qwen35.load_json(Path(model_dir) / "config.json")
     decision = qwen35.load_json(Path(model_dir) / "decision_config.json")
     temperature = decision.get("temperature")
     return qwen35.descriptor_from(
@@ -219,7 +221,9 @@ class PplxPrompter:
             escapes.add(SEPARATOR)
         self._escapes = tuple(sorted(escapes, key=len, reverse=True))
 
-    def text(self, state: str, question: Question) -> tuple[tuple[str, ...], tuple[int | None, ...]]:
+    def text(
+        self, state: str, question: Question, *, images: int = 0
+    ) -> tuple[tuple[str, ...], tuple[int | None, ...]]:
         """题面被切成哪几段（各自独立分词），以及每段末尾要补的那个 token。
 
         v1.2 是一段整篇（标记就在正文里）；v1.3 是 context 与题块两段，末尾分别补
@@ -229,7 +233,7 @@ class PplxPrompter:
         分词、按顺序拼起来 —— 分块分词本身就是 v1.3 协议的一部分（每段的 token 不随别的题
         或它在序列里的位置变）。
         """
-        return self._render(state, question)[:2]
+        return self._render(state, question, images=images)[:2]
 
     def encode(
         self, state: str, question: Question, *, images: int = 0
@@ -238,15 +242,12 @@ class PplxPrompter:
 
         前缀长度恒为 0：这两份检查点只有全双向，没有"前缀只算一遍"那条路。
         读出位置只有 v1.2 是非末位（标记后面还有模板补的 assistant 头）。
+
+        `images` 是这道题题面里的图数：一张图在 id 里仍只占**一个** `<|image_pad|>` 占位符
+        （厂商 `messages()` 把图块放在正文之前），展开成 `gh*gw` 个是合流那一步的事
+        （`models/vision/merge`），与 mude 同一条契约。
         """
-        if images:
-            raise UnsupportedMediaError(
-                "这个家族按纯文本接入，带图请求还不支持",
-                family=self._protocol.family,
-                images=images,
-                hint="图块位置、`max_pixels` 与塔的合流都还没移植",
-            )
-        segments, tails, labels, indexes = self._render(state, question)
+        segments, tails, labels, indexes = self._render(state, question, images=images)
         ids: tuple[int, ...] = ()
         for segment, tail in zip(segments, tails):
             ids += self._ids(segment)
@@ -256,7 +257,7 @@ class PplxPrompter:
         return ids, 0, labels, indexes, readout
 
     def _render(
-        self, state: str, question: Question
+        self, state: str, question: Question, *, images: int = 0
     ) -> tuple[tuple[str, ...], tuple[int | None, ...], tuple[str, ...], tuple[int, ...]]:
         texts, labels, indexes = option_plan(question)
         room = min(CODE_ROWS, len(self._codes))
@@ -264,30 +265,33 @@ class PplxPrompter:
             raise ConfigError("选项数超出码表", options=len(texts), room=room)
         if self._protocol.chunked:
             return (
-                (self._context_text(state), self._question_text(question, texts)),
+                (self._context_text(state, images=images),
+                 self._question_text(question, texts)),
                 (self._separator, self._marker),
                 labels,
                 indexes,
             )
         return (
-            (self._inline_text(state, question, texts),),
+            (self._inline_text(state, question, texts, images=images),),
             (None,),
             labels,
             indexes,
         )
 
-    def _inline_text(self, state: str, question: Question, texts: Sequence[str]) -> str:
+    def _inline_text(
+        self, state: str, question: Question, texts: Sequence[str], *, images: int = 0
+    ) -> str:
         """v1.2：整条题面一次模板，标记在用户轮里（后面还有 assistant 头）。"""
         body = "\n\n".join([
             "State:\n" + self._text(state),
             self._question_text(question, texts, numbered=True) + "\n" + MARKER,
         ])
-        return self._chat(body, generation_prompt=True)
+        return self._chat(body, generation_prompt=True, images=images)
 
-    def _context_text(self, state: str) -> str:
+    def _context_text(self, state: str, *, images: int = 0) -> str:
         """v1.3 的 context：模板渲染到 state 末尾（用户轮不闭合），切掉哨兵之后的部分。"""
         state_text = "State:\n" + self._text(state)
-        text = self._chat(state_text + CONTEXT_END, generation_prompt=False)
+        text = self._chat(state_text + CONTEXT_END, generation_prompt=False, images=images)
         try:
             cut = text.index(CONTEXT_END)
         except ValueError:
@@ -312,11 +316,17 @@ class PplxPrompter:
         instructions = self._text(question.text or DEFAULT_INSTRUCTIONS)
         return f"{header}\n{instructions}\nOptions:\n{body}"
 
-    def _chat(self, body: str, *, generation_prompt: bool) -> str:
+    def _chat(self, body: str, *, generation_prompt: bool, images: int = 0) -> str:
+        """system + user 轮；`images > 0` 时 user 轮改 content parts（图块在正文之前）。"""
+        if images < 0:
+            raise ConfigError("图数不能为负", images=images)
+        user: object = body if not images else (
+            [{"type": "image"} for _ in range(images)] + [{"type": "text", "text": body}]
+        )
         return self._tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": self._protocol.system},
-                {"role": "user", "content": body},
+                {"role": "user", "content": user},
             ],
             tokenize=False,
             add_generation_prompt=generation_prompt,

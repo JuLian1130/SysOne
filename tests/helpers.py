@@ -32,8 +32,7 @@ def make_code_checkpoint(
     """造一个 d3 线格式的检查点目录：4B 的 `config.json` + `decision_config.json`。
 
     不写权重与读出表：用它的用例只看解析、装配与 CLI 推断，不装链。config 借 h2o 那份 ——
-    它正是"从多模态基座微调、准备时丢掉 `visual.*`"的形态（`vision_config` 与占位 token 都
-    还在），所以 `text_only` 那条也在这些用例里被走到。
+    它带整座塔的声明与占位 token（`vision_config` / `image_token_id`），与 d3 的发布包同形。
     """
     directory.mkdir(parents=True, exist_ok=True)
     shutil.copy(FIXTURES / "h2o" / "config.json", directory / "config.json")

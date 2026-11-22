@@ -12,9 +12,13 @@
 **因果臂不在这里声明**：§8.8 量过它（137 题 739 s → 186 s，但 37/137 条判词翻掉），那是
 "未训练读法的代价"，与 torchcast 同一条判据 —— 只能以 `noncausal_full` 出货。
 
-权重的准备约定：`merge_shards.py --drop-prefix visual.` 合分片时丢掉视觉塔张量，config 里
-却还留着整块 `vision_config`。所以这里用 `qwen35.text_only` 读 config —— 否则描述符会声明
-一座没有权重的塔，首启预处理当场去编它。
+权重的准备约定：发布包的 `config.json` 留着整块 `vision_config`，而**塔的权重也在包里**
+（297 个 `visual.*`；`visual.blocks.0.attn.qkv.weight` 实测 BF16 `[3072, 1024]`），几何与
+torchcast 逐项相同。所以这里照读完整 config：描述符会声明这座塔，`split` 装配据此建塔，图片
+走 `MudePrompter` 的 content parts 与 `models/vision/merge` 的展开/位置表。早先的
+`qwen35.text_only` 是误判（把 d3 当成了 mude 那种"塔继承但没用"的检查点）—— 那会让每个带图
+请求都 422，而 d3-mini 的发布卡片把读图列为核心能力。视频仍没接：塔只做单帧
+（`devices/apple/vision.py` 的 `patchify` 把单帧沿 temporal 复制），没有时间轴与抽帧。
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ MODES = frozenset({MaskMode.NONCAUSAL_FULL})
 
 def parse_config(model_dir: Path) -> ModelDescriptor:
     """按 d3 线格式读描述符：温度随 checkpoint 走，掩码只有双向那一种。"""
-    config = qwen35.text_only(qwen35.load_json(model_dir / "config.json"))
+    config = qwen35.load_json(model_dir / "config.json")
     decision = qwen35.load_json(model_dir / "decision_config.json")
     temperature = decision.get("temperature")
     return qwen35.descriptor_from(

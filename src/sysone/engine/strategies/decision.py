@@ -126,7 +126,11 @@ def _common_prefix(encoded: Sequence[Encoded]) -> tuple[int, ...] | None:
 
 @dataclass
 class DecisionMetrics:
-    """共享与合批的计数（互不重叠）；编排按能力位分派，计数记在分派处。"""
+    """共享与合批的计数（互不重叠）；编排按能力位分派，计数记在分派处。
+
+    `batch_hit` 是"一个 pass 装了 ≥2 条**互不相干**的序列"：不同请求的块对角，或
+    `noncausal_full` 同一请求的多题（它们本来就是一题一条序列）。
+    """
 
     shared_hit: int = 0
     shared_miss: int = 0
@@ -208,10 +212,21 @@ class DecisionRunner:
         # 一图一块的位置在每题的整条序列上不同，但链只按第一题那份把塔的行盖进去。
         mm = placements[0] if placements else None
         shared = shared_prefix(encoded) if use_prefix else None
+        answers: list[Answer] | None = None
         if shared is not None and len(encoded) > 1 and self.supports_shared:
             self.decisions.shared_hit += 1
             answers = self.shared_answers(shared, encoded, kinds, causal=causal, mm=mm)
-        else:
+        elif len(encoded) > 1 and not use_prefix and mm is None and self.supports_batch:
+            # `noncausal_full` 的同一请求多题是**互不相干**的独立序列（每题一条 state + 题），
+            # 块对角正好是它们的语义；装不下时 `forward_batched` 返回 `None`，下面退回逐题。
+            # 带图时不进这条路：塔的行落点是按第一题对好的，`forward_batched` 也不收 `mm`。
+            answers = self.batched_answers(
+                encoded, kinds, causal=causal, use_prefix=use_prefix)
+            if answers is not None:
+                self.decisions.batch_hit += 1
+            else:
+                self.decisions.batch_fallback += 1
+        if answers is None:
             if len(encoded) > 1 and use_prefix:
                 # 有前缀语义的多题却没共享：前缀不同、链没有 `forward_shared`，或分词把它们的
                 # 前缀切成了不同的串。都记 miss —— 它就是共享的收益没拿到。
@@ -355,7 +370,13 @@ class DecisionRunner:
                     item.ids[:cut], media.counts, image_token_id=self._image_token)  # type: ignore[arg-type]
             else:
                 prefix_ids = []
-            placed.append(replace(item, ids=tuple(expanded), prefix_len=len(prefix_ids)))
+            # 读出位置也是**未展开**时量出来的（pplx v1.2 的标记在 93）：图块展开后它前面
+            # 会多出 `Σ(n_i - 1)` 个 token，不平移就是拿错列的 hidden 当答案。
+            readout = item.readout
+            if readout is not None:
+                readout = merge.shift_position(readout, placement.spans)  # type: ignore[attr-defined]
+            placed.append(replace(item, ids=tuple(expanded), prefix_len=len(prefix_ids),
+                                  readout=readout))
             placements.append(placement)
         return placed, placements
 

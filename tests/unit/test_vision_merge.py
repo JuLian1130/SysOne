@@ -20,6 +20,7 @@ from sysone.models.vision.merge import (
     attach,
     expand_image_tokens,
     mrope_positions,
+    shift_position,
     splice_rows,
     split_placement,
 )
@@ -141,3 +142,18 @@ def test_split_placement_keeps_the_images_on_one_side() -> None:
 
     with pytest.raises(ValueError, match="跨在"):
         split_placement(placement, 3)
+
+
+def test_shift_position_moves_the_readout_past_the_images_before_it() -> None:
+    """读出位置是未展开时量出来的；图块展开后它前面多出 `Σ(n_i - 1)` 个 token。"""
+    ids = [1, IMAGE, 2, IMAGE, 3]
+    _expanded, spans = expand_image_tokens(ids, (4, 3), image_token_id=IMAGE)
+    assert shift_position(0, spans) == 0, "图之前的 token 不受影响"
+    assert shift_position(2, spans) == 5, "只有第一张图在它之前：(2) + 4 - 1"
+    assert shift_position(4, spans) == 9, "两张图都在它之前：(4) + 3 + 2"
+
+
+def test_shift_position_refuses_a_readout_inside_an_image_block() -> None:
+    """读出位置是标记 token，不可能是占位符；落进图块内部说明编码那一步已经错了。"""
+    with pytest.raises(ValueError, match="图块"):
+        shift_position(7, [(7, 4)])

@@ -109,6 +109,25 @@ def expand_image_tokens(
     return out, spans
 
 
+def shift_position(position: int, spans: Sequence[tuple[int, int]]) -> int:
+    """占位符展开之后，未展开序列里的第 `position` 个 token 落到哪个下标。
+
+    `spans` 是 `expand_image_tokens` 返回的那一份，起点是**展开后**的下标。读出位置是**未
+    展开**时量出来的（一张图一个占位符），所以这里逐张图把它换算回未展开下标、判断它是否在
+    读出位置之前，再累加 `Σ(n_i - 1)`。读出位置落进图块内部是编程错误（标记不可能是占位符），
+    报错而不是就近取一个数。
+    """
+    added = 0
+    for start, n in spans:
+        origin = int(start) - added          # 这个占位符在未展开序列里的下标
+        if origin > position:
+            break
+        if origin == position:
+            raise ValueError(f"读出位置 {position} 落在 [{start}, {start + n}) 的图块里")
+        added += int(n) - 1
+    return int(position) + added
+
+
 def mrope_positions(
     ids: Sequence[int], counts: Sequence[int], grids: Sequence[tuple[int, int]],
     *, image_token_id: int,
@@ -249,6 +268,7 @@ __all__ = [
     "attach",
     "expand_image_tokens",
     "mrope_positions",
+    "shift_position",
     "splice_rows",
     "split_placement",
 ]

@@ -280,28 +280,6 @@ def test_d3_reads_the_mude_wire_format_on_the_4b_body(tmp_path) -> None:
         assert plan.descriptor.family == name
 
 
-def test_a_text_only_decision_checkpoint_declares_no_tower(tmp_path) -> None:
-    """准备时按 `visual.*` 丢了塔权重，config 里却还留着整块视觉声明。
-
-    照读会让 descriptor 声明一座没有权重的塔：首启预处理去编它，然后报"缺张量" —— 症状
-    与原因隔得很远。`text_only` 去掉顶层那几项，塔从描述符起就不存在。
-    """
-    config = json.loads((FIXTURES / "h2o" / "config.json").read_text(encoding="utf-8"))
-    assert "vision_config" in config and config.get("image_token_id") is not None
-
-    stripped = qwen35.text_only(config)
-    for key in ("vision_config", "image_token_id", "video_token_id",
-                "vision_start_token_id", "vision_end_token_id"):
-        assert key not in stripped
-    # 原 dict 不被改：同一份 config 还要给别的家族读
-    assert "vision_config" in config
-
-    descriptor = d3.parse_config(make_code_checkpoint(tmp_path))
-    assert descriptor.vision is None
-    assert descriptor.image_token_id is None
-    assert descriptor.vision_start_token_id is None
-
-
 def test_a_decision_config_without_the_d3_format_id_is_refused(tmp_path) -> None:
     """d3 线格式的码表函数要认 `format_id`：另一套决策检查点（pplx-decider-flash）同样有 255 个
     码，但 `decision_config.json` 里没有它，读法也不同。缺这一项时必须当场拒绝，而不是把别人的

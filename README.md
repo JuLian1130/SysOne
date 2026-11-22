@@ -69,7 +69,8 @@ For mude use `--model mude`. d3 and torchcast download their sharded packages
 on first use as well: `--model d3` runs `vllm-sr/d3-mini` on the split chain and
 `--model torchcast` runs `torchcast-ai/torchcast-decision-4b` on the pooled
 chain. Both only support the full-bidirectional mask, so they share no prompt
-prefix between questions, though batching still applies. Give `--model`
+prefix between questions, though batching still applies. d3 also reads images,
+since its package carries the vision tower. Give `--model`
 explicitly for those two (their packages carry the same required files as
 mude's). The vendor extra (`pip install -e './src[vendor]'`) is only needed to
 run the vendor's own torch engine as a comparison baseline.
@@ -78,8 +79,9 @@ pplx-decider-flash is two separate checkpoints (`--model pplx12` and
 `--model pplx13`): v1.2 reads out at a `<|fim_suffix|>` marker inside the user
 turn, v1.3 chunks the context and one question and reads out on the marker that
 ends the sequence. Both run on the split chain with the full-bidirectional mask,
-one question per sequence; images, the multi-question `isolated` layout and
-v1.3's locate head are not supported yet.
+one question per sequence (the questions of one request may share one packed
+pass); images are supported, placed before the state text; the multi-question
+`isolated` layout and v1.3's locate head are not supported yet.
 
 Check it from another shell:
 
