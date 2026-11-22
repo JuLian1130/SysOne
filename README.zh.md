@@ -25,7 +25,7 @@ SysOne 接收一个结构化状态（JSON 对象或一段文本）加一组问�
   `--W 0` 把 32 层全部常驻，约需 4.5 GB。
 - arm64 Python 3.11 或更新。
 - Xcode Command Line Tools（`xcode-select --install`），`clang` 需要它。
-- 磁盘：mude 权重约 4 GB，5 个 4B 检查点（d3 / h2o / pplx12 / pplx13 /
+- 磁盘：mude 权重约 4 GB，6 个 4B 检查点（d3 / h2o / pplx12 / pplx13 / singvl /
   torchcast）各约 9.1–10.4 GB（一次装一个模型），另加约 4 GiB 编译产物。权重在首次
   使用时下载。
 
@@ -72,6 +72,12 @@ pplx-decider-flash 是两份独立的检查点（`--model pplx12` 与 `--model p
 挤进一个合批 pass）；图像已支持、放在正文之前；多题的 `isolated` 布局与 v1.3 的 locate
 头暂不支持。
 
+inclusionAI 的 SingVL S1 4B（`--model singvl`）与上面四个的差别在**答案码怎么读**：256
+个两字母码是绑定 embedding 的行，所以链直接从权重分片里切那几行，不另读一张码表。题面也是
+它自己的一套（`<|im_start|>user` + 固定指令 + `### Question:` / `### Options:`），不走
+chat 模板；同样只有全双向掩码；图像走它发布包自带的那座塔。它的 `score` 收 2 到 10 档。
+发布包里没有 license 文件 —— 这里不做任何再授权。
+
 另开一个 shell 检查：
 
 ```sh
@@ -89,12 +95,12 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 
 | 参数 | 默认 / 取值 | 含义 |
 |---|---|---|
-| `--model {d3,h2o,mude,pplx12,pplx13,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
-| `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude / d3 / pplx12 / pplx13 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
+| `--model {d3,h2o,mude,pplx12,pplx13,singvl,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
+| `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude / d3 / pplx12 / pplx13 / singvl 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
 | `--weights PATH` | 自动下载 | 显式包；只读，永不下网 |
 | `--offline` | 关 | 不碰网络 |
 | `--quant {int8,fp16}` | `int8` | ANE 权重存储形态；计算始终 fp16 |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast / d3 / pplx12 / pplx13 `noncausal_full`） | 掩码；请求可覆盖 |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast / d3 / pplx12 / pplx13 / singvl `noncausal_full`） | 掩码；请求可覆盖 |
 | `--bucket N` | `1024` | ANE program 列宽 |
 | `--width N` | `32768` | GPU 缓冲宽度，也是最大输入 token 数 |
 | `--W N` | `4` | 常驻层数；`0` = 全部常驻 |

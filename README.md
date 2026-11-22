@@ -31,8 +31,8 @@ questions and options, and returns a probability for every option.
 - arm64 Python 3.11 or newer.
 - Xcode Command Line Tools (`xcode-select --install`) for `clang`.
 - Disk: about 4 GB of weights for mude and 9.1–10.4 GB for each 4B checkpoint
-  (d3, h2o, pplx12, pplx13, torchcast; one model at a time), plus about 4 GiB
-  of compiled artifacts. The weights are downloaded on first use.
+  (d3, h2o, pplx12, pplx13, singvl, torchcast; one model at a time), plus about
+  4 GiB of compiled artifacts. The weights are downloaded on first use.
 
 ## Install
 
@@ -83,6 +83,16 @@ one question per sequence (the questions of one request may share one packed
 pass); images are supported, placed before the state text; the multi-question
 `isolated` layout and v1.3's locate head are not supported yet.
 
+inclusionAI's SingVL S1 4B (`--model singvl`) differs from the other four in how
+its answer codes are read: the 256 two-letter codes are rows of the tied
+embedding, so the chain slices those rows out of the weight shard instead of
+loading a separate readout table. It also brings its own prompt layout
+(`<|im_start|>user` + a fixed instruction + `### Question:` / `### Options:`)
+rather than a chat template, only supports the full-bidirectional mask, and
+reads images through the tower its package carries. Its `score` questions take
+2 to 10 levels. The package carries no license file, so nothing here re-licenses
+the weights.
+
 Check it from another shell:
 
 ```sh
@@ -101,12 +111,12 @@ optional.
 
 | Flag | Default / values | Meaning |
 |---|---|---|
-| `--model {d3,h2o,mude,pplx12,pplx13,torchcast}` | from `--backend` or `--weights` | model family |
-| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude, d3, pplx12 and pplx13 | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
+| `--model {d3,h2o,mude,pplx12,pplx13,singvl,torchcast}` | from `--backend` or `--weights` | model family |
+| `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude, d3, pplx12, pplx13 and singvl | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |
 | `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
-| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast, d3, pplx12 and pplx13) | mask; a request can override it |
+| `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast, d3, pplx12, pplx13 and singvl) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
 | `--width N` | `32768` | GPU buffer width, also the max input tokens |
 | `--W N` | `4` | resident layers; `0` keeps all of them |

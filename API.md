@@ -102,21 +102,21 @@ are layouts in which the questions, or the state, see each other.
 - `noul` answers carry `noul` (P(true)) and no `confidence`: neither vendor's
   yes/no answer object has one.
 - `score` answers carry the expected level in `score` (0-based), the per-level
-  `probabilities` keyed `"0"`..`"n-1"`, and `confidence`. mude takes 2 to 10
-  levels, h2o up to 255.
+  `probabilities` keyed `"0"`..`"n-1"`, and `confidence`. mude, d3, torchcast
+  and singvl take 2 to 10 levels, h2o and the two pplx checkpoints up to 255.
 - `attention_mode` in the request body overrides the process default set by
   `--attention-mode` for that request.
 
 ## Per-model capabilities
 
-| | h2o | mude | d3 | torchcast | pplx12 | pplx13 |
-|---|---|---|---|---|---|---|
-| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
-| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained) | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only |
-| Readout | vendor pooled readout | 255-row code table | 255-row code table | 26 `lm_head` letter rows | 255-row code table (BF16) | 255-row code table (BF16) |
-| Max options per question | 255 (255 levels) | 255 (10 levels) | 255 (10 levels) | 26 (10 levels) | 255 (255 levels) | 255 (255 levels) |
-| Max input tokens | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
-| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) |
+| | h2o | mude | d3 | torchcast | pplx12 | pplx13 | singvl |
+|---|---|---|---|---|---|---|---|
+| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
+| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained) | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only |
+| Readout | vendor pooled readout | 255-row code table | 255-row code table | 26 `lm_head` letter rows | 255-row code table (BF16) | 255-row code table (BF16) | 256 rows of the tied embedding |
+| Max options per question | 255 (255 levels) | 255 (10 levels) | 255 (10 levels) | 26 (10 levels) | 255 (255 levels) | 255 (255 levels) | 255 (10 levels) |
+| Max input tokens | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
+| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) |
 
 `--width` is both the GPU buffer width and the input limit, so a longer prompt
 needs a larger value. Every family with a tower answers images; mude's tower is

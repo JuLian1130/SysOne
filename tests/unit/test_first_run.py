@@ -21,7 +21,7 @@ import pytest
 from helpers import FIXTURES, write_safetensors, write_sharded_checkpoint
 from sysone.cli import _CLI_FAMILIES
 from sysone.domain.quant import DType
-from sysone.models.families import d3, pplx, torchcast
+from sysone.models.families import d3, pplx, singvl, torchcast
 from sysone.models.sources import SOURCES, WeightsSource, source_for
 from sysone.models.tokenizer import ChatTokenizer
 from sysone.weights.checkpoint import open_checkpoint
@@ -57,6 +57,19 @@ _TORCHCAST_SHARDS = {
     },
     "model-00003-of-00003.safetensors": {
         "model.language_model.layers.0.linear_attn.in_proj_a.weight": np.zeros((32, HIDDEN), dtype=np.float32),
+    },
+}
+
+# SingVL 的读出**切**的是绑定 embedding 的行（没有 `lm_head`、也没有码表），所以清单里必须
+# 有那张表所在的分片。这里只放两行：切行的顺序由 `test_singvl.py` 用同一份表钉（真表 248320
+# 行，按真实 id 造一份就是 2.2 GB）。
+_SINGVL_SHARDS = {
+    "model-00001-of-00002.safetensors": {
+        "model.language_model.embed_tokens.weight":
+            np.arange(HIDDEN * 2, dtype=np.float32).reshape(2, HIDDEN),
+    },
+    "model-00002-of-00002.safetensors": {
+        "model.language_model.layers.0.input_layernorm.weight": np.ones(HIDDEN, dtype=np.float32),
     },
 }
 
@@ -227,3 +240,36 @@ def test_a_second_start_reads_the_marker_instead_of_the_network(tmp_path: Path) 
     assert ensure_weights(source, tmp_path, download=_never) == target
     assert ensure_weights(source, tmp_path, offline=True, download=_never) == target
     assert (Path(target) / "source.json").is_file()
+
+
+def test_the_singvl_source_is_enough_to_first_run_and_read(tmp_path: Path) -> None:
+    """SingVL 的清单下载完也能直接跑：绑定 embedding 的那张表在分片里，读出按 id 切行。
+
+    这一家没有 `readout.safetensors`、也没有 `lm_head`：`tie_word_embeddings: true` 让
+    "答案码的 logits" 就是 `embed_tokens.weight` 的那 256 行。所以清单里必须带上分片索引
+    与两个分片，读出才切得出来。
+    """
+    source = source_for("singvl")
+    publisher = Publisher(_SINGVL_SHARDS, {
+        "config.json": FIXTURES / "singvl" / "config.json",
+        "processor_config.json": {"processor_class": "Qwen3VLProcessor"},
+        "chat_template.jinja": "",
+    })
+    target = ensure_weights(source, tmp_path, download=publisher)
+    assert publisher.calls == 1
+    descriptor = singvl.parse_config(Path(target))
+    ids = descriptor.readout.ids
+    assert ids is not None and len(ids) == singvl.CODE_ROWS
+    store = open_checkpoint(target)
+    try:
+        # 读出要的那张表就在下载的分片里（它是绑定 embedding，不是独立的读出文件）。
+        assert store.read(singvl.EMBED).shape == (2, HIDDEN)
+        np.testing.assert_allclose(
+            store.read("model.language_model.layers.0.input_layernorm.weight"), 1.0)
+    finally:
+        store.close()
+    assert descriptor.vision is not None and descriptor.image_token_id == 248056
+    # 模板在兄弟文件里（`tokenizer_config.json` 的 `chat_template` 是 null）：装载契约要它。
+    assert ChatTokenizer.load(target).apply_chat_template(
+        [{"role": "user", "content": "hello"}], tokenize=False, add_generation_prompt=True
+    ) == "hello\n"

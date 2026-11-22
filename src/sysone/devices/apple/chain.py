@@ -315,7 +315,6 @@ class SplitChain:
         # 读 config 拼形状（那会有第二份真相，且 h2o 的 v 头曾被抄成 k 头）。
         geometry = Geometry.from_descriptor(weights.descriptor)
         hidden, ffn = geometry.hid, geometry.ffn
-        readout = _readout(root, weights.descriptor)
         roles = list(weights.descriptor.layer_types)
         # 窗口在装载之前算：比块还短时在这里就报错，不必先装完 20 层再失败。
         targets: tuple[tuple[int, ...], ...] = ()
@@ -352,6 +351,9 @@ class SplitChain:
                                cout=max(geometry.cout_full, geometry.cout_gdn), s=s)
                     for _ in range(pool_slots(roles))]
         try:
+            # 读出表在 store 打开之后取：`embed_rows` 要按 token id 切绑定 embedding 的行，
+            # 那张表在分片里（SingVL 没有独立的 `readout.safetensors`）。
+            readout = _readout(root, store, weights.descriptor)
             params = [_layer_params(store, prefix, index, role, weights.norm_offset)
                       for index, role in enumerate(roles)]
             # 产物目录按 (模型, 桶宽) 分家：不同桶宽的产物互不覆盖 —— 否则一次 `s=256`
@@ -1170,28 +1172,38 @@ def _build_layer_program(
 # ---------------------------------------------------------------------- 权重
 
 
-def _readout(root: Path, descriptor: ModelDescriptor) -> np.ndarray | None:
-    """码表读出：`readout.safetensors` 的 `[rows, hidden]`，转 fp32。
+def _readout(root: Path, store: WeightStore, descriptor: ModelDescriptor) -> np.ndarray | None:
+    """读出表 `[rows, hidden]`（fp32），两种来源。
 
-    只有 `code_rows` 有这张表。`pooled`（h2o）的读出是厂商的分池头 + selector，还没接
-    （票据 15 的 G6）—— 这时返回 `None`，链仍然能装、能跑逐层 hidden，`logits()` 会明确报错，
-    而不是拿一张不存在的表算出一堆看似正常的数。
+    `code_rows` 读独立文件（`readout.safetensors`，mude / d3 / pplx）。`embed_rows` **不另存
+    文件**：这份检查点 `tie_word_embeddings: true`，`lm_head` 与 embedding 是同一张表，所以
+    "答案码的 logits" 就是这张表里那几个 id 的行。按 id 切行与厂商 `lm_head(hidden)` 取那几列
+    是同一个乘法，不需要往权重目录写一份派生表（那会让只读的权重容器变成可写）。
+
+    `pooled`（h2o）的读出是厂商的分池头 + selector，还没接（票据 15 的 G6）—— 这时返回
+    `None`，链仍然能装、能跑逐层 hidden，`logits()` 会明确报错，而不是拿一张不存在的表算出
+    一堆看似正常的数。
     """
     plan = descriptor.readout
-    if plan.kind != "code_rows":
+    if plan.kind == "embed_rows":
+        if not plan.weight or not plan.ids:
+            raise ConfigError("embed_rows 读出缺少 weight / ids", kind=plan.kind)
+        table = np.asarray(store.read_rows(plan.weight, plan.ids), np.float32)
+    elif plan.kind == "code_rows":
+        if not plan.file or not plan.weight:
+            raise ConfigError("code_rows 读出缺少 file / weight", kind=plan.kind)
+        handle = SafeTensorFile(root / plan.file)
+        try:
+            weight = handle.read(plan.weight)
+        finally:
+            handle.close()
+        table = np.asarray(weight, np.float32)
+    else:
         return None
-    if not plan.file or not plan.weight:
-        raise ConfigError("code_rows 读出缺少 file / weight", kind=plan.kind)
-    handle = SafeTensorFile(root / plan.file)
-    try:
-        weight = handle.read(plan.weight)
-    finally:
-        handle.close()
-    table = np.asarray(weight, np.float32)
     if table.ndim != 2 or (plan.rows is not None and table.shape[0] != plan.rows):
         raise ConfigError(
             "读出表的形状与 descriptor 不符",
-            shape=list(table.shape), rows=plan.rows, file=plan.file,
+            shape=list(table.shape), rows=plan.rows, file=plan.file or plan.weight,
         )
     return table
 

@@ -185,6 +185,8 @@ def test_package_markers_name_one_family_or_none(tmp_path: Path) -> None:
 
     assert _infer_family(package("h2o", "serve_config.json")) == "h2o"
     assert _infer_family(package("tc", "decision_config.json", "int8_manifest.json")) == "torchcast"
+    # SingVL 没有独立码表（读出切绑定 embedding 的行），标记件是它独有的多模态处理器声明。
+    assert _infer_family(package("sv", "processor_config.json")) == "singvl"
 
     # 同一份 d3 线格式的两家：必需件相同，认不出是哪一家
     with pytest.raises(ConfigError) as ambiguous:

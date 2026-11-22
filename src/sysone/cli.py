@@ -74,6 +74,11 @@ _FAMILY_MARKERS = {
     "pplx13": ("decision_config.json", "readout.safetensors", "joint_config.json"),
     "h2o": ("serve_config.json",),
     "torchcast": ("decision_config.json", "int8_manifest.json"),
+    # SingVL 的读出直接切绑定 embedding 的行，没有独立码表；它的 `config.json` 虽带 `jev_*`
+    # 字段但文件名与别家一样。`processor_config.json` 是它独有的**多模态处理器**声明，也是
+    # 图像预算（`size.shortest_edge` 与 `image_mean/std`）的唯一书面来源 —— 认出包的同时
+    # 认出"这份包带塔"。
+    "singvl": ("processor_config.json",),
 }
 
 
@@ -89,14 +94,14 @@ def _infer_family(weights: Path) -> str:
                 "模型目录认不出唯一家族",
                 weights=str(weights),
                 matches=found,
-                hint="加 --model 显式指定（d3 / h2o / mude / pplx12 / pplx13 / torchcast）；"
+                hint="加 --model 显式指定（d3 / h2o / mude / pplx12 / pplx13 / singvl / torchcast）；"
                      "d3、mude 与两版 pplx 都是同形的检查点，必需件本来就一样",
             )
     raise ConfigError(
         "需要 --model 或 --backend",
         weights=str(weights),
         available=list(_CLI_FAMILIES),
-        hint="--model 取 d3 / h2o / mude / pplx12 / pplx13 / torchcast；"
+        hint="--model 取 d3 / h2o / mude / pplx12 / pplx13 / singvl / torchcast；"
              "reference 后端用 --backend reference --descriptor",
     )
 
@@ -110,7 +115,7 @@ def _resolve_backend(args: argparse.Namespace) -> str:
             raise ConfigError(
                 "需要 --model 或 --backend",
                 hint="省略 --weights 时没有权重包可认家族；"
-                     "先给 --model（d3 / h2o / mude / pplx12 / pplx13 / torchcast）",
+                     "先给 --model（d3 / h2o / mude / pplx12 / pplx13 / singvl / torchcast）",
             )
         args.model = _infer_family(args.weights)
     strategy = family(args.model).strategy

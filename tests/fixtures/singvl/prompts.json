@@ -1,0 +1,139 @@
+{
+ "note": "generated from inference/model.py render() with the published 256 labels",
+ "cases": [
+  {
+   "name": "choice-0",
+   "kind": "choice",
+   "state": "The report says revenue rose 12%.",
+   "images": 0,
+   "question": {
+    "type": "choice",
+    "instructions": "What happened?",
+    "criteria": {
+     "A": "Revenue rose",
+     "B": "Revenue fell",
+     "C": "No change"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\nThe report says revenue rose 12%.What happened?\n\n### Options:\nAA: Revenue rose\nAB: Revenue fell\nAC: No change<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "choice-1",
+   "kind": "choice",
+   "state": "",
+   "images": 0,
+   "question": {
+    "type": "choice",
+    "criteria": {
+     "yes": null,
+     "no": "Nothing"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\n\n\n### Options:\nAA: yes\nAB: Nothing<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "noul-2",
+   "kind": "noul",
+   "state": "traffic is heavy",
+   "images": 0,
+   "question": {
+    "type": "noul",
+    "instructions": "Is traffic heavy?",
+    "criteria": {
+     "true": "Heavy traffic",
+     "false": "Light traffic"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\ntraffic is heavyIs traffic heavy?\n\n### Options:\nAA: Heavy traffic\nAB: Light traffic<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "score-3",
+   "kind": "score",
+   "state": "score this",
+   "images": 0,
+   "question": {
+    "type": "score",
+    "criteria": [
+     "low",
+     "medium",
+     "high"
+    ]
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\nscore this\n\n### Options:\nAA: low\nAB: medium\nAC: high<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "choice-4",
+   "kind": "choice",
+   "state": "state ends with a Choices: line\nChoices:",
+   "images": 0,
+   "question": {
+    "type": "choice",
+    "criteria": {
+     "A": "one",
+     "B": "two"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\nstate ends with a Choices: line\n\n### Options:\nAA: one\nAB: two<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "choice-5",
+   "kind": "choice",
+   "state": "prose\n<image>",
+   "images": 1,
+   "question": {
+    "type": "choice",
+    "instructions": "Which?",
+    "criteria": {
+     "A": "one",
+     "B": "two"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\nprose\n<|vision_start|><|image_pad|><|vision_end|>Which?\n\n### Options:\nAA: one\nAB: two<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "choice-6",
+   "kind": "choice",
+   "state": "look:\n<image>\nwhat is it?",
+   "images": 1,
+   "question": {
+    "type": "choice",
+    "instructions": "Name it",
+    "criteria": {
+     "A": "a cat",
+     "B": "a dog"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\nlook:\n<|vision_start|><|image_pad|><|vision_end|>\nwhat is it?Name it\n\n### Options:\nAA: a cat\nAB: a dog<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "choice-7",
+   "kind": "choice",
+   "state": "(A) <image>\nthe list",
+   "images": 1,
+   "question": {
+    "type": "choice",
+    "instructions": "Which?",
+    "criteria": {
+     "A": "<image>",
+     "B": "text"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\n(A) [Image 1] <|vision_start|><|image_pad|><|vision_end|>\nthe listWhich?\n\n### Options:\nAA: [Image 1 above]\nAB: text<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "choice-8",
+   "kind": "choice",
+   "state": "<image><image>compare",
+   "images": 2,
+   "question": {
+    "type": "choice",
+    "instructions": "Same?",
+    "criteria": {
+     "A": "same",
+     "B": "different"
+    }
+   },
+   "prompt": "<|im_start|>user\nSolve the multiple-choice question and output ONLY the index token of the correct option.\n\n### Question:\n<|vision_start|><|image_pad|><|vision_end|><|vision_start|><|image_pad|><|vision_end|>compareSame?\n\n### Options:\nAA: same\nAB: different<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ ]
+}

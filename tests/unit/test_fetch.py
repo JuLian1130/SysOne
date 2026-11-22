@@ -189,10 +189,11 @@ def test_failed_download_cleans_the_partial_directory(tmp_path: Path) -> None:
 
 
 def test_a_family_without_a_published_source_asks_for_explicit_weights() -> None:
-    """四个出货家族都有来源之后，这条仍是新家族的默认：没来源就要显式 `--weights`。"""
+    """出货家族都有来源之后，这条仍是新家族的默认：没来源就要显式 `--weights`。"""
     with pytest.raises(ConfigError) as caught:
         source_for("unpublished")
-    assert caught.value.context["available"] == ["d3", "h2o", "mude", "pplx12", "pplx13", "torchcast"]
+    assert caught.value.context["available"] == [
+        "d3", "h2o", "mude", "pplx12", "pplx13", "singvl", "torchcast"]
 
 
 def test_manual_command_names_the_pinned_revision(tmp_path: Path) -> None:

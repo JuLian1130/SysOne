@@ -1,8 +1,9 @@
-"""四份发布权重从哪来：仓库、固定修订与引擎读的文件清单。
+"""发布权重从哪来：仓库、固定修订与引擎读的文件清单。
 
 这份清单原先只写在 README 的 `hf download` 命令里，现在它是唯一事实来源：首启自动下载
 按它取文件，`DownloadError` 按它拼出手动命令。修订必须钉死 —— follow branch 会换权重，
-而产物缓存只认权重文件的指纹，换了等于悄悄重编一遍。license 文件也在清单里，随包保留。
+而产物缓存只认权重文件的指纹，换了等于悄悄重编一遍。license 文件也在清单里，随包保留；
+上游仓库本身没有 license 文件的（`SingVL`）清单里也就没有它 —— 那不是漏列。
 
 按**引擎真正读的文件**列，不抄仓库全量：`d3` / `pplx` / `torchcast` 都把权重发成
 `model-0000N-of-000M.safetensors` 加 `model.safetensors.index.json`（首启直接读分片，
@@ -164,6 +165,30 @@ SOURCES: dict[str, WeightsSource] = {
             "NOTICE",
         ),
         size_hint=10_400_000_000,
+    ),
+    "singvl": WeightsSource(
+        family="singvl",
+        repo_id="inclusionAI/SingVL_S1_4B",
+        # 厂商 `inference/release.json` 的 `download_revision`：评测权重钉在
+        # `93f15cd6…`，而它声明 `weights_unchanged: true` 并给出两个分片的 sha256，
+        # 那份声明的下载修订就是这个。跟分支会换权重，产物缓存只认文件指纹。
+        revision="dd9fcbe2412068def01666b1d1a443e412f11214",
+        directory="SingVL_S1_4B",
+        files=(
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            # 这一份的模板不在 tokenizer_config.json 里（是 null），只有这个兄弟文件：
+            # 引擎的分词器装载会读它（题面渲染不走模板，但装载契约要求有一条）。
+            "chat_template.jinja",
+            # 多模态处理器声明：引擎不读它，但它是图像预算（`size.shortest_edge` 与
+            # `image_mean/std`）的书面来源，也是 CLI 认出这个包的唯一标记件。
+            "processor_config.json",
+        ),
+        size_hint=9_100_000_000,
     ),
 }
 

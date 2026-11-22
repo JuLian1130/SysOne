@@ -12,7 +12,7 @@ from ..domain.attention import AttentionRole, MaskMode
 from ..domain.quant import DType, QuantSpec, Scales, Scheme, Storage
 from ..errors import ConfigError
 
-READOUT_KINDS = ("code_rows", "letter_rows", "pooled")
+READOUT_KINDS = ("code_rows", "letter_rows", "pooled", "embed_rows")
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,11 @@ class ReadoutPlan:
 
     - `code_rows`：读固定行数的码表（mude，255 行），再做温度 softmax；
     - `letter_rows`：读 `lm_head` 中候选字母对应的行（torchcast）；
-    - `pooled`：厂商自己的 pooled readout + selector（h2o），M1 由 vendor 策略实现。
+    - `pooled`：厂商自己的 pooled readout + selector（h2o），M1 由 vendor 策略实现；
+    - `embed_rows`：**从绑定 embedding 的张量里按 token id 切行**（SingVL）。这份检查点
+      `tie_word_embeddings: true`、没有 `lm_head`，所以 256 个答案码的 logits 就是
+      `embed_tokens.weight` 的那 256 行 —— 切行等于取 logits，不需要另存一份 `readout.safetensors`。
+      `ids` 是那 256 个 id，`rows` 是行数；行序就是 id 序，与码表顺序一致。
     """
 
     kind: str
@@ -40,6 +44,8 @@ class ReadoutPlan:
     temperature: float | None = None
     noul: NoulThresholds | None = None
     dtype: DType = DType.FP32
+    #: `embed_rows` 要切的 token id（顺序即读出表行序）。其他形态不用。
+    ids: tuple[int, ...] | None = None
 
     def validate(self) -> None:
         if self.kind not in READOUT_KINDS:
@@ -49,6 +55,14 @@ class ReadoutPlan:
                 raise ConfigError("code_rows 需要 weight / file / rows", kind=self.kind)
         if self.kind == "letter_rows" and not self.weight:
             raise ConfigError("letter_rows 需要 weight", kind=self.kind)
+        if self.kind == "embed_rows":
+            if not self.weight or not self.ids:
+                raise ConfigError("embed_rows 需要 weight / ids", kind=self.kind)
+            if self.rows is not None and self.rows != len(self.ids):
+                raise ConfigError(
+                    "embed_rows 的 rows 与 ids 数量不一致",
+                    rows=self.rows, ids=len(self.ids),
+                )
         if self.temperature is not None and self.temperature <= 0:
             raise ConfigError("temperature 必须为正", temperature=self.temperature)
         if self.rows is not None and self.rows <= 0:
@@ -256,6 +270,7 @@ class ModelDescriptor:
                 "labels": list(self.readout.labels) if self.readout.labels else None,
                 "temperature": self.readout.temperature,
                 "dtype": self.readout.dtype.value,
+                "ids": list(self.readout.ids) if self.readout.ids else None,
             },
             "image_token_id": self.image_token_id,
             "video_token_id": self.video_token_id,
@@ -316,6 +331,7 @@ class ModelDescriptor:
             temperature=_opt_float(readout_raw.get("temperature")),  # type: ignore[union-attr]
             noul=NoulThresholds(float(noul_raw["yes"]), float(noul_raw["no"])) if noul_raw else None,
             dtype=DType(str(readout_raw.get("dtype", DType.FP32.value))),  # type: ignore[union-attr]
+            ids=_opt_ints(readout_raw.get("ids")),  # type: ignore[union-attr]
         )
         quant = QuantSpec(
             scheme=Scheme(str(quant_raw.get("scheme", Scheme.NONE.value))),

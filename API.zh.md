@@ -88,19 +88,19 @@ path`：d3 自己的发布包写了视频输入，但本引擎既没有取帧解
   `0.4`），mude 报的是 `1 - H/log n`，同一对概率得 `0.12`。上面那个例子用的是 h2o 的数。
 - `noul` 的答案带 `noul`（P(true)），不带 `confidence`：两家的 yes/no 答面都没有这个字段。
 - `score` 的答案在 `score` 里带期望档位（0 起算），带按序号给的 `probabilities`（键是
-  `"0"`..`"n-1"`）与 `confidence`。mude 收 2 到 10 档，h2o 最多 255 档。
+  `"0"`..`"n-1"`）与 `confidence`。mude / d3 / torchcast / singvl 收 2 到 10 档，h2o 与两版 pplx 最多 255 档。
 - 请求体里的 `attention_mode` 只对该请求覆盖 `--attention-mode` 设的进程默认值。
 
 ## 各模型能力
 
-| | h2o | mude | d3 | torchcast | pplx12 | pplx13 |
-|---|---|---|---|---|---|---|
-| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
-| 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal`（训练过） | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` |
-| 读出 | 厂商 pooled 读出 | 255 行码表 | 255 行码表 | 26 行 `lm_head` 字母 | 255 行码表（BF16） | 255 行码表（BF16） |
-| 每题最多选项 | 255（255 档） | 255（10 档） | 255（10 档） | 26（10 档） | 255（255 档） | 255（255 档） |
-| 最大输入 token | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
-| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
+| | h2o | mude | d3 | torchcast | pplx12 | pplx13 | singvl |
+|---|---|---|---|---|---|---|---|
+| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
+| 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal`（训练过） | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` |
+| 读出 | 厂商 pooled 读出 | 255 行码表 | 255 行码表 | 26 行 `lm_head` 字母 | 255 行码表（BF16） | 255 行码表（BF16） | 绑定 embedding 的 256 行 |
+| 每题最多选项 | 255（255 档） | 255（10 档） | 255（10 档） | 26（10 档） | 255（255 档） | 255（255 档） | 255（10 档） |
+| 最大输入 token | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
+| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
 
 `--width` 同时是 GPU 缓冲宽度与输入上限，所以更长的 prompt 要给更大的值。带塔的家族都能
 收图；mude 的塔继承自 d3-nano，按它的模型卡，那座塔没有为 mu 的决策训练或评估过 —— 它能
