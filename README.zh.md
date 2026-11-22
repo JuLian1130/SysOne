@@ -95,7 +95,7 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 
 | 参数 | 默认 / 取值 | 含义 |
 |---|---|---|
-| `--model {d3,h2o,mude,pplx12,pplx13,singvl,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族 |
+| `--model {d3,h2o,mude,pplx12,pplx13,singvl,torchcast}` | 由 `--backend` 或 `--weights` 推断 | 模型家族；一个名字固定一份发布检查点，参数量写在 `--help` 里（mude 1.98B、h2o 4.66B、d3 / pplx12 / pplx13 / singvl 4.54B、torchcast 5.17B） |
 | `--backend {split,pooled,vendor,reference}` | h2o 与 torchcast 用 `pooled`、mude / d3 / pplx12 / pplx13 / singvl 用 `split` | 执行路径；`vendor` 跑厂商自己的引擎，`reference` 是只用于测试的语义裁判 |
 | `--weights PATH` | 自动下载 | 显式包；只读，永不下网 |
 | `--offline` | 关 | 不碰网络 |

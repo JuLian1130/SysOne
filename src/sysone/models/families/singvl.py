@@ -383,5 +383,6 @@ def _plan(
 # 这份检查点的张量前缀、norm 存法与置信度口径。形状与读出方案来自 `parse_config`。
 RECIPE = SplitRecipe(labels=read_codes, prompter=SingVLPrompter, confidence=mude.confidence)
 
-register_family("singvl", parse_config, build_layer_plan,
-                strategy="split", weight_plan=weight_plan, recipe=RECIPE, source=__name__)
+# 参数量按发布包的两个分片实测：4 539 265 536（与 d3 / pplx 同一个 4B 底座 + 视觉塔）。
+register_family("singvl", parse_config, build_layer_plan, strategy="split",
+                weight_plan=weight_plan, recipe=RECIPE, params="4.54B", source=__name__)

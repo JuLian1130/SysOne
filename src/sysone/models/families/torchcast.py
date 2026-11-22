@@ -95,5 +95,6 @@ RECIPE = PooledRecipe(serve=open_serve)
 # 厂商直通不挂 CLI：`vendor_runner` 与 `TorchcastBridge` 留着作对拍基线。
 BASELINE = "torchcast"
 
-register_family("torchcast", parse_config, build_layer_plan,
-                strategy="pooled", weight_plan=weight_plan, recipe=RECIPE, source=__name__)
+# 参数量按发布包的三个分片实测：5 174 964 736（同一个 4B 底座，多一份解绑的 `lm_head`）。
+register_family("torchcast", parse_config, build_layer_plan, strategy="pooled",
+                weight_plan=weight_plan, recipe=RECIPE, params="5.17B", source=__name__)

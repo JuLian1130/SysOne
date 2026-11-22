@@ -29,6 +29,30 @@ def test_inspect_prints_descriptor(capsys) -> None:
     assert payload["default_mode"] == "prefix_noncausal"
 
 
+def test_the_model_flag_names_the_parameter_size_of_each_family(capsys) -> None:
+    """同一个厂商可能发 2B / 4B 几档，所以 `--model` 的取值表与帮助都要带档位。
+
+    用法行（metavar）与报错各查一遍：认错家族的那一刻正是用户需要看到"这个名字对应多大"。
+    """
+    with pytest.raises(SystemExit) as helped:
+        main(["serve", "--help"])
+    assert helped.value.code == 0
+    assert ("{d3=4.54B,h2o=4.66B,mude=1.98B,pplx12=4.54B,pplx13=4.54B,singvl=4.54B,"
+            "torchcast=5.17B}") in capsys.readouterr().out
+    with pytest.raises(SystemExit) as refused:
+        main(["serve", "--model", "d3-8b"])
+    assert refused.value.code == 2
+    assert "mude 1.98B" in capsys.readouterr().err
+
+
+def test_inspect_prints_the_parameter_size(capsys) -> None:
+    """`inspect` 的回包里带 `params`：它是家族名承诺的那一档，不是 config 里的字段。"""
+    code = main(["inspect", "--model", "mude", "--weights", str(FIXTURES / "mude")])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["params"] == "1.98B"
+
+
 def test_run_with_tiny_model(tmp_path: Path, capsys) -> None:
     descriptor, store = make_tiny(tmp_path)
     descriptor_path = tmp_path / "descriptor.json"

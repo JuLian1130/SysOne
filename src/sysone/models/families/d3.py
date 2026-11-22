@@ -83,5 +83,6 @@ def weight_plan(model_dir: Path) -> WeightPlan:
 # 与 mude 共用同一份配方：同一线格式的两份检查点，题面/码表/置信度没有第二套定义。
 RECIPE = mude.RECIPE
 
-register_family("d3", parse_config, build_layer_plan,
-                strategy="split", weight_plan=weight_plan, recipe=RECIPE, source=__name__)
+# 参数量按发布包的两个分片实测：4 539 265 536（Qwen3.5-4B 底座 + 整座视觉塔）。
+register_family("d3", parse_config, build_layer_plan, strategy="split",
+                weight_plan=weight_plan, recipe=RECIPE, params="4.54B", source=__name__)

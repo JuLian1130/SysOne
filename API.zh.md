@@ -95,6 +95,8 @@ path`：d3 自己的发布包写了视频输入，但本引擎既没有取帧解
 
 | | h2o | mude | d3 | torchcast | pplx12 | pplx13 | singvl |
 |---|---|---|---|---|---|---|---|
+| 检查点 | `h2o-lightning-4b` | `mude-1.0` | `d3-mini` | `torchcast-decision-4b` | `pplx-decider-flash-v1.2` | `pplx-decider-flash-v1.3` | `SingVL_S1_4B` |
+| 参数量 | 4.66B | 1.98B | 4.54B | 5.17B | 4.54B | 4.54B | 4.54B |
 | 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
 | 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal`（训练过） | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` |
 | 读出 | 厂商 pooled 读出 | 255 行码表 | 255 行码表 | 26 行 `lm_head` 字母 | 255 行码表（BF16） | 255 行码表（BF16） | 绑定 embedding 的 256 行 |

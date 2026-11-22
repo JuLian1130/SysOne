@@ -19,6 +19,26 @@ def test_four_families_registered() -> None:
     assert {"d3", "h2o", "mude", "torchcast"} <= set(registered())
 
 
+# 每个家族固定一份发布检查点；这几个数是按各自 safetensors 头里的形状乘积求和的**实测值**
+# （`.tmp/probe_param_counts.py`，2026-11-22）。mude 是 Qwen3.5-2B 剪到 20 层，torchcast 比
+# 同一个 4B 底座多一份解绑的 `lm_head`。
+PARAMS = {
+    "d3": "4.54B",
+    "h2o": "4.66B",
+    "mude": "1.98B",
+    "pplx12": "4.54B",
+    "pplx13": "4.54B",
+    "singvl": "4.54B",
+    "torchcast": "5.17B",
+}
+
+
+def test_every_family_names_the_parameter_count_of_its_checkpoint() -> None:
+    """`--model` 的名字只说"哪一家"，档位在每个注册项的 `params` 里 —— 漏一个就等于入参
+    不知道指的是多大的模型。"""
+    assert {name: family(name).params for name in registered()} == PARAMS
+
+
 def test_unknown_family_reports_available() -> None:
     with pytest.raises(UnknownModelError) as caught:
         family("nope")

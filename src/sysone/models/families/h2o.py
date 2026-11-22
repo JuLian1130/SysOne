@@ -76,5 +76,6 @@ def open_serve(model_dir: str | Path, tokenizer: object | None = None) -> object
 # 交给 pooled 策略的接入件。形状与张量前缀仍由 `weight_plan` 给，两者各管一半。
 RECIPE = PooledRecipe(serve=open_serve)
 
-register_family("h2o", parse_config, build_layer_plan,
-                strategy="pooled", weight_plan=weight_plan, recipe=RECIPE, source=__name__)
+# 参数量按发布包的 safetensors 头实测：4 659 865 088（h2o-lightning-4b）。
+register_family("h2o", parse_config, build_layer_plan, strategy="pooled",
+                weight_plan=weight_plan, recipe=RECIPE, params="4.66B", source=__name__)

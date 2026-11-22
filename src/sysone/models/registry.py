@@ -40,6 +40,13 @@ class Family:
     `recipe` 是这一家交给策略的接入件（`models.recipe` 的三种之一）。它与 `strategy` 成对
     才有意义：策略挑执行器，配方给这家自己的题面与读出。缺配方时装配**必须报错** ——
     早先的写法按策略名直接查工厂，新家族声明同一个策略就会静默借走前一家的题面。
+
+    `params` 是这一家**对应哪一档参数量**，形如 `"4.54B"`：一个家族名固定一份发布检查点
+    （同一个模型可能发 2B / 4B / 8B 几档，家族名只说"哪一家"、不说"多大"），所以这个数写在
+    注册项里，由 `--model` 的帮助、`sysone inspect` 与文档一起念出来。它是**实测值**：按
+    safetensors 头里的形状乘积求和，不是厂商卡片上的约数（torchcast 因为有解绑的 `lm_head`
+    比同一个基座的其它 4B 多 0.64B）。读不出来（比如自定义 `--weights` 换了一档）时它仍然
+    是这家的发布档位 —— 那是"我们这个家族名承诺什么"，不是"你手上这份有多大"。
     """
 
     name: str
@@ -48,6 +55,7 @@ class Family:
     strategy: str
     weight_plan: WeightPlanFn | None = None
     recipe: object | None = None
+    params: str = ""
     source: str = ""
 
 
@@ -62,6 +70,7 @@ def register_family(
     strategy: str,
     weight_plan: WeightPlanFn | None = None,
     recipe: object | None = None,
+    params: str = "",
     source: str = "",
 ) -> None:
     """注册家族；重复注册直接报错（同名两份实现是配置事故，不该静默覆盖）。
@@ -80,6 +89,7 @@ def register_family(
         strategy=strategy,
         weight_plan=weight_plan,
         recipe=recipe,
+        params=params,
         source=source,
     )
 

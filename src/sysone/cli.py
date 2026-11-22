@@ -54,6 +54,37 @@ _VISION_IDLE = 0.0
 # run / serve 只列有 CLI 装配入口的家族。`inspect` / `doctor` 仍列全部家族（它们只看配置）。
 _CLI_FAMILIES = tuple(name for name in families() if family(name).strategy in STRATEGY_BACKENDS)
 
+
+def _family_sizes(names: tuple[str, ...] | None = None) -> str:
+    """`d3 4.54B、h2o 4.66B、…` —— 一个家族名固定一份发布检查点，所以档位写在名字旁边。
+
+    同一个厂商可能发 2B / 4B 几档，家族名只说"哪一家"、不说"多大"；这一串就是
+    `--model` 认的那几档（数值来自注册项的 `params`，是 safetensors 头的实测值）。
+    """
+    chosen = families() if names is None else names
+    return "、".join(
+        f"{name} {family(name).params}" if family(name).params else name for name in chosen
+    )
+
+
+def _model_metavar(names: tuple[str, ...]) -> str:
+    """`--model` 的取值表，带参数量：`{d3=4.54B,h2o=4.66B,…}`（只影响用法行）。"""
+    return "{" + ",".join(
+        f"{name}={family(name).params}" if family(name).params else name for name in names
+    ) + "}"
+
+
+def _model_choice(names: tuple[str, ...]):
+    """`--model` 的校验器：**不用 `choices`**，因为 argparse 在报错时只念 choices 的原始值、
+    **不念 metavar** —— 而认错家族的那一刻正是用户需要看到"这个名字对应多大"的时候。"""
+
+    def check(value: str) -> str:
+        if value in names:
+            return value
+        raise argparse.ArgumentTypeError(f"未知家族 {value!r}；可选：{_family_sizes(names)}")
+
+    return check
+
 # 没有 --model 时按包身份认家族：每个家族列它那份发布包里**必需**的一组文件，全在才算命中。
 # 这不是按权重形状猜家族 —— 猜错不会崩，只会拿错模板算出看似正常的答案；认发布包的必需件比
 # 认形状或目录名可靠。
@@ -94,14 +125,14 @@ def _infer_family(weights: Path) -> str:
                 "模型目录认不出唯一家族",
                 weights=str(weights),
                 matches=found,
-                hint="加 --model 显式指定（d3 / h2o / mude / pplx12 / pplx13 / singvl / torchcast）；"
+                hint=f"加 --model 显式指定（{_family_sizes()}）；"
                      "d3、mude 与两版 pplx 都是同形的检查点，必需件本来就一样",
             )
     raise ConfigError(
         "需要 --model 或 --backend",
         weights=str(weights),
         available=list(_CLI_FAMILIES),
-        hint="--model 取 d3 / h2o / mude / pplx12 / pplx13 / singvl / torchcast；"
+        hint=f"--model 取 {_family_sizes()}；"
              "reference 后端用 --backend reference --descriptor",
     )
 
@@ -115,7 +146,7 @@ def _resolve_backend(args: argparse.Namespace) -> str:
             raise ConfigError(
                 "需要 --model 或 --backend",
                 hint="省略 --weights 时没有权重包可认家族；"
-                     "先给 --model（d3 / h2o / mude / pplx12 / pplx13 / singvl / torchcast）",
+                     f"先给 --model（{_family_sizes()}）",
             )
         args.model = _infer_family(args.weights)
     strategy = family(args.model).strategy
@@ -142,8 +173,10 @@ def _model_flags() -> argparse.ArgumentParser:
              "只做全注意力层）必须显式给，且只配合 --descriptor",
     )
     common.add_argument(
-        "--model", default=None, choices=_CLI_FAMILIES,
-        help="家族（默认按后端取：split → mude、pooled → h2o；也可由权重包身份推断）",
+        "--model", default=None, type=_model_choice(_CLI_FAMILIES),
+        metavar=_model_metavar(_CLI_FAMILIES),
+        help=f"家族与它的参数量（{'；'.join([_family_sizes(_CLI_FAMILIES), '一个名字固定一份发布检查点'])}）。"
+             "默认按后端取：split → mude、pooled → h2o；也可由权重包身份推断",
     )
     common.add_argument("--descriptor", type=Path, default=None, help="descriptor JSON；reference 路径必填")
     common.add_argument(
@@ -271,7 +304,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     inspect = sub.add_parser("inspect", help="解析模型配置并打印描述")
-    inspect.add_argument("--model", required=True, choices=families())
+    inspect.add_argument("--model", required=True, type=_model_choice(families()),
+                         metavar=_model_metavar(families()),
+                         help=f"家族与参数量：{_family_sizes()}")
     inspect.add_argument("--weights", type=Path, required=True, help="模型目录")
 
     run = sub.add_parser("run", parents=[_model_flags()], help="跑一次请求")
@@ -291,7 +326,7 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="打印平台能力与内存预算")
     doctor.add_argument("--platform", default="auto", choices=("auto", "reference", "apple"))
     doctor.add_argument(
-        "--model", default=None, choices=families(),
+        "--model", default=None, type=_model_choice(families()), metavar=_model_metavar(families()),
         help="顺带检查这个模型：它的几何在不在 Apple 的实测白名单里（不装载权重）",
     )
     doctor.add_argument("--weights", type=Path, default=None, help="配合 --model 的模型目录")
@@ -713,7 +748,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "inspect":
             descriptor = family(args.model).parse_config(args.weights)
-            _print(descriptor.summary())
+            # 参数量是**家族名承诺的那一档**（发布检查点），不是 config 里的字段：同一个名字
+            # 换成另一档 `--weights` 时它不变，所以放在打印这一层而不是描述符里。
+            _print({**descriptor.summary(), "params": family(args.model).params})
             return 0
         if args.command == "serve":
             return _serve(args)
