@@ -97,4 +97,4 @@ BASELINE = "torchcast"
 
 # 参数量按发布包的三个分片实测：5 174 964 736（同一个 4B 底座，多一份解绑的 `lm_head`）。
 register_family("torchcast", parse_config, build_layer_plan, strategy="pooled",
-                weight_plan=weight_plan, recipe=RECIPE, params="5.17B", source=__name__)
+                weight_plan=weight_plan, recipe=RECIPE, params="4B", source=__name__)

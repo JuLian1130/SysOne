@@ -385,4 +385,4 @@ RECIPE = SplitRecipe(labels=read_codes, prompter=SingVLPrompter, confidence=mude
 
 # 参数量按发布包的两个分片实测：4 539 265 536（与 d3 / pplx 同一个 4B 底座 + 视觉塔）。
 register_family("singvl", parse_config, build_layer_plan, strategy="split",
-                weight_plan=weight_plan, recipe=RECIPE, params="4.54B", source=__name__)
+                weight_plan=weight_plan, recipe=RECIPE, params="4B", source=__name__)

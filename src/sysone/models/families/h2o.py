@@ -78,4 +78,4 @@ RECIPE = PooledRecipe(serve=open_serve)
 
 # 参数量按发布包的 safetensors 头实测：4 659 865 088（h2o-lightning-4b）。
 register_family("h2o", parse_config, build_layer_plan, strategy="pooled",
-                weight_plan=weight_plan, recipe=RECIPE, params="4.66B", source=__name__)
+                weight_plan=weight_plan, recipe=RECIPE, params="4B", source=__name__)

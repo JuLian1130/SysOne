@@ -312,4 +312,4 @@ RECIPE = SplitRecipe(labels=read_codes, prompter=MudePrompter, confidence=confid
 
 # 参数量按发布包的 safetensors 头实测：1 984 364 384（Qwen3.5-2B 剪到 20 层）。
 register_family("mude", parse_config, build_layer_plan, strategy="split",
-                weight_plan=weight_plan, recipe=RECIPE, params="1.98B", source=__name__)
+                weight_plan=weight_plan, recipe=RECIPE, params="2B", source=__name__)

@@ -425,6 +425,6 @@ RECIPE_13 = SplitRecipe(labels=read_codes_13,
 
 # 两版的参数量都按各自发布包的分片实测：4 539 265 536（同一个 Qwen3.5-4B 底座 + 视觉塔）。
 register_family("pplx12", parse_config_12, build_layer_plan, strategy="split",
-                weight_plan=weight_plan_12, recipe=RECIPE_12, params="4.54B", source=__name__)
+                weight_plan=weight_plan_12, recipe=RECIPE_12, params="4B", source=__name__)
 register_family("pplx13", parse_config_13, build_layer_plan, strategy="split",
-                weight_plan=weight_plan_13, recipe=RECIPE_13, params="4.54B", source=__name__)
+                weight_plan=weight_plan_13, recipe=RECIPE_13, params="4B", source=__name__)

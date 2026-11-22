@@ -96,13 +96,17 @@ path`：d3 自己的发布包写了视频输入，但本引擎既没有取帧解
 | | h2o | mude | d3 | torchcast | pplx12 | pplx13 | singvl |
 |---|---|---|---|---|---|---|---|
 | 检查点 | `h2o-lightning-4b` | `mude-1.0` | `d3-mini` | `torchcast-decision-4b` | `pplx-decider-flash-v1.2` | `pplx-decider-flash-v1.3` | `SingVL_S1_4B` |
-| 参数量 | 4.66B | 1.98B | 4.54B | 5.17B | 4.54B | 4.54B | 4.54B |
+| 档位 | 4B | 2B | 4B | 4B | 4B | 4B | 4B |
 | 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
 | 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal`（训练过） | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` |
 | 读出 | 厂商 pooled 读出 | 255 行码表 | 255 行码表 | 26 行 `lm_head` 字母 | 255 行码表（BF16） | 255 行码表（BF16） | 绑定 embedding 的 256 行 |
 | 每题最多选项 | 255（255 档） | 255（10 档） | 255（10 档） | 26（10 档） | 255（255 档） | 255（255 档） | 255（10 档） |
 | 最大输入 token | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
 | 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
+
+档位用厂商的命名，`--model` 收的就是它（mude 2B、其余 4B，也可以写成 `d3=4B`）。实测参数
+量与这个标签略有出入 —— 4B 的几份是 4.54B、h2o 是 4.66B、torchcast 是 5.17B（它保留了一份
+解绑的 `lm_head`）—— 算内存请按实测值，不要按标签。
 
 `--width` 同时是 GPU 缓冲宽度与输入上限，所以更长的 prompt 要给更大的值。带塔的家族都能
 收图；mude 的塔继承自 d3-nano，按它的模型卡，那座塔没有为 mu 的决策训练或评估过 —— 它能

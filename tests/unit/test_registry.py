@@ -19,17 +19,17 @@ def test_four_families_registered() -> None:
     assert {"d3", "h2o", "mude", "torchcast"} <= set(registered())
 
 
-# 每个家族固定一份发布检查点；这几个数是按各自 safetensors 头里的形状乘积求和的**实测值**
-# （`.tmp/probe_param_counts.py`，2026-11-22）。mude 是 Qwen3.5-2B 剪到 20 层，torchcast 比
-# 同一个 4B 底座多一份解绑的 `lm_head`。
+# 每个家族固定一份发布检查点，档位用厂商的命名：mude 是 2B（Qwen3.5-2B 剪到 20 层），
+# 其余都是 4B —— 包括 torchcast（`decision-4b`，实测 5.17B，因为它多一份解绑的 `lm_head`）
+# 与 h2o（实测 4.66B）。精确值只进文档的内存账，不进命令行。
 PARAMS = {
-    "d3": "4.54B",
-    "h2o": "4.66B",
-    "mude": "1.98B",
-    "pplx12": "4.54B",
-    "pplx13": "4.54B",
-    "singvl": "4.54B",
-    "torchcast": "5.17B",
+    "d3": "4B",
+    "h2o": "4B",
+    "mude": "2B",
+    "pplx12": "4B",
+    "pplx13": "4B",
+    "singvl": "4B",
+    "torchcast": "4B",
 }
 
 

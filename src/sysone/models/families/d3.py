@@ -85,4 +85,4 @@ RECIPE = mude.RECIPE
 
 # 参数量按发布包的两个分片实测：4 539 265 536（Qwen3.5-4B 底座 + 整座视觉塔）。
 register_family("d3", parse_config, build_layer_plan, strategy="split",
-                weight_plan=weight_plan, recipe=RECIPE, params="4.54B", source=__name__)
+                weight_plan=weight_plan, recipe=RECIPE, params="4B", source=__name__)

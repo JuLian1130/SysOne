@@ -10,6 +10,7 @@ import pytest
 from helpers import FIXTURES, make_request, make_tiny
 from sysone.cli import (
     _artifacts_dir,
+    _build_parser,
     _geometry_report,
     _infer_family,
     _platform_report,
@@ -30,19 +31,37 @@ def test_inspect_prints_descriptor(capsys) -> None:
 
 
 def test_the_model_flag_names_the_parameter_size_of_each_family(capsys) -> None:
-    """同一个厂商可能发 2B / 4B 几档，所以 `--model` 的取值表与帮助都要带档位。
-
-    用法行（metavar）与报错各查一遍：认错家族的那一刻正是用户需要看到"这个名字对应多大"。
-    """
+    """档位用厂商的命名：mude 2B、其余 4B。用法行与报错各查一遍。"""
     with pytest.raises(SystemExit) as helped:
         main(["serve", "--help"])
     assert helped.value.code == 0
-    assert ("{d3=4.54B,h2o=4.66B,mude=1.98B,pplx12=4.54B,pplx13=4.54B,singvl=4.54B,"
-            "torchcast=5.17B}") in capsys.readouterr().out
+    assert ("{d3=4B,h2o=4B,mude=2B,pplx12=4B,pplx13=4B,singvl=4B,torchcast=4B}"
+            in capsys.readouterr().out)
     with pytest.raises(SystemExit) as refused:
         main(["serve", "--model", "d3-8b"])
     assert refused.value.code == 2
-    assert "mude 1.98B" in capsys.readouterr().err
+    assert "mude 2B" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("given", "resolved"), (
+    ("d3", "d3"),          # 省略档位 = 用这家固定的那一档
+    ("d3=4B", "d3"),
+    ("d3=4b", "d3"),       # 大小写不敏感（厂商写法不统一）
+    ("mude=2B", "mude"),
+))
+def test_a_size_suffix_is_optional_and_defaults_to_the_pinned_one(
+    given: str, resolved: str
+) -> None:
+    args = _build_parser().parse_args(["serve", "--model", given, "--weights", "/tmp"])
+    assert args.model == resolved
+
+
+@pytest.mark.parametrize("given", ("d3=8B", "mude=4B", "torchcast=8B"))
+def test_a_size_suffix_that_is_not_pinned_is_refused(given: str) -> None:
+    """给错档位要当场拒收：静默按默认档跑等于用户以为自己在跑 8B。"""
+    with pytest.raises(SystemExit) as caught:
+        _build_parser().parse_args(["serve", "--model", given, "--weights", "/tmp"])
+    assert caught.value.code == 2
 
 
 def test_inspect_prints_the_parameter_size(capsys) -> None:
@@ -50,7 +69,7 @@ def test_inspect_prints_the_parameter_size(capsys) -> None:
     code = main(["inspect", "--model", "mude", "--weights", str(FIXTURES / "mude")])
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["params"] == "1.98B"
+    assert payload["params"] == "2B"
 
 
 def test_run_with_tiny_model(tmp_path: Path, capsys) -> None:

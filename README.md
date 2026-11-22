@@ -111,7 +111,7 @@ optional.
 
 | Flag | Default / values | Meaning |
 |---|---|---|
-| `--model {d3,h2o,mude,pplx12,pplx13,singvl,torchcast}` | from `--backend` or `--weights` | model family; each name is one pinned checkpoint, and its parameter count is spelled out in `--help` (mude 1.98B, h2o 4.66B, d3 / pplx12 / pplx13 / singvl 4.54B, torchcast 5.17B) |
+| `--model {d3,h2o,mude,pplx12,pplx13,singvl,torchcast}` | from `--backend` or `--weights` | model family; each name is one pinned checkpoint at one size (mude 2B, the rest 4B). A size may be given as `--model d3=4B`; omitted, the pinned size is used, and any other size is refused |
 | `--backend {split,pooled,vendor,reference}` | `pooled` for h2o and torchcast, `split` for mude, d3, pplx12, pplx13 and singvl | execution path; `vendor` runs a vendor's own engine, `reference` is the test-only semantic judge |
 | `--weights PATH` | auto-download | explicit package; read-only, never downloads |
 | `--offline` | off | never touch the network |

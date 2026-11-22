@@ -56,11 +56,7 @@ _CLI_FAMILIES = tuple(name for name in families() if family(name).strategy in ST
 
 
 def _family_sizes(names: tuple[str, ...] | None = None) -> str:
-    """`d3 4.54B、h2o 4.66B、…` —— 一个家族名固定一份发布检查点，所以档位写在名字旁边。
-
-    同一个厂商可能发 2B / 4B 几档，家族名只说"哪一家"、不说"多大"；这一串就是
-    `--model` 认的那几档（数值来自注册项的 `params`，是 safetensors 头的实测值）。
-    """
+    """`d3 4B、h2o 4B、mude 2B、…` —— 档位写在名字旁边，一个名字固定一份发布检查点。"""
     chosen = families() if names is None else names
     return "、".join(
         f"{name} {family(name).params}" if family(name).params else name for name in chosen
@@ -68,20 +64,34 @@ def _family_sizes(names: tuple[str, ...] | None = None) -> str:
 
 
 def _model_metavar(names: tuple[str, ...]) -> str:
-    """`--model` 的取值表，带参数量：`{d3=4.54B,h2o=4.66B,…}`（只影响用法行）。"""
+    """`--model` 的取值表：`{d3=4B,h2o=4B,mude=2B,…}`（只影响用法行）。
+
+    等号是**可选档位**的写法：`--model d3` 与 `--model d3=4B` 都是 d3 这一档（见
+    `_model_choice`）；写成别的档位当场拒收，不会静默按默认档跑。
+    """
     return "{" + ",".join(
         f"{name}={family(name).params}" if family(name).params else name for name in names
     ) + "}"
 
 
 def _model_choice(names: tuple[str, ...]):
-    """`--model` 的校验器：**不用 `choices`**，因为 argparse 在报错时只念 choices 的原始值、
-    **不念 metavar** —— 而认错家族的那一刻正是用户需要看到"这个名字对应多大"的时候。"""
+    """`--model` 的校验器：收 `家族` 或 `家族=档位`，返回**家族名**。
+
+    三条理由要自己写校验而不用 `choices`：argparse 报错时只念 choices 的原始值、不念
+    metavar，而认错的那一刻正是要看档位的时候；`家族=档位` 这种取值不是 choices 能表达的；
+    省略档位时它才是默认值 —— 所以 `d3` 与 `d3=4B` 等价，`d3=8B` 报错说这家只有 4B。
+    """
 
     def check(value: str) -> str:
-        if value in names:
-            return value
-        raise argparse.ArgumentTypeError(f"未知家族 {value!r}；可选：{_family_sizes(names)}")
+        name, _, size = value.partition("=")
+        if name not in names:
+            raise argparse.ArgumentTypeError(f"未知家族 {value!r}；可选：{_family_sizes(names)}")
+        pinned = family(name).params
+        if size and pinned and size.casefold() != pinned.casefold():
+            raise argparse.ArgumentTypeError(
+                f"{name} 只有 {pinned} 这一档（给的是 {size}）；省略档位即用默认的 {pinned}"
+            )
+        return name
 
     return check
 

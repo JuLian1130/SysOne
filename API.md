@@ -112,13 +112,19 @@ are layouts in which the questions, or the state, see each other.
 | | h2o | mude | d3 | torchcast | pplx12 | pplx13 | singvl |
 |---|---|---|---|---|---|---|---|
 | Checkpoint | `h2o-lightning-4b` | `mude-1.0` | `d3-mini` | `torchcast-decision-4b` | `pplx-decider-flash-v1.2` | `pplx-decider-flash-v1.3` | `SingVL_S1_4B` |
-| Parameters | 4.66B | 1.98B | 4.54B | 5.17B | 4.54B | 4.54B | 4.54B |
+| Size class | 4B | 2B | 4B | 4B | 4B | 4B | 4B |
 | Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
 | Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained) | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only |
 | Readout | vendor pooled readout | 255-row code table | 255-row code table | 26 `lm_head` letter rows | 255-row code table (BF16) | 255-row code table (BF16) | 256 rows of the tied embedding |
 | Max options per question | 255 (255 levels) | 255 (10 levels) | 255 (10 levels) | 26 (10 levels) | 255 (255 levels) | 255 (255 levels) | 255 (10 levels) |
 | Max input tokens | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
 | Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) |
+
+Sizes are the vendor's naming, which is what `--model` takes (mude 2B, everything
+else 4B, optionally spelled `d3=4B`). The measured parameter counts differ a
+little from that label — 4.54B for the 4B checkpoints, 4.66B for h2o and 5.17B
+for torchcast, which keeps an untied `lm_head` — so budget memory from those,
+not from the label.
 
 `--width` is both the GPU buffer width and the input limit, so a longer prompt
 needs a larger value. Every family with a tower answers images; mude's tower is
