@@ -61,8 +61,21 @@ the value); for `score` it is an ordered array of levels; for `noul` it is
 `state` and `instructions` may be strings or arbitrary JSON; non-strings are
 serialized as JSON into the prompt.
 
-`images` accepts a list of `data:image/...;base64,` data URLs. Video is
-rejected. When `--vision off` is set, image requests are rejected with `422`.
+`type` is `choice`, `noul` or `score`. Anything else — `locate` is the one a
+vendor ships — is a per-question `422` that names the kinds this wire format
+carries.
+
+`images` accepts a list of `data:image/...;base64,` data URLs. With
+`--vision off` set, image requests are rejected with `422`.
+
+`videos` is refused with `422` and `video inputs are not available: this engine
+ships no video path`: d3's own package documents video input, but this engine
+has neither a frame decoder nor a time axis.
+
+Every question is answered from the state alone: questions of one request never
+attend to each other, so adding, removing or reordering them cannot change
+another answer. That is also why there is no `isolated` or `joint` knob — those
+are layouts in which the questions, or the state, see each other.
 
 ## Response
 
@@ -93,14 +106,20 @@ rejected. When `--vision off` is set, image requests are rejected with `422`.
 
 ## Per-model capabilities
 
-| | h2o | mude | torchcast |
-|---|---|---|---|
-| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` (2–10 levels) | `choice`, `noul`, `score` (2–10 levels) |
-| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) | `noncausal_full` only |
-| Readout | vendor pooled readout | fixed 255-row code table | 26 `lm_head` letter rows |
-| Max options per question | 255 | 255 (10 for a `score`) | 26 (10 for a `score`) |
-| Max input tokens | `--width` (default 16384) | `--width` (default 16384) | `--width` (default 16384) |
-| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) |
+| | h2o | mude | d3 | torchcast | pplx12 | pplx13 |
+|---|---|---|---|---|---|---|
+| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
+| Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained) | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only |
+| Readout | vendor pooled readout | 255-row code table | 255-row code table | 26 `lm_head` letter rows | 255-row code table (BF16) | 255-row code table (BF16) |
+| Max options per question | 255 (255 levels) | 255 (10 levels) | 255 (10 levels) | 26 (10 levels) | 255 (255 levels) | 255 (255 levels) |
+| Max input tokens | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
+| Vision | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) | available by default (`--vision auto`) |
+
+`--width` is both the GPU buffer width and the input limit, so a longer prompt
+needs a larger value. Every family with a tower answers images; mude's tower is
+inherited from d3-nano and, per its model card, was neither trained nor
+evaluated for mu's decisions — it runs, but it is not a validated capability
+there.
 
 The first start also builds the vision tower's 26 programs, then releases the
 tower: text-only processes stay at 0 resident, and the first image request pays

@@ -54,8 +54,18 @@
 等级数组，`noul` 是 `{"true": …, "false": …}`。一题最多 255 个选项。`state` 与
 `instructions` 可以是字符串或任意 JSON；非字符串会序列化成 JSON 进 prompt。
 
-`images` 接受一组 `data:image/...;base64,` data URL。视频会被拒绝。设置 `--vision off`
-时，带图的请求回 `422`。
+`type` 是 `choice`、`noul` 或 `score`。别的（厂商那份带的是 `locate`）会回逐个问题的
+`422`，并说明这条线格式带哪些题型。
+
+`images` 接受一组 `data:image/...;base64,` data URL。设置 `--vision off` 时，带图的请求回
+`422`。
+
+`videos` 会被拒，回 `422` 与 `video inputs are not available: this engine ships no video
+path`：d3 自己的发布包写了视频输入，但本引擎既没有取帧解码器，也没有时间轴。
+
+每道题只从 state 得到答案：同一个请求里的题互不可见，所以增删改别的题不会改变某一题的
+答案。这也是没有 `isolated` 或 `joint` 旋钮的原因 —— 那两种布局里题目（或 state）会互相
+看见。
 
 ## 响应
 
@@ -81,14 +91,18 @@
 
 ## 各模型能力
 
-| | h2o | mude | torchcast |
-|---|---|---|---|
-| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score`（2–10 档） | `choice`, `noul`, `score`（2–10 档） |
-| 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained on `prefix_noncausal`) | 只有 `noncausal_full` |
-| 读出 | 厂商 pooled 读出 | 固定 255 行码表 | 26 行 `lm_head` 字母 |
-| 每题最多选项 | 255 | 255（`score` 为 10） | 26（`score` 为 10） |
-| 最大输入 token | `--width` (default 16384) | `--width` (default 16384) | `--width` (default 16384) |
-| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
+| | h2o | mude | d3 | torchcast | pplx12 | pplx13 |
+|---|---|---|---|---|---|---|
+| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
+| 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal`（训练过） | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` |
+| 读出 | 厂商 pooled 读出 | 255 行码表 | 255 行码表 | 26 行 `lm_head` 字母 | 255 行码表（BF16） | 255 行码表（BF16） |
+| 每题最多选项 | 255（255 档） | 255（10 档） | 255（10 档） | 26（10 档） | 255（255 档） | 255（255 档） |
+| 最大输入 token | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) | `--width` (default 32768) |
+| 视觉 | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） | 默认可用（`--vision auto`） |
+
+`--width` 同时是 GPU 缓冲宽度与输入上限，所以更长的 prompt 要给更大的值。带塔的家族都能
+收图；mude 的塔继承自 d3-nano，按它的模型卡，那座塔没有为 mu 的决策训练或评估过 —— 它能
+跑，但在那里不是一个已验证的能力。
 
 首次启动还会把视觉塔的 26 份产物编好，然后归还塔：纯文本进程保持 0 常驻，第一次带图
 请求只付装载。`--vision off` 跳过塔及其产物。第三份 dylib（`libe8image.dylib`）只在真的
