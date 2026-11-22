@@ -108,7 +108,7 @@ optional.
 | `--quant {int8,fp16}` | `int8` | ANE weight storage; compute stays fp16 either way |
 | `--attention-mode {causal,noncausal_full,prefix_noncausal}` | family default (`causal` for h2o, `prefix_noncausal` for mude, `noncausal_full` for torchcast, d3, pplx12 and pplx13) | mask; a request can override it |
 | `--bucket N` | `1024` | ANE program column width |
-| `--width N` | `16384` | GPU buffer width, also the max input tokens |
+| `--width N` | `32768` | GPU buffer width, also the max input tokens |
 | `--W N` | `4` | resident layers; `0` keeps all of them |
 | `--batch N` | `4` | requests packed into one pass; `1` turns batching off |
 | `--artifacts PATH` | platform cache | compiled artifact root |

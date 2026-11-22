@@ -37,8 +37,8 @@ def _hold(slot: LongPass, length: int, seconds: float, *, name: str,
     return thread
 
 
-def test_the_budget_is_one_full_width_sequence() -> None:
-    assert BUDGET_TOKENS == 16_384, "预算 = SchedulerConfig.max_len"
+def test_the_budget_is_one_16k_sequence() -> None:
+    assert BUDGET_TOKENS == 16_384, "预算固定 16k 当量；--width 更大时单条占满格子独自跑"
     assert QUANTUM_TOKENS * 4 == BUDGET_TOKENS
     slot = LongPass()
     assert slot.quanta_for(1) == 1
@@ -46,6 +46,8 @@ def test_the_budget_is_one_full_width_sequence() -> None:
     assert slot.quanta_for(QUANTUM_TOKENS + 1) == 2
     assert slot.quanta_for(8_192) == 2
     assert slot.quanta_for(BUDGET_TOKENS) == 4
+    # 32k 的单条：需要的格子超过预算，按"占满"处理 —— 它照样整趟跑，只是没有别的 pass 能并行。
+    assert slot.quanta_for(32_768) == 4
 
 
 def test_a_single_long_sequence_always_runs_whole(tmp_path: Path) -> None:

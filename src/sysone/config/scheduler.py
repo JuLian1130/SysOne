@@ -18,7 +18,9 @@ class SchedulerConfig:
     - `queue`：准入等待队列上限（服务层用）。默认 8 而不是 2：批处理要有原料才能攒批，
       排队位太少时请求还没进来就被拒了（旧引擎的出厂值也是 8）。
     - `batch`：一个 pass 最多装几条请求，0/1 表示不攒批。实测收益见票据 07 §7.25j。
-    - `max_len`：序列上限，超了直接 422。
+    - `max_len`：序列上限，超了直接 422。默认 32 768：pplx 与 d3 的训练长度是 30 720 / 32 768，
+      16k 会把它们本就能答的请求拒掉；这条同时是 GPU 缓冲宽度，抬上去的内存代价见
+      `devices/apple/longpass.py`。
     """
 
     attention_mode: MaskMode | None = None
@@ -27,7 +29,7 @@ class SchedulerConfig:
     tile: int = 0
     queue: int = 8
     batch: int = 4
-    max_len: int = 16384
+    max_len: int = 32768
 
     def validate(self) -> None:
         if self.resident_w < 1:

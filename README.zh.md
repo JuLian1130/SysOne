@@ -96,7 +96,7 @@ curl -s -X POST http://127.0.0.1:8000/v1/systemone \
 | `--quant {int8,fp16}` | `int8` | ANE 权重存储形态；计算始终 fp16 |
 | `--attention-mode {causal,noncausal_full,prefix_noncausal}` | 家族默认（h2o `causal`、mude `prefix_noncausal`、torchcast / d3 / pplx12 / pplx13 `noncausal_full`） | 掩码；请求可覆盖 |
 | `--bucket N` | `1024` | ANE program 列宽 |
-| `--width N` | `16384` | GPU 缓冲宽度，也是最大输入 token 数 |
+| `--width N` | `32768` | GPU 缓冲宽度，也是最大输入 token 数 |
 | `--W N` | `4` | 常驻层数；`0` = 全部常驻 |
 | `--batch N` | `4` | 一个 pass 最多装几条请求；`1` 表示不攒批 |
 | `--artifacts PATH` | 平台缓存 | 编译产物落点 |
