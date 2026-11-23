@@ -56,8 +56,8 @@
 等级数组，`noul` 是 `{"true": …, "false": …}`。一题最多 255 个选项。`state` 与
 `instructions` 可以是字符串或任意 JSON；非字符串会序列化成 JSON 进 prompt。
 
-`type` 是 `choice`、`noul` 或 `score`。别的（厂商那份带的是 `locate`）会回逐个问题的
-`422`，并说明这条线格式带哪些题型。
+`type` 是 `choice`、`noul` 或 `score`。别的（厂商那份带的是 `locate` 与 `box`）会回逐个问题
+的 `422`，并说明这条线格式带哪些题型。
 
 `images` 接受一组 `data:image/...;base64,` data URL。设置 `--vision off` 时，带图的请求回
 `422`。
@@ -97,7 +97,7 @@ path`：d3 自己的发布包写了视频输入，但本引擎既没有取帧解
 |---|---|---|---|---|---|---|---|
 | 检查点 | `h2o-lightning-4b` | `mude-1.0` | `d3-mini` | `torchcast-decision-4b` | `pplx-decider-flash-v1.2` | `pplx-decider-flash-v1.3` | `SingVL_S1_4B` |
 | 档位 | 4B | 2B | 4B | 4B | 4B | 4B | 4B |
-| 问题类型 | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
+| 问题类型 | `choice`, `noul`, `score`（另有 `box`，不支持） | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
 | 注意力模式 | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal`（训练过） | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` | 只有 `noncausal_full` |
 | 读出 | 厂商 pooled 读出 | 255 行码表 | 255 行码表 | 26 行 `lm_head` 字母 | 255 行码表（BF16） | 255 行码表（BF16） | 绑定 embedding 的 256 行 |
 | 每题最多选项 | 255（255 档） | 255（10 档） | 255（10 档） | 26（10 档） | 255（255 档） | 255（255 档） | 255（10 档） |

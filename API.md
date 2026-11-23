@@ -64,9 +64,9 @@ the value); for `score` it is an ordered array of levels; for `noul` it is
 `state` and `instructions` may be strings or arbitrary JSON; non-strings are
 serialized as JSON into the prompt.
 
-`type` is `choice`, `noul` or `score`. Anything else — `locate` is the one a
-vendor ships — is a per-question `422` that names the kinds this wire format
-carries.
+`type` is `choice`, `noul` or `score`. Anything else — `locate` and `box` are
+the ones a vendor ships — is a per-question `422` that names the kinds this
+wire format carries.
 
 `images` accepts a list of `data:image/...;base64,` data URLs. With
 `--vision off` set, image requests are rejected with `422`.
@@ -113,7 +113,7 @@ are layouts in which the questions, or the state, see each other.
 |---|---|---|---|---|---|---|---|
 | Checkpoint | `h2o-lightning-4b` | `mude-1.0` | `d3-mini` | `torchcast-decision-4b` | `pplx-decider-flash-v1.2` | `pplx-decider-flash-v1.3` | `SingVL_S1_4B` |
 | Size class | 4B | 2B | 4B | 4B | 4B | 4B | 4B |
-| Question kinds | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
+| Question kinds | `choice`, `noul`, `score` (plus `box`, unsupported) | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` | `choice`, `noul`, `score` |
 | Attention modes | `causal` (default), `noncausal_full` | `causal`, `noncausal_full`, `prefix_noncausal` (trained) | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only | `noncausal_full` only |
 | Readout | vendor pooled readout | 255-row code table | 255-row code table | 26 `lm_head` letter rows | 255-row code table (BF16) | 255-row code table (BF16) | 256 rows of the tied embedding |
 | Max options per question | 255 (255 levels) | 255 (10 levels) | 255 (10 levels) | 26 (10 levels) | 255 (255 levels) | 255 (255 levels) | 255 (10 levels) |
